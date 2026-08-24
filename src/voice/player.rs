@@ -63,7 +63,7 @@ struct GuildState {
     current_handle: Option<TrackHandle>,
 }
 
-/// A point-in-time view of a guild's queue, for `/queue` and `/nowplaying`.
+/// A point-in-time view of a guild's queue, for `/queue` and `/now_playing`.
 pub struct QueueSnapshot {
     pub now_playing: Option<QueuedTrack>,
     pub upcoming: Vec<QueuedTrack>,
@@ -314,7 +314,7 @@ impl PlayerRegistry {
         }
     }
 
-    /// Live playback position of the current track, for a `/nowplaying`
+    /// Live playback position of the current track, for a `/now_playing`
     /// progress display. `None` if nothing is playing or songbird couldn't
     /// report a position (e.g. the track just ended in a race with this
     /// call) — a missing position isn't worth surfacing as an error.

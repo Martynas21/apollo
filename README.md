@@ -123,15 +123,18 @@ See `.env.example` for the full list and inline docs:
 
 - **Account**: `/link`, `/unlink`
 - **Playback**: `/join`, `/leave`, `/play <query|url>`, `/queue`, `/skip`,
-  `/pause`, `/resume`, `/stop`, `/nowplaying`
-- **Library browsing**: `/search <query>` → `/searchplay <query> <n>`,
-  `/playlists` → `/playlistplay <n>` → `/playlistqueue <playlist n> <track n>`,
-  `/liked` → `/likedplay <n>`
+  `/pause`, `/resume`, `/stop`, `/now_playing`
+- **Library browsing**: `/search <query>` → `/search_play <query> <n>`,
+  `/playlists` → `/playlist_play <n>` → `/playlist_queue <playlist n> <track n>`
+  (or `/playlist_queue_all <playlist n>` to queue every track in it),
+  `/liked` → `/liked_play <n>`
 
   The browsing commands show a numbered list and a follow-up command
   queues a pick by number — there's no interactive button/select-menu
   picker (that needs live Discord component-interaction testing this
-  project hasn't had yet).
+  project hasn't had yet). `/playlist_queue_all` is the exception: it
+  queues the whole playlist in one shot without needing a prior
+  `/playlist_play` browse step.
 
 ## Deployment
 

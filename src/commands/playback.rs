@@ -1,5 +1,5 @@
 //! `/join`, `/leave`, `/play`, `/queue`, `/skip`, `/pause`, `/resume`,
-//! `/stop`, `/nowplaying`: voice playback commands.
+//! `/stop`, `/now_playing`: voice playback commands.
 
 use std::time::Duration;
 
@@ -94,7 +94,7 @@ fn format_track(track: &Track) -> String {
     }
 }
 
-/// Builds the `/nowplaying` embed: title (linked to the video), thumbnail,
+/// Builds the `/now_playing` embed: title (linked to the video), thumbnail,
 /// requester, and progress (`position / duration`, or just `position` if
 /// the video's total duration is unknown, or omitted entirely if songbird
 /// couldn't report a position).
@@ -334,7 +334,7 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
 
 /// Shows the currently playing track.
 #[poise::command(slash_command, guild_only)]
-pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
+pub async fn now_playing(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
     let snapshot = ctx.data().player.queue_snapshot(guild_id).await;
 

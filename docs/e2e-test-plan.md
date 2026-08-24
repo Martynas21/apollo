@@ -41,11 +41,13 @@ share with other people — some steps involve deliberately breaking things
 
 - [ ] `/playlists` lists your account's playlists (or "you don't have any
       playlists" if there genuinely aren't any).
-- [ ] `/playlistplay <n>` on a non-empty playlist lists its tracks.
+- [ ] `/playlist_play <n>` on a non-empty playlist lists its tracks.
+- [ ] `/playlist_queue_all <n>` on a non-empty playlist queues every track
+      in it and reports the count; `/queue` shows them all in order.
 - [ ] `/liked` lists liked videos (or the empty-state message).
 - [ ] `/search <query>` returns up to 5 results for a query you know has
       results (e.g. an artist name).
-- [ ] Invalid selections (`/playlistplay 99`, `/searchplay <query> 0`)
+- [ ] Invalid selections (`/playlist_play 99`, `/search_play <query> 0`)
       reply "Invalid selection" rather than panicking or hanging.
 
 ## 3. Playback
@@ -58,14 +60,14 @@ share with other people — some steps involve deliberately breaking things
 - [ ] While something is playing, `/play` a second track — it queues
       rather than interrupting; `/queue` shows both the now-playing track
       and the queued one.
-- [ ] `/nowplaying` shows an embed: title (linking to the actual video),
+- [ ] `/now_playing` shows an embed: title (linking to the actual video),
       thumbnail image, channel, requester mention, and a progress value
       that visibly increases if you run it twice a few seconds apart.
 - [ ] `/pause` then `/resume` — audio actually stops and restarts, not
       just the command replying successfully.
 - [ ] `/skip` — the queued track starts playing next automatically (no
-      manual `/play` needed), and `/nowplaying` reflects the new track.
-- [ ] `/stop` — audio stops and `/queue`/`/nowplaying` both show nothing
+      manual `/play` needed), and `/now_playing` reflects the new track.
+- [ ] `/stop` — audio stops and `/queue`/`/now_playing` both show nothing
       playing.
 - [ ] `/leave` while connected — bot leaves the channel; `/queue` shows
       nothing (state was cleared).

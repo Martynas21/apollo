@@ -1,6 +1,6 @@
-//! `/search`, `/searchplay`, `/playlists`, `/playlistplay`, `/playlistqueue`,
-//! `/liked`, `/likedplay`: browsing a linked account's YouTube library and
-//! queuing tracks from it.
+//! `/search`, `/search_play`, `/playlists`, `/playlist_play`,
+//! `/playlist_queue`, `/playlist_queue_all`, `/liked`, `/liked_play`:
+//! browsing a linked account's YouTube library and queuing tracks from it.
 //!
 //! No interactive component picker (buttons/select menus) — a "browse, then
 //! queue by number in a follow-up command" pattern is used instead. This
@@ -20,7 +20,7 @@ use crate::youtube::oauth::get_valid_access_token;
 
 /// Max results shown by `/search`.
 const SEARCH_DISPLAY_LIMIT: usize = 5;
-/// Max results shown by `/playlists`, `/playlistplay`, and `/liked`.
+/// Max results shown by `/playlists`, `/playlist_play`, and `/liked`.
 const LIST_DISPLAY_LIMIT: usize = 10;
 
 /// Fetches a valid access token for the invoking user, or replies
@@ -187,8 +187,46 @@ async fn join_and_enqueue(ctx: Context<'_>, track: Track) -> Result<(), Error> {
     Ok(())
 }
 
+/// Auto-joins if needed, enqueues every track in `tracks` in order, and
+/// sends one public confirmation reply summarizing how many were queued.
+/// Unlike [`join_and_enqueue`], a per-track enqueue failure doesn't abort
+/// the rest — it's tallied and reported alongside the successes, since one
+/// bad track (e.g. region-locked) shouldn't block queuing the rest of a
+/// playlist.
+async fn join_and_enqueue_all(ctx: Context<'_>, label: &str, tracks: Vec<Track>) -> Result<(), Error> {
+    let guild_id = ctx.guild_id().expect("guild_only command has a guild id");
+
+    if !ensure_connected(ctx, guild_id).await? {
+        return Ok(());
+    }
+
+    let total = tracks.len();
+    let mut queued_count = 0usize;
+    for track in tracks {
+        let queued = QueuedTrack {
+            track,
+            requested_by: ctx.author().id,
+        };
+        if ctx.data().player.enqueue(guild_id, queued).await.is_ok() {
+            queued_count += 1;
+        }
+    }
+
+    let content = if queued_count == total {
+        format!("Queued {queued_count} track(s) from **{label}**.")
+    } else {
+        format!(
+            "Queued {queued_count}/{total} track(s) from **{label}** ({} failed).",
+            total - queued_count
+        )
+    };
+    ctx.send(poise::CreateReply::default().content(content)).await?;
+
+    Ok(())
+}
+
 /// Searches YouTube for `query` and shows up to 5 results. Queue one with
-/// `/searchplay`.
+/// `/search_play`.
 #[poise::command(slash_command, guild_only)]
 pub async fn search(ctx: Context<'_>, #[description = "Search query"] query: String) -> Result<(), Error> {
     let Some(token) = require_access_token(ctx).await? else {
@@ -222,7 +260,7 @@ pub async fn search(ctx: Context<'_>, #[description = "Search query"] query: Str
     ctx.send(
         poise::CreateReply::default()
             .content(format!(
-                "Search results for \"{query}\":\n{listing}\n\nRun `/searchplay {query} <number>` to queue one."
+                "Search results for \"{query}\":\n{listing}\n\nRun `/search_play {query} <number>` to queue one."
             ))
             .ephemeral(true),
     )
@@ -233,7 +271,7 @@ pub async fn search(ctx: Context<'_>, #[description = "Search query"] query: Str
 
 /// Re-runs a `/search` and queues result number `number` from it.
 #[poise::command(slash_command, guild_only)]
-pub async fn searchplay(
+pub async fn search_play(
     ctx: Context<'_>,
     #[description = "Search query"] query: String,
     #[description = "Result number from /search"] number: u8,
@@ -268,7 +306,7 @@ pub async fn searchplay(
     join_and_enqueue(ctx, track).await
 }
 
-/// Lists the linked account's playlists. Browse one with `/playlistplay`.
+/// Lists the linked account's playlists. Browse one with `/playlist_play`.
 #[poise::command(slash_command, guild_only)]
 pub async fn playlists(ctx: Context<'_>) -> Result<(), Error> {
     let Some(token) = require_access_token(ctx).await? else {
@@ -302,7 +340,7 @@ pub async fn playlists(ctx: Context<'_>) -> Result<(), Error> {
     ctx.send(
         poise::CreateReply::default()
             .content(format!(
-                "Your playlists:\n{listing}\n\nRun `/playlistplay <number>` to browse one."
+                "Your playlists:\n{listing}\n\nRun `/playlist_play <number>` to browse one."
             ))
             .ephemeral(true),
     )
@@ -311,9 +349,9 @@ pub async fn playlists(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Browses playlist `number`'s tracks. Queue one with `/playlistqueue`.
+/// Browses playlist `number`'s tracks. Queue one with `/playlist_queue`.
 #[poise::command(slash_command, guild_only)]
-pub async fn playlistplay(
+pub async fn playlist_play(
     ctx: Context<'_>,
     #[description = "Playlist number from /playlists"] number: u8,
 ) -> Result<(), Error> {
@@ -376,7 +414,8 @@ pub async fn playlistplay(
     ctx.send(
         poise::CreateReply::default()
             .content(format!(
-                "Tracks in **{}**:\n{listing}\n\nRun `/playlistqueue {number} <track number>` to queue one.",
+                "Tracks in **{}**:\n{listing}\n\nRun `/playlist_queue {number} <track number>` to queue one, \
+                 or `/playlist_queue_all {number}` to queue the whole playlist.",
                 playlist.title
             ))
             .ephemeral(true),
@@ -388,10 +427,10 @@ pub async fn playlistplay(
 
 /// Queues track `track_number` from playlist `playlist_number`.
 #[poise::command(slash_command, guild_only)]
-pub async fn playlistqueue(
+pub async fn playlist_queue(
     ctx: Context<'_>,
     #[description = "Playlist number from /playlists"] playlist_number: u8,
-    #[description = "Track number from /playlistplay"] track_number: u8,
+    #[description = "Track number from /playlist_play"] track_number: u8,
 ) -> Result<(), Error> {
     let Some(token) = require_access_token(ctx).await? else {
         return Ok(());
@@ -451,7 +490,71 @@ pub async fn playlistqueue(
     join_and_enqueue(ctx, track).await
 }
 
-/// Lists the linked account's liked videos. Queue one with `/likedplay`.
+/// Queues every track in playlist `playlist_number`, in playlist order.
+#[poise::command(slash_command, guild_only)]
+pub async fn playlist_queue_all(
+    ctx: Context<'_>,
+    #[description = "Playlist number from /playlists"] playlist_number: u8,
+) -> Result<(), Error> {
+    let Some(token) = require_access_token(ctx).await? else {
+        return Ok(());
+    };
+
+    let playlists = match ctx.data().youtube.list_playlists(&token).await {
+        Ok(playlists) => playlists,
+        Err(err) => {
+            ctx.send(
+                poise::CreateReply::default()
+                    .content(format!("Failed to list playlists: {err}"))
+                    .ephemeral(true),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    let Some(playlist) = select_by_number(&playlists, playlist_number) else {
+        ctx.send(
+            poise::CreateReply::default()
+                .content("Invalid selection.")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let tracks = match ctx
+        .data()
+        .youtube
+        .list_playlist_items(&token, &playlist.id)
+        .await
+    {
+        Ok(tracks) => tracks,
+        Err(err) => {
+            ctx.send(
+                poise::CreateReply::default()
+                    .content(format!("Failed to list playlist items: {err}"))
+                    .ephemeral(true),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    if tracks.is_empty() {
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("**{}** is empty.", playlist.title))
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    join_and_enqueue_all(ctx, &playlist.title, tracks).await
+}
+
+/// Lists the linked account's liked videos. Queue one with `/liked_play`.
 #[poise::command(slash_command, guild_only)]
 pub async fn liked(ctx: Context<'_>) -> Result<(), Error> {
     let Some(token) = require_access_token(ctx).await? else {
@@ -485,7 +588,7 @@ pub async fn liked(ctx: Context<'_>) -> Result<(), Error> {
     ctx.send(
         poise::CreateReply::default()
             .content(format!(
-                "Your liked videos:\n{listing}\n\nRun `/likedplay <number>` to queue one."
+                "Your liked videos:\n{listing}\n\nRun `/liked_play <number>` to queue one."
             ))
             .ephemeral(true),
     )
@@ -496,7 +599,7 @@ pub async fn liked(ctx: Context<'_>) -> Result<(), Error> {
 
 /// Re-fetches liked videos and queues result number `number` from them.
 #[poise::command(slash_command, guild_only)]
-pub async fn likedplay(
+pub async fn liked_play(
     ctx: Context<'_>,
     #[description = "Result number from /liked"] number: u8,
 ) -> Result<(), Error> {
