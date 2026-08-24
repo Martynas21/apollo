@@ -16,9 +16,6 @@ use serde::Deserialize;
 
 const API_BASE: &str = "https://www.googleapis.com/youtube/v3";
 
-/// Special playlist ID YouTube reserves for a user's liked videos.
-pub const LIKED_VIDEOS_PLAYLIST_ID: &str = "LL";
-
 /// A single playable video, as resolved from a playlist, liked-videos list,
 /// uploads list, or search results.
 #[derive(Debug, Clone, PartialEq)]
@@ -416,14 +413,6 @@ impl YouTubeClient {
         let durations = self.fetch_durations(access_token, &video_ids).await?;
 
         Ok(map_playlist_items(resp, &durations))
-    }
-
-    pub async fn list_liked_videos(
-        &self,
-        access_token: &str,
-    ) -> Result<Vec<Track>, YouTubeApiError> {
-        self.list_playlist_items(access_token, LIKED_VIDEOS_PLAYLIST_ID)
-            .await
     }
 
     /// Resolves the signed-in user's uploads playlist ID (via

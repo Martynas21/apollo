@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
+use rand::seq::SliceRandom;
 use serenity::{ChannelId, GuildId, UserId};
 use songbird::input::Input;
 use songbird::tracks::TrackHandle;
@@ -20,6 +21,7 @@ use songbird::{Call, Event, EventContext, EventHandler as SongbirdEventHandler, 
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::db;
 use crate::voice::resolve::{self, PlaybackError};
 use crate::youtube::api::Track;
 
@@ -43,12 +45,16 @@ pub struct QueuedTrack {
 
 #[derive(Debug)]
 pub enum PlayerError {
-    /// No active voice connection for this guild (caller should `/join` first).
+    /// No active voice connection for this guild (caller should `/play` first).
     NotConnected,
     /// `/skip`, `/pause`, `/resume`, or `/stop` with nothing currently playing.
     NothingPlaying,
+    /// `/shuffle` with fewer than two upcoming tracks to shuffle.
+    NothingToShuffle,
     Join(String),
     Playback(String),
+    /// Persisting a `/volume` change to the database failed.
+    Storage(String),
 }
 
 impl std::fmt::Display for PlayerError {
@@ -56,8 +62,10 @@ impl std::fmt::Display for PlayerError {
         match self {
             PlayerError::NotConnected => write!(f, "not connected to a voice channel"),
             PlayerError::NothingPlaying => write!(f, "nothing is playing"),
+            PlayerError::NothingToShuffle => write!(f, "not enough upcoming tracks to shuffle"),
             PlayerError::Join(message) => write!(f, "failed to join voice channel: {message}"),
             PlayerError::Playback(message) => write!(f, "playback error: {message}"),
+            PlayerError::Storage(message) => write!(f, "failed to save setting: {message}"),
         }
     }
 }
@@ -90,6 +98,7 @@ pub struct PlayerRegistry {
     songbird: Arc<Songbird>,
     http: oauth2::reqwest::Client,
     cookies_file: Option<String>,
+    db: sqlx::SqlitePool,
     guilds: Arc<Mutex<HashMap<GuildId, GuildState>>>,
 }
 
@@ -98,11 +107,13 @@ impl PlayerRegistry {
         songbird: Arc<Songbird>,
         http: oauth2::reqwest::Client,
         cookies_file: Option<String>,
+        db: sqlx::SqlitePool,
     ) -> Self {
         Self {
             songbird,
             http,
             cookies_file,
+            db,
             guilds: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -214,6 +225,16 @@ impl PlayerRegistry {
             let mut call = call.lock().await;
             call.play_input(input)
         };
+
+        // Best-effort: a missing/unreadable volume setting shouldn't block
+        // playback — fall back to songbird's own default (100%) rather than
+        // erroring the whole track out.
+        let volume = db::get_guild_volume(&self.db, &guild_id.to_string())
+            .await
+            .unwrap_or(db::DEFAULT_VOLUME);
+        if let Err(err) = handle.set_volume(volume as f32 / 100.0) {
+            tracing::warn!(%err, "failed to apply saved volume to new track");
+        }
 
         // Best-effort: if registering the end-of-track hook itself fails,
         // the track still plays, it just won't auto-advance the queue —
@@ -355,6 +376,46 @@ impl PlayerRegistry {
         handle
             .play()
             .map_err(|e| PlayerError::Playback(e.to_string()))
+    }
+
+    /// Shuffles the upcoming queue in place. Leaves `now_playing` where it
+    /// is — shuffling shouldn't restart or skip the current track.
+    pub async fn shuffle(&self, guild_id: GuildId) -> Result<(), PlayerError> {
+        let mut guilds = self.guilds.lock().await;
+        let Some(state) = guilds.get_mut(&guild_id) else {
+            return Err(PlayerError::NothingToShuffle);
+        };
+        if state.queue.len() < 2 {
+            return Err(PlayerError::NothingToShuffle);
+        }
+
+        let mut items: Vec<QueuedTrack> = state.queue.drain(..).collect();
+        items.shuffle(&mut rand::rng());
+        state.queue = items.into();
+
+        Ok(())
+    }
+
+    /// Sets and persists this guild's playback volume (0-100), applying it
+    /// immediately to whatever's currently playing.
+    pub async fn set_volume(&self, guild_id: GuildId, volume: u8) -> Result<(), PlayerError> {
+        db::set_guild_volume(&self.db, &guild_id.to_string(), volume)
+            .await
+            .map_err(|e| PlayerError::Storage(e.to_string()))?;
+
+        let handle = {
+            let guilds = self.guilds.lock().await;
+            guilds
+                .get(&guild_id)
+                .and_then(|state| state.current_handle.clone())
+        };
+        if let Some(handle) = handle
+            && let Err(err) = handle.set_volume(volume as f32 / 100.0)
+        {
+            tracing::warn!(%err, "failed to apply volume change to current track");
+        }
+
+        Ok(())
     }
 
     pub async fn queue_snapshot(&self, guild_id: GuildId) -> QueueSnapshot {

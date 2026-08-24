@@ -83,6 +83,7 @@ dependencies = [
  "dotenvy",
  "oauth2",
  "poise",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "serenity",

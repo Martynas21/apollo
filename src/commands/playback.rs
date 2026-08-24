@@ -1,5 +1,5 @@
-//! `/join`, `/leave`, `/play`, `/queue`, `/skip`, `/pause`, `/resume`,
-//! `/stop`, `/now_playing`: voice playback commands.
+//! `/play`, `/queue`, `/skip`, `/pause`, `/resume`, `/stop`, `/now_playing`,
+//! `/shuffle`, `/volume`: voice playback commands.
 
 use std::time::Duration;
 
@@ -152,33 +152,6 @@ async fn reply_error(ctx: Context<'_>, content: impl Into<String>) -> Result<(),
     )
     .await?;
     Ok(())
-}
-
-/// Joins the voice channel of the user invoking the command.
-#[poise::command(slash_command, guild_only)]
-pub async fn join(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
-    let Some(channel_id) = voice_channel_of(ctx) else {
-        reply_error(ctx, "you're not in a voice channel").await?;
-        return Ok(());
-    };
-
-    match ctx.data().player.join(guild_id, channel_id).await {
-        Ok(()) => reply_public(ctx, format!("Joined <#{channel_id}>.")).await,
-        Err(err) => reply_error(ctx, err.to_string()).await,
-    }
-}
-
-/// Leaves the current voice channel and clears the queue.
-#[poise::command(slash_command, guild_only)]
-pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
-
-    match ctx.data().player.leave(guild_id).await {
-        Ok(()) => reply_public(ctx, "Left the voice channel.").await,
-        Err(PlayerError::NotConnected) => reply_error(ctx, "not currently connected").await,
-        Err(err) => reply_error(ctx, err.to_string()).await,
-    }
 }
 
 /// Plays a YouTube video (URL or video ID), or searches and queues the top
@@ -346,6 +319,38 @@ pub async fn now_playing(ctx: Context<'_>) -> Result<(), Error> {
     ctx.send(poise::CreateReply::default().embed(now_playing_embed(&queued, position)))
         .await?;
     Ok(())
+}
+
+/// Shuffles the upcoming queue. Leaves the currently playing track alone.
+#[poise::command(slash_command, guild_only)]
+pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
+    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
+
+    match ctx.data().player.shuffle(guild_id).await {
+        Ok(()) => reply_public(ctx, "Shuffled the queue.").await,
+        Err(PlayerError::NothingToShuffle) => {
+            reply_error(ctx, "not enough upcoming tracks to shuffle").await
+        }
+        Err(err) => reply_error(ctx, err.to_string()).await,
+    }
+}
+
+/// Sets the playback volume (0-100). Applies immediately and persists for
+/// future tracks.
+#[poise::command(slash_command, guild_only)]
+pub async fn volume(
+    ctx: Context<'_>,
+    #[description = "Volume, 0-100"]
+    #[min = 0]
+    #[max = 100]
+    level: u8,
+) -> Result<(), Error> {
+    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
+
+    match ctx.data().player.set_volume(guild_id, level).await {
+        Ok(()) => reply_public(ctx, format!("Volume set to {level}.")).await,
+        Err(err) => reply_error(ctx, err.to_string()).await,
+    }
 }
 
 #[cfg(test)]

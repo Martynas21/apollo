@@ -27,21 +27,11 @@ pub struct Data {
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Context<'a> = poise::Context<'a, Data, Error>;
 
-/// Trivial connectivity check.
-#[poise::command(slash_command)]
-async fn ping(ctx: Context<'_>) -> Result<(), Error> {
-    ctx.say("Pong!").await?;
-    Ok(())
-}
-
 /// All commands registered with the framework.
 pub fn commands() -> Vec<poise::Command<Data, Error>> {
     vec![
-        ping(),
         youtube::link(),
         youtube::unlink(),
-        playback::join(),
-        playback::leave(),
         playback::play(),
         playback::queue(),
         playback::skip(),
@@ -49,13 +39,11 @@ pub fn commands() -> Vec<poise::Command<Data, Error>> {
         playback::resume(),
         playback::stop(),
         playback::now_playing(),
-        library::search(),
-        library::search_play(),
+        playback::shuffle(),
+        playback::volume(),
+        library::add_to_queue(),
         library::playlists(),
+        library::playlist_browse(),
         library::playlist_play(),
-        library::playlist_queue(),
-        library::playlist_queue_all(),
-        library::liked(),
-        library::liked_play(),
     ]
 }

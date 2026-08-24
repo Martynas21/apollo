@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         songbird.clone(),
         oauth2::reqwest::Client::new(),
         config.yt_dlp_cookies_file.clone(),
+        db_pool.clone(),
     );
     let youtube_client = youtube::api::YouTubeClient::new(oauth2::reqwest::Client::new());
 

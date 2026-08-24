@@ -2,8 +2,7 @@
 
 Apollo is a Discord bot that lets a Discord user link their own YouTube
 account (via Google OAuth2) and stream audio from YouTube — their
-playlists, liked videos, or ad-hoc search/URL — directly into a Discord
-voice channel.
+playlists, or ad-hoc search/URL — directly into a Discord voice channel.
 
 ## Status
 
@@ -169,19 +168,22 @@ See `.env.example` for the full list and inline docs:
 ## Commands
 
 - **Account**: `/link`, `/unlink`
-- **Playback**: `/join`, `/leave`, `/play <query|url>`, `/queue`, `/skip`,
-  `/pause`, `/resume`, `/stop`, `/now_playing`
-- **Library browsing**: `/search <query>` → `/search_play <query> <n>`,
-  `/playlists` → `/playlist_play <n>` → `/playlist_queue <playlist n> <track n>`
-  (or `/playlist_queue_all <playlist n>` to queue every track in it),
-  `/liked` → `/liked_play <n>`
+- **Playback**: `/play <query|url>` (auto-joins your voice channel), `/queue`,
+  `/skip`, `/pause`, `/resume`, `/stop`, `/now_playing`, `/shuffle`,
+  `/volume <0-100>` (persists per-guild across restarts)
+- **Library browsing**: `/add_to_queue <query>` (no `number` → shows the top 5
+  matches; same `query` plus a `number` → queues one), `/playlists` →
+  `/playlist_browse <n>` (or `/playlist_play <n>` to queue the whole playlist
+  in one shot without browsing it first)
 
-  The browsing commands show a numbered list and a follow-up command
-  queues a pick by number — there's no interactive button/select-menu
-  picker (that needs live Discord component-interaction testing this
-  project hasn't had yet). `/playlist_queue_all` is the exception: it
-  queues the whole playlist in one shot without needing a prior
-  `/playlist_play` browse step.
+  The browsing commands show a numbered list and a follow-up call queues a
+  pick by number — there's no interactive button/select-menu picker (that
+  needs live Discord component-interaction testing this project hasn't had
+  yet).
+
+  There's no manual `/join`/`/leave` — the bot joins automatically on
+  `/play`/`/add_to_queue`/etc., and leaves on its own 5 minutes after the
+  queue drains empty (see `IDLE_DISCONNECT` in `src/voice/player.rs`).
 
 ## Deployment
 

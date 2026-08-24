@@ -88,6 +88,36 @@ pub async fn delete_token(pool: &SqlitePool, discord_user_id: &str) -> Result<()
     Ok(())
 }
 
+/// Default playback volume (percent) for a guild with no `guild_settings` row.
+pub const DEFAULT_VOLUME: u8 = 100;
+
+/// Reads a guild's persisted playback volume (0-100), defaulting to
+/// [`DEFAULT_VOLUME`] if it's never been set.
+pub async fn get_guild_volume(pool: &SqlitePool, guild_id: &str) -> Result<u8> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT volume FROM guild_settings WHERE guild_id = ?1")
+        .bind(guild_id)
+        .fetch_optional(pool)
+        .await
+        .context("failed to fetch guild volume")?;
+
+    Ok(row.map_or(DEFAULT_VOLUME, |(volume,)| volume as u8))
+}
+
+/// Persists a guild's playback volume (0-100).
+pub async fn set_guild_volume(pool: &SqlitePool, guild_id: &str, volume: u8) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO guild_settings (guild_id, volume) VALUES (?1, ?2)
+         ON CONFLICT(guild_id) DO UPDATE SET volume = excluded.volume",
+    )
+    .bind(guild_id)
+    .bind(volume as i64)
+    .execute(pool)
+    .await
+    .context("failed to set guild volume")?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +193,30 @@ mod tests {
             .await?
             .expect("token should still be present after reopening the pool");
         assert_eq!(fetched, token);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guild_volume_defaults_when_unset() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        assert_eq!(get_guild_volume(&pool, "1").await?, DEFAULT_VOLUME);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guild_volume_set_and_get_round_trip() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+
+        set_guild_volume(&pool, "1", 42).await?;
+        assert_eq!(get_guild_volume(&pool, "1").await?, 42);
+
+        // A different guild is unaffected.
+        assert_eq!(get_guild_volume(&pool, "2").await?, DEFAULT_VOLUME);
+
+        // Setting again replaces rather than erroring on the existing row.
+        set_guild_volume(&pool, "1", 7).await?;
+        assert_eq!(get_guild_volume(&pool, "1").await?, 7);
 
         Ok(())
     }
