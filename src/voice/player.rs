@@ -14,12 +14,20 @@ use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, GuildId, UserId};
+use songbird::input::Input;
 use songbird::tracks::TrackHandle;
 use songbird::{Call, Event, EventContext, EventHandler as SongbirdEventHandler, Songbird, TrackEvent};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
-use crate::voice::resolve;
+use crate::voice::resolve::{self, PlaybackError};
 use crate::youtube::api::Track;
+
+/// A background pre-buffer for the track that's up next in the queue,
+/// started as soon as the current track begins playing so its download
+/// finishes (or is well underway) by the time it's actually needed. See
+/// `cached_track_input`.
+type Prefetch = JoinHandle<Result<Input, PlaybackError>>;
 
 /// How long an empty, drained queue waits before the bot leaves the voice
 /// channel on its own. Re-checked when the timer fires (not just scheduled
@@ -61,6 +69,11 @@ struct GuildState {
     queue: VecDeque<QueuedTrack>,
     now_playing: Option<QueuedTrack>,
     current_handle: Option<TrackHandle>,
+    /// Background pre-buffer for `queue`'s front entry, started right after
+    /// the current track begins playing. Always corresponds to whatever is
+    /// at the front of `queue` — `enqueue`/`advance`/`stop` are the only
+    /// places that mutate the queue, and each keeps this in sync.
+    prefetch: Option<Prefetch>,
 }
 
 /// A point-in-time view of a guild's queue, for `/queue` and `/now_playing`.
@@ -145,10 +158,41 @@ impl PlayerRegistry {
         };
 
         if should_start {
-            self.start_playback(guild_id, call, queued).await?;
+            self.start_playback(guild_id, call, queued, None).await?;
         }
 
         Ok(())
+    }
+
+    /// Resolves a prefetch handle into a playable input, falling back to
+    /// building fresh (rather than propagating a stale prefetch failure) if
+    /// the background download errored.
+    async fn resolve_prefetched(&self, queued: &QueuedTrack, prefetched: Prefetch) -> Input {
+        match prefetched.await {
+            Ok(Ok(input)) => return input,
+            Ok(Err(err)) => tracing::warn!(%err, "prefetch failed, resolving fresh instead"),
+            Err(err) => tracing::warn!(%err, "prefetch task panicked, resolving fresh instead"),
+        }
+        self.cached_input(queued).await.unwrap_or_else(|_| {
+            // `cached_track_input`'s only fallible steps are the same ones
+            // that already failed above; fall back to the plain live-stream
+            // input so playback can still be attempted rather than giving up.
+            resolve::track_input(
+                self.http.clone(),
+                &queued.track.video_id,
+                self.cookies_file.as_deref(),
+            )
+        })
+    }
+
+    async fn cached_input(&self, queued: &QueuedTrack) -> Result<Input, PlaybackError> {
+        resolve::cached_track_input(
+            self.http.clone(),
+            &queued.track.video_id,
+            queued.track.duration,
+            self.cookies_file.as_deref(),
+        )
+        .await
     }
 
     async fn start_playback(
@@ -156,12 +200,15 @@ impl PlayerRegistry {
         guild_id: GuildId,
         call: Arc<Mutex<Call>>,
         queued: QueuedTrack,
+        prefetched: Option<Prefetch>,
     ) -> Result<(), PlayerError> {
-        let input = resolve::track_input(
-            self.http.clone(),
-            &queued.track.video_id,
-            self.cookies_file.as_deref(),
-        );
+        let input = match prefetched {
+            Some(handle) => self.resolve_prefetched(&queued, handle).await,
+            None => self
+                .cached_input(&queued)
+                .await
+                .map_err(|e| PlayerError::Playback(e.to_string()))?,
+        };
 
         let handle = {
             let mut call = call.lock().await;
@@ -184,6 +231,13 @@ impl PlayerRegistry {
         let mut guilds = self.guilds.lock().await;
         if let Some(state) = guilds.get_mut(&guild_id) {
             state.current_handle = Some(handle);
+
+            // Start pre-buffering whatever's next in the queue now, so its
+            // download runs in the background while this track plays.
+            if let Some(next) = state.queue.front().cloned() {
+                let registry = self.clone();
+                state.prefetch = Some(tokio::spawn(async move { registry.cached_input(&next).await }));
+            }
         }
 
         Ok(())
@@ -193,20 +247,20 @@ impl PlayerRegistry {
     /// schedules an idle-timeout disconnect. Called from [`TrackEndHandler`]
     /// whenever a track ends, whether naturally or via `/skip`/`/stop`.
     async fn advance(&self, guild_id: GuildId) {
-        let next = {
+        let (next, prefetch) = {
             let mut guilds = self.guilds.lock().await;
             let Some(state) = guilds.get_mut(&guild_id) else {
                 return;
             };
             state.current_handle = None;
             state.now_playing = state.queue.pop_front();
-            state.now_playing.clone()
+            (state.now_playing.clone(), state.prefetch.take())
         };
 
         match next {
             Some(queued) => {
                 if let Some(call) = self.songbird.get(guild_id)
-                    && let Err(err) = self.start_playback(guild_id, call, queued).await
+                    && let Err(err) = self.start_playback(guild_id, call, queued, prefetch).await
                 {
                     tracing::warn!(%err, "failed to start next queued track");
                 }
@@ -244,6 +298,9 @@ impl PlayerRegistry {
             };
             state.queue.clear();
             state.now_playing = None;
+            if let Some(prefetch) = state.prefetch.take() {
+                prefetch.abort();
+            }
             state.current_handle.take()
         };
 

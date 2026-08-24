@@ -8,7 +8,9 @@
 //! `ffmpeg` subprocess needed for playback.
 
 use std::io::ErrorKind;
+use std::time::Duration;
 
+use songbird::input::cached::Memory;
 use songbird::input::{Input, YoutubeDl};
 use tokio::process::Command;
 
@@ -16,6 +18,11 @@ use tokio::process::Command;
 /// `PlaybackError::Other`, matching `YouTubeApiError`'s convention in
 /// `src/youtube/api.rs`.
 const STDERR_TRUNCATE_LEN: usize = 200;
+
+/// Tracks longer than this (or with no known duration, e.g. livestreams)
+/// skip full pre-buffering and fall back to [`track_input`]'s live-streaming
+/// path, to bound worst-case memory use. See `cached_track_input`.
+const MAX_BUFFERED_TRACK_DURATION: Duration = Duration::from_secs(20 * 60);
 
 #[derive(Debug)]
 pub enum PlaybackError {
@@ -134,6 +141,47 @@ pub fn track_input(
         ytdl = ytdl.user_args(vec!["--cookies".to_string(), cookies_file.to_string()]);
     }
     ytdl.into()
+}
+
+/// Builds a fully pre-buffered songbird input: the entire track is
+/// downloaded into memory (via songbird's [`Memory`] cache) before this
+/// returns, so playback never reads from the network. This is what makes
+/// playback immune to network blips — songbird's live-streaming path has
+/// only a small, fixed-size buffer, and a stall long enough to drain it
+/// causes an audible speed-up as the driver's scheduler bursts packets to
+/// catch up (see the plan doc/README for the full root cause).
+///
+/// `duration` is used to skip pre-buffering for livestreams (`None` — no
+/// fixed length to download ahead of) and for tracks longer than
+/// [`MAX_BUFFERED_TRACK_DURATION`], to bound memory use; both fall back to
+/// [`track_input`]'s live-streaming behavior and remain exposed to the
+/// original bug.
+pub async fn cached_track_input(
+    http: oauth2::reqwest::Client,
+    video_id: &str,
+    duration: Option<Duration>,
+    cookies_file: Option<&str>,
+) -> Result<Input, PlaybackError> {
+    let lazy = track_input(http, video_id, cookies_file);
+
+    let too_long = duration.is_none_or(|d| d > MAX_BUFFERED_TRACK_DURATION);
+    if too_long {
+        return Ok(lazy);
+    }
+
+    let memory = Memory::new(lazy)
+        .await
+        .map_err(|e| PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN)))?;
+
+    // `Memory`/`Catcher` only fill lazily as a consumer reads through them —
+    // drive a cloned handle to read everything up front (it shares the same
+    // backing store) so playback later reads purely from RAM.
+    let mut loader = memory.raw.new_handle();
+    tokio::task::spawn_blocking(move || loader.load_all())
+        .await
+        .map_err(|e| PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN)))?;
+
+    Ok(memory.into())
 }
 
 #[cfg(test)]
