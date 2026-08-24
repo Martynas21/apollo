@@ -43,7 +43,7 @@ pub fn commands() -> Vec<poise::Command<Data, Error>> {
         playback::pause(),
         playback::resume(),
         playback::stop(),
-        playback::now_playing(),
+        playback::player(),
         playback::shuffle(),
         playback::volume(),
         library::add_to_queue(),

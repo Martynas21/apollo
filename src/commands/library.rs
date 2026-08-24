@@ -12,10 +12,11 @@
 
 use poise::serenity_prelude as serenity;
 
-use super::playback::{access_token_error_message, truncate_label};
+use super::playback::access_token_error_message;
 use super::{Context, Data, Error};
 use crate::voice::QueuedTrack;
-use crate::youtube::api::{Playlist, Track};
+use crate::voice::panel::truncate_label;
+use crate::youtube::api::{Playlist, Track, YouTubeClient};
 use crate::youtube::oauth::get_valid_access_token;
 
 /// Max results shown by `/add_to_queue` when browsing (no `number` given).
@@ -107,6 +108,35 @@ fn format_playlist_list(playlists: &[crate::youtube::api::Playlist]) -> String {
     }
 
     lines.join("\n")
+}
+
+/// Fetches the linked account's playlists and renders the listing: display
+/// text plus (when non-empty) a [`playlist_select_menu`] row. `Err` carries
+/// a ready-to-show failure message rather than a raw error, since every
+/// caller just displays it directly. Shared by `/playlists` and the
+/// `/player` panel's Playlists button.
+async fn playlists_listing(
+    youtube: &YouTubeClient,
+    token: &str,
+) -> Result<(String, Vec<serenity::CreateActionRow>), String> {
+    let playlists = youtube
+        .list_playlists(token)
+        .await
+        .map_err(|err| format!("Failed to list playlists: {err}"))?;
+
+    if playlists.is_empty() {
+        return Ok(("You don't have any playlists.".to_string(), Vec::new()));
+    }
+
+    let listing = format_playlist_list(&playlists);
+    let content = format!(
+        "Your playlists:\n{listing}\n\nSelect one below to browse its tracks, \
+         or run `/playlist_play <number>` to queue the whole thing."
+    );
+    Ok((
+        content,
+        vec![playlist_select_menu(&playlists, LIST_DISPLAY_LIMIT)],
+    ))
 }
 
 /// Builds a `library:queue` select menu offering up to `limit` (and never
@@ -367,6 +397,143 @@ async fn handle_browse_playlist(
                     "Tracks:\n{listing}\n\nSelect one below to queue it, or queue the whole playlist."
                 ))
                 .components(components),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Handles the `/player` panel's Playlists button: same content as
+/// `/playlists`, as an ephemeral edit to the already-deferred component
+/// interaction (the caller — [`super::playback::handle_component`] — defers
+/// before calling this, same as every `library:*` handler does for itself).
+pub(super) async fn handle_playlists_button(
+    ctx: &serenity::Context,
+    component: &serenity::ComponentInteraction,
+    data: &Data,
+) -> Result<(), Error> {
+    let token = match get_valid_access_token(
+        &data.oauth_client,
+        &data.oauth_http,
+        &data.db,
+        &component.user.id.to_string(),
+        &data.token_key,
+    )
+    .await
+    {
+        Ok(token) => token,
+        Err(err) => return update_picker(ctx, component, access_token_error_message(&err)).await,
+    };
+
+    let (content, components) = match playlists_listing(&data.youtube, &token).await {
+        Ok(listing) => listing,
+        Err(message) => return update_picker(ctx, component, message).await,
+    };
+
+    component
+        .edit_response(
+            &ctx.http,
+            serenity::EditInteractionResponse::new()
+                .content(content)
+                .components(components),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Extracts the submitted `query` field's value from a modal submission
+/// built by [`super::playback::handle_search_button`], or `None` if it was
+/// left empty.
+fn modal_query(data: &serenity::ModalInteractionData) -> Option<String> {
+    data.components.iter().find_map(|row| {
+        row.components.iter().find_map(|component| match component {
+            serenity::ActionRowComponent::InputText(input) if input.custom_id == "query" => {
+                input.value.clone().filter(|v| !v.is_empty())
+            }
+            _ => None,
+        })
+    })
+}
+
+/// Handles the `/player` panel's Search flow once its modal is submitted:
+/// runs the query and replies with a [`track_select_menu`] to queue one —
+/// the same shape as `/add_to_queue`'s no-`number` branch, just reached via
+/// a modal instead of a slash-command argument.
+pub(super) async fn handle_search_modal_submit(
+    ctx: &serenity::Context,
+    modal: &serenity::ModalInteraction,
+    data: &Data,
+) -> Result<(), Error> {
+    modal.defer_ephemeral(&ctx.http).await?;
+
+    let Some(query) = modal_query(&modal.data) else {
+        modal
+            .edit_response(
+                &ctx.http,
+                serenity::EditInteractionResponse::new().content("Enter a search query."),
+            )
+            .await?;
+        return Ok(());
+    };
+
+    let token = match get_valid_access_token(
+        &data.oauth_client,
+        &data.oauth_http,
+        &data.db,
+        &modal.user.id.to_string(),
+        &data.token_key,
+    )
+    .await
+    {
+        Ok(token) => token,
+        Err(err) => {
+            modal
+                .edit_response(
+                    &ctx.http,
+                    serenity::EditInteractionResponse::new()
+                        .content(access_token_error_message(&err)),
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let results = match data.youtube.search(&token, &query).await {
+        Ok(results) => results,
+        Err(err) => {
+            modal
+                .edit_response(
+                    &ctx.http,
+                    serenity::EditInteractionResponse::new()
+                        .content(format!("Search failed: {err}")),
+                )
+                .await?;
+            return Ok(());
+        }
+    };
+
+    if results.is_empty() {
+        modal
+            .edit_response(
+                &ctx.http,
+                serenity::EditInteractionResponse::new()
+                    .content(format!("No results found for \"{query}\".")),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let listing = format_track_list(&results, ADD_TO_QUEUE_DISPLAY_LIMIT);
+    modal
+        .edit_response(
+            &ctx.http,
+            serenity::EditInteractionResponse::new()
+                .content(format!(
+                    "Search results for \"{query}\":\n{listing}\n\nSelect one below to queue it."
+                ))
+                .components(vec![track_select_menu(
+                    &results,
+                    ADD_TO_QUEUE_DISPLAY_LIMIT,
+                )]),
         )
         .await?;
     Ok(())
@@ -657,12 +824,12 @@ pub async fn playlists(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
 
-    let playlists = match ctx.data().youtube.list_playlists(&token).await {
-        Ok(playlists) => playlists,
-        Err(err) => {
+    let (content, components) = match playlists_listing(&ctx.data().youtube, &token).await {
+        Ok(listing) => listing,
+        Err(message) => {
             ctx.send(
                 poise::CreateReply::default()
-                    .content(format!("Failed to list playlists: {err}"))
+                    .content(message)
                     .ephemeral(true),
             )
             .await?;
@@ -670,24 +837,10 @@ pub async fn playlists(ctx: Context<'_>) -> Result<(), Error> {
         }
     };
 
-    if playlists.is_empty() {
-        ctx.send(
-            poise::CreateReply::default()
-                .content("You don't have any playlists.")
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let listing = format_playlist_list(&playlists);
     ctx.send(
         poise::CreateReply::default()
-            .content(format!(
-                "Your playlists:\n{listing}\n\nSelect one below to browse its tracks, \
-                 or run `/playlist_play <number>` to queue the whole thing."
-            ))
-            .components(vec![playlist_select_menu(&playlists, LIST_DISPLAY_LIMIT)])
+            .content(content)
+            .components(components)
             .ephemeral(true),
     )
     .await?;

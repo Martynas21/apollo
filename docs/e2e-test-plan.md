@@ -60,9 +60,6 @@ share with other people — some steps involve deliberately breaking things
 - [ ] While something is playing, `/play` a second track — it queues
       rather than interrupting; `/queue` shows both the now-playing track
       and the queued one.
-- [ ] `/now_playing` shows an embed: title (linking to the actual video),
-      thumbnail image, channel, requester mention, and a progress value
-      that visibly increases if you run it twice a few seconds apart.
 - [ ] `/pause` then `/resume` — audio actually stops and restarts, not
       just the command replying successfully.
 - [ ] `/skip` — the queued track starts playing next automatically (no
@@ -76,7 +73,47 @@ share with other people — some steps involve deliberately breaking things
       leave the voice channel on its own. (Long wait — worth doing once,
       not on every test pass.)
 
-## 4. Failure modes
+## 4. Player panel
+
+`/player` replaces the old `/now_playing` with a single persistent,
+self-updating panel per guild. This is the one area with no live-Discord
+substitute for manual testing — everything here depends on real message
+edits landing in real time.
+
+- [ ] `/player` with nothing playing posts a panel: an informational
+      "search or browse a playlist to get started" message, playback
+      buttons (Pause/Skip/Stop/Shuffle, volume +/-) all disabled, and
+      Search/Playlists buttons enabled.
+- [ ] Panel's **Search** button opens a modal; submitting a query shows an
+      ephemeral result picker (only visible to you); picking a result
+      starts playback (auto-joining your voice channel) and the panel
+      updates in place to show it — title, thumbnail, channel, requester,
+      progress.
+- [ ] Panel's **Playlists** button shows an ephemeral playlist listing;
+      picking one, then queuing a track or the whole playlist, is reflected
+      in the panel (now-playing and/or queue) without touching the panel
+      itself.
+- [ ] Panel's own Pause/Resume/Skip/Stop/Shuffle/volume buttons work and
+      update the panel in place immediately (same as the old `/now_playing`
+      panel did).
+- [ ] Run `/skip`, `/pause`, `/stop`, `/shuffle`, or `/volume` as **slash
+      commands** (not panel buttons) while a panel is live — the panel
+      message updates on its own within a second or two, with nobody
+      touching its buttons.
+- [ ] Let a track play to its natural end with another queued behind it —
+      the panel advances to the next track on its own.
+- [ ] Let the queue drain and the idle-timeout auto-disconnect fire (see
+      the "Auto-disconnect" step above) — the panel updates to the
+      "nothing is playing" empty state rather than freezing on the last
+      track that played.
+- [ ] Run `/player` again in the same guild — the previous panel message is
+      deleted (check the channel), and only the new one remains and keeps
+      updating.
+- [ ] Manually delete the panel message yourself, then trigger a state
+      change (e.g. `/play` something) — the bot doesn't error or hang; it
+      just has no panel to update until `/player` is run again.
+
+## 5. Failure modes
 
 - [ ] `/play` an age-restricted video — replies with a clear
       "age-restricted" message, not a raw error dump or a hang.
@@ -88,7 +125,7 @@ share with other people — some steps involve deliberately breaking things
       channel and the bot isn't already connected — replies "join a voice
       channel first, or use `/join`", doesn't silently fail.
 
-## 5. Re-link handling
+## 6. Re-link handling
 
 This is the one that needs deliberate setup: it exercises the
 `AccessTokenError::RefreshFailed { revoked: true, .. }` path from
@@ -106,7 +143,7 @@ This is the one that needs deliberate setup: it exercises the
 - [ ] `/link` again afterward — should work cleanly (the stale row was
       deleted automatically per the `invalid_grant` handling).
 
-## 6. Unlinking
+## 7. Unlinking
 
 - [ ] `/unlink` on a linked account — confirms unlinked, and a subsequent
       `/play` correctly says "you need to link your Google account
@@ -117,7 +154,7 @@ This is the one that needs deliberate setup: it exercises the
       linking — the link should still be there afterward (SQLite
       persistence surviving a restart, Phase 3's actual "done when").
 
-## 7. Multi-guild sanity (skip if you only have one test server)
+## 8. Multi-guild sanity (skip if you only have one test server)
 
 - [ ] Playing in two different guilds at once doesn't cross-contaminate
       queues — `/queue` in guild A never shows guild B's tracks.

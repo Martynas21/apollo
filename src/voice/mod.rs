@@ -5,6 +5,7 @@
 //! decodes the resolved stream via symphonia — no separate `ffmpeg`
 //! subprocess in the playback path itself.
 
+pub mod panel;
 pub mod player;
 pub mod resolve;
 

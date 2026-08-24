@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
 use rand::seq::SliceRandom;
-use serenity::{ChannelId, GuildId, UserId};
+use serenity::{ChannelId, GuildId, MessageId, UserId};
 use songbird::input::Input;
 use songbird::tracks::{PlayMode, TrackHandle};
 use songbird::{
@@ -93,6 +93,10 @@ struct GuildState {
     /// at the front of `queue` — `enqueue`/`advance`/`stop` are the only
     /// places that mutate the queue, and each keeps this in sync.
     prefetch: Option<Prefetch>,
+    /// The live `/player` panel message for this guild, if one has been
+    /// posted — kept current by [`PlayerRegistry::refresh_panel`] after
+    /// every state-changing mutation.
+    panel: Option<(ChannelId, MessageId)>,
 }
 
 /// A point-in-time view of a guild's queue, for `/queue` and `/now_playing`.
@@ -108,6 +112,12 @@ pub struct QueueSnapshot {
 pub struct PlayerRegistry {
     songbird: Arc<Songbird>,
     http: oauth2::reqwest::Client,
+    /// Used only to edit/delete the live `/player` panel message from
+    /// contexts that aren't already handling a Discord interaction (e.g.
+    /// [`TrackEndHandler`], or a `/skip` slash command refreshing a panel
+    /// message it didn't itself respond to). Unrelated to `http` above,
+    /// which is for yt-dlp/YouTube stream resolution.
+    discord_http: Arc<serenity::Http>,
     cookies_file: Option<String>,
     db: sqlx::SqlitePool,
     guilds: Arc<Mutex<HashMap<GuildId, GuildState>>>,
@@ -117,12 +127,14 @@ impl PlayerRegistry {
     pub fn new(
         songbird: Arc<Songbird>,
         http: oauth2::reqwest::Client,
+        discord_http: Arc<serenity::Http>,
         cookies_file: Option<String>,
         db: sqlx::SqlitePool,
     ) -> Self {
         Self {
             songbird,
             http,
+            discord_http,
             cookies_file,
             db,
             guilds: Arc::new(Mutex::new(HashMap::new())),
@@ -141,13 +153,27 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    /// Leaves voice and drops all queued/now-playing state for the guild.
+    /// Leaves voice and drops all queued/now-playing state for the guild. If
+    /// a `/player` panel is live, it gets one last edit to reflect that
+    /// nothing is playing anymore — otherwise it would freeze showing
+    /// whatever was playing right before disconnect (notably including the
+    /// common case of the idle-timeout auto-disconnect in
+    /// [`Self::schedule_idle_disconnect`]).
     pub async fn leave(&self, guild_id: GuildId) -> Result<(), PlayerError> {
         self.songbird
             .leave(guild_id)
             .await
             .map_err(|e| PlayerError::Join(e.to_string()))?;
-        self.guilds.lock().await.remove(&guild_id);
+
+        let panel = self
+            .guilds
+            .lock()
+            .await
+            .remove(&guild_id)
+            .and_then(|state| state.panel);
+        if let Some((channel_id, message_id)) = panel {
+            let _ = self.edit_panel(guild_id, channel_id, message_id).await;
+        }
         Ok(())
     }
 
@@ -190,6 +216,7 @@ impl PlayerRegistry {
             return Err(err);
         }
 
+        self.refresh_panel(guild_id).await;
         Ok(())
     }
 
@@ -308,6 +335,8 @@ impl PlayerRegistry {
             }
             None => self.schedule_idle_disconnect(guild_id),
         }
+
+        self.refresh_panel(guild_id).await;
     }
 
     fn schedule_idle_disconnect(&self, guild_id: GuildId) {
@@ -352,9 +381,13 @@ impl PlayerRegistry {
         // Stopping fires a Track::End event, but `now_playing`/`current_handle`
         // are already cleared above, so `advance()` will see an empty queue
         // and just (re-)schedule the idle timer rather than double-advance.
-        handle
+        let result = handle
             .stop()
-            .map_err(|e| PlayerError::Playback(e.to_string()))
+            .map_err(|e| PlayerError::Playback(e.to_string()));
+        if result.is_ok() {
+            self.refresh_panel(guild_id).await;
+        }
+        result
     }
 
     /// Stops the current track, which triggers the queue to auto-advance to
@@ -380,9 +413,13 @@ impl PlayerRegistry {
                 .and_then(|state| state.current_handle.clone())
         };
         let handle = handle.ok_or(PlayerError::NothingPlaying)?;
-        handle
+        let result = handle
             .pause()
-            .map_err(|e| PlayerError::Playback(e.to_string()))
+            .map_err(|e| PlayerError::Playback(e.to_string()));
+        if result.is_ok() {
+            self.refresh_panel(guild_id).await;
+        }
+        result
     }
 
     pub async fn resume(&self, guild_id: GuildId) -> Result<(), PlayerError> {
@@ -393,9 +430,13 @@ impl PlayerRegistry {
                 .and_then(|state| state.current_handle.clone())
         };
         let handle = handle.ok_or(PlayerError::NothingPlaying)?;
-        handle
+        let result = handle
             .play()
-            .map_err(|e| PlayerError::Playback(e.to_string()))
+            .map_err(|e| PlayerError::Playback(e.to_string()));
+        if result.is_ok() {
+            self.refresh_panel(guild_id).await;
+        }
+        result
     }
 
     /// Shuffles the upcoming queue in place. Leaves `now_playing` where it
@@ -412,7 +453,9 @@ impl PlayerRegistry {
         let mut items: Vec<QueuedTrack> = state.queue.drain(..).collect();
         items.shuffle(&mut rand::rng());
         state.queue = items.into();
+        drop(guilds);
 
+        self.refresh_panel(guild_id).await;
         Ok(())
     }
 
@@ -481,6 +524,7 @@ impl PlayerRegistry {
             tracing::warn!(%err, "failed to apply volume change to current track");
         }
 
+        self.refresh_panel(guild_id).await;
         Ok(())
     }
 
@@ -510,6 +554,87 @@ impl PlayerRegistry {
                 .and_then(|state| state.current_handle.clone())
         }?;
         handle.get_info().await.ok().map(|state| state.position)
+    }
+
+    /// Points this guild's live `/player` panel at a new message, best-effort
+    /// deleting whatever panel message preceded it (ignored if it's already
+    /// gone — e.g. a user deleted it themselves).
+    pub async fn replace_panel(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) {
+        let old = {
+            let mut guilds = self.guilds.lock().await;
+            guilds
+                .entry(guild_id)
+                .or_default()
+                .panel
+                .replace((channel_id, message_id))
+        };
+
+        if let Some((old_channel, old_message)) = old {
+            let _ = old_channel
+                .delete_message(self.discord_http.clone(), old_message)
+                .await;
+        }
+    }
+
+    /// Renders and pushes the panel's current appearance to an already-known
+    /// panel message. Shared by [`Self::refresh_panel`] (looks up the
+    /// pointer itself and self-heals on failure) and [`Self::leave`] (which
+    /// already has the pointer in hand, from the `GuildState` it just
+    /// removed).
+    async fn edit_panel(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        message_id: MessageId,
+    ) -> Result<(), ()> {
+        let (content, embed, components) = crate::voice::panel::render(self, guild_id).await;
+        let mut edit = serenity::EditMessage::new()
+            .content(content)
+            .components(components);
+        edit = match embed {
+            Some(embed) => edit.embed(embed),
+            None => edit.embeds(Vec::new()),
+        };
+
+        channel_id
+            .edit_message(self.discord_http.clone(), message_id, edit)
+            .await
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
+    /// Edits this guild's live `/player` panel message (if any) with fresh
+    /// content — called after every state-changing mutation so the panel
+    /// stays current regardless of what triggered the change (its own
+    /// buttons, a slash command, or a track ending on its own).
+    ///
+    /// Self-heals on edit failure (e.g. the message was deleted out from
+    /// under it) by forgetting the panel, so later mutations don't keep
+    /// retrying a dead pointer.
+    async fn refresh_panel(&self, guild_id: GuildId) {
+        let panel = {
+            let guilds = self.guilds.lock().await;
+            guilds.get(&guild_id).and_then(|state| state.panel)
+        };
+        let Some((channel_id, message_id)) = panel else {
+            return;
+        };
+
+        if self
+            .edit_panel(guild_id, channel_id, message_id)
+            .await
+            .is_err()
+        {
+            let mut guilds = self.guilds.lock().await;
+            if let Some(state) = guilds.get_mut(&guild_id) {
+                state.panel = None;
+            }
+        }
     }
 }
 

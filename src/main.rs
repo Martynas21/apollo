@@ -46,9 +46,15 @@ async fn main() -> anyhow::Result<()> {
     // Built here (rather than left to `.register_songbird()`) so the same
     // `Arc<Songbird>` can back both the serenity client and `Data::player`.
     let songbird = songbird::Songbird::serenity();
+    // Independent of the gateway `Client` (built further down) so
+    // `PlayerRegistry` can use it to push `/player` panel edits from
+    // contexts that aren't already handling a Discord interaction, e.g. the
+    // track-end handler that drives auto-advance.
+    let discord_http = std::sync::Arc::new(serenity::Http::new(&config.discord_token));
     let player = voice::PlayerRegistry::new(
         songbird.clone(),
         oauth2::reqwest::Client::new(),
+        discord_http,
         config.yt_dlp_cookies_file.clone(),
         db_pool.clone(),
     );

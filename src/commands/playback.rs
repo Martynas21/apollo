@@ -1,12 +1,14 @@
-//! `/play`, `/queue`, `/skip`, `/pause`, `/resume`, `/stop`, `/now_playing`,
+//! `/play`, `/queue`, `/skip`, `/pause`, `/resume`, `/stop`, `/player`,
 //! `/shuffle`, `/volume`: voice playback commands.
 
 use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
 
+use super::library;
 use super::{Context, Data, Error};
-use crate::voice::player::{PlayerError, QueueSnapshot, QueuedTrack};
+use crate::voice::panel::format_duration;
+use crate::voice::player::{PlayerError, QueuedTrack};
 use crate::youtube::api::Track;
 use crate::youtube::oauth::{AccessTokenError, get_valid_access_token};
 
@@ -34,11 +36,12 @@ pub(super) fn access_token_error_message(err: &AccessTokenError) -> String {
 /// cap on a long queue.
 const QUEUE_DISPLAY_LIMIT: usize = 10;
 
-/// Discord select menus cap out at 25 options.
-const QUEUE_SELECT_LIMIT: usize = 25;
-
 /// How much each volume button click changes the level by.
 const VOLUME_STEP: u8 = 10;
+
+/// How long the `/player` panel's Search button waits for a modal submission
+/// before giving up.
+const SEARCH_MODAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Extracts a `YouTube` video ID from a URL, recognizing `youtu.be` short
 /// links, `.../watch?v=...`, and `.../shorts/...`. Returns `None` for
@@ -73,19 +76,6 @@ fn extract_video_id(input: &str) -> Option<String> {
     None
 }
 
-/// Formats a `Duration` as `mm:ss`, or `h:mm:ss` once it reaches an hour.
-fn format_duration(duration: Duration) -> String {
-    let total_secs = duration.as_secs();
-    let hours = total_secs / 3600;
-    let minutes = (total_secs % 3600) / 60;
-    let seconds = total_secs % 60;
-    if hours > 0 {
-        format!("{hours}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes}:{seconds:02}")
-    }
-}
-
 /// Formats a track as `**title** — channel (mm:ss)`, omitting the duration
 /// parenthetical when unknown.
 fn format_track(track: &Track) -> String {
@@ -100,149 +90,15 @@ fn format_track(track: &Track) -> String {
     }
 }
 
-/// Builds the `/now_playing` embed: title (linked to the video), thumbnail,
-/// requester, and progress (`position / duration`, or just `position` if
-/// the video's total duration is unknown, or omitted entirely if songbird
-/// couldn't report a position).
-fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> serenity::CreateEmbed {
-    let video_url = format!("https://www.youtube.com/watch?v={}", queued.track.video_id);
-    // YouTube's thumbnail CDN follows this URL shape for every public video
-    // ID — no extra API call needed to get it.
-    let thumbnail_url = format!(
-        "https://i.ytimg.com/vi/{}/hqdefault.jpg",
-        queued.track.video_id
-    );
-
-    let progress = match (position, queued.track.duration) {
-        (Some(pos), Some(dur)) => Some(format!(
-            "{} / {}",
-            format_duration(pos),
-            format_duration(dur)
-        )),
-        (Some(pos), None) => Some(format_duration(pos)),
-        (None, _) => None,
-    };
-
-    let mut embed = serenity::CreateEmbed::new()
-        .title(&queued.track.title)
-        .url(video_url)
-        .thumbnail(thumbnail_url)
-        .field("Channel", &queued.track.channel, true)
-        .field("Requested by", format!("<@{}>", queued.requested_by), true);
-
-    if let Some(progress) = progress {
-        embed = embed.field("Progress", progress, true);
-    }
-
-    embed
-}
-
-/// Discord caps select-menu option labels at 100 characters.
-pub(super) fn truncate_label(label: &str) -> String {
-    if label.chars().count() > 100 {
-        let mut truncated: String = label.chars().take(97).collect();
-        truncated.push_str("...");
-        truncated
-    } else {
-        label.to_string()
-    }
-}
-
-/// Builds the now-playing control panel's button/select-menu rows:
-/// play/pause toggle, skip, stop, shuffle, volume +/-, and — when the
-/// queue isn't empty — a select menu to jump straight to an upcoming
-/// track. Used both by `/now_playing` and by [`handle_component`] when
-/// refreshing the panel after a click.
-fn player_components(
-    snapshot: &QueueSnapshot,
-    paused: Option<bool>,
-    volume: u8,
-) -> Vec<serenity::CreateActionRow> {
-    let has_now_playing = snapshot.now_playing.is_some();
-
-    let toggle = match paused {
-        Some(true) => serenity::CreateButton::new("player:toggle")
-            .label("Resume")
-            .style(serenity::ButtonStyle::Success),
-        _ => serenity::CreateButton::new("player:toggle")
-            .label("Pause")
-            .style(serenity::ButtonStyle::Secondary),
-    }
-    .disabled(!has_now_playing);
-
-    let playback_row = serenity::CreateActionRow::Buttons(vec![
-        toggle,
-        serenity::CreateButton::new("player:skip")
-            .label("Skip")
-            .style(serenity::ButtonStyle::Primary)
-            .disabled(!has_now_playing),
-        serenity::CreateButton::new("player:stop")
-            .label("Stop")
-            .style(serenity::ButtonStyle::Danger)
-            .disabled(!has_now_playing),
-        serenity::CreateButton::new("player:shuffle")
-            .label("Shuffle")
-            .style(serenity::ButtonStyle::Secondary)
-            .disabled(snapshot.upcoming.len() < 2),
-    ]);
-
-    let volume_row = serenity::CreateActionRow::Buttons(vec![
-        serenity::CreateButton::new("player:vol_down")
-            .label("Vol \u{2212}")
-            .style(serenity::ButtonStyle::Secondary)
-            .disabled(volume == 0),
-        serenity::CreateButton::new("player:vol_label")
-            .label(format!("{volume}%"))
-            .style(serenity::ButtonStyle::Secondary)
-            .disabled(true),
-        serenity::CreateButton::new("player:vol_up")
-            .label("Vol +")
-            .style(serenity::ButtonStyle::Secondary)
-            .disabled(volume >= 100),
-    ]);
-
-    let mut rows = vec![playback_row, volume_row];
-
-    if !snapshot.upcoming.is_empty() {
-        let options = snapshot
-            .upcoming
-            .iter()
-            .take(QUEUE_SELECT_LIMIT)
-            .enumerate()
-            .map(|(i, queued)| {
-                serenity::CreateSelectMenuOption::new(
-                    truncate_label(&format!("{}. {}", i + 1, queued.track.title)),
-                    i.to_string(),
-                )
-            })
-            .collect();
-        let select = serenity::CreateSelectMenu::new(
-            "player:jump",
-            serenity::CreateSelectMenuKind::String { options },
-        )
-        .placeholder("Jump to a track in the queue...");
-        rows.push(serenity::CreateActionRow::SelectMenu(select));
-    }
-
-    rows
-}
-
-/// Fetches everything [`player_components`] and the now-playing embed need
-/// in one place, for both `/now_playing` and [`handle_component`].
-async fn panel_state(
-    data: &Data,
-    guild_id: serenity::GuildId,
-) -> (QueueSnapshot, Option<bool>, u8) {
-    let snapshot = data.player.queue_snapshot(guild_id).await;
-    let paused = data.player.is_paused(guild_id).await;
-    let volume = data.player.get_volume(guild_id).await;
-    (snapshot, paused, volume)
-}
-
-/// Handles a `player:*` button/select click from the now-playing control
-/// panel: applies the action via [`crate::voice::PlayerRegistry`], then
-/// edits the panel message in place with the resulting state. Any other
-/// component interaction is ignored (there's only ever this one panel).
+/// Handles a `player:*` button/select click from the `/player` panel.
+///
+/// `search` and `playlists` open a library picker and don't touch playback
+/// state, so they're handled up front and return early. Every other id
+/// applies a [`crate::voice::PlayerRegistry`] mutation, then rebuilds the
+/// panel via [`crate::voice::panel::render`] and edits it in place —
+/// `PlayerRegistry` also pushes this same rendering to the panel on its own
+/// after the mutation, so this in-place edit is just for zero-latency
+/// feedback on the click itself.
 pub async fn handle_component(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -254,9 +110,17 @@ pub async fn handle_component(
     let Some(guild_id) = component.guild_id else {
         return Ok(());
     };
+
+    if custom_id == "search" {
+        return handle_search_button(ctx, component, data).await;
+    }
+    if custom_id == "playlists" {
+        component.defer_ephemeral(&ctx.http).await?;
+        return library::handle_playlists_button(ctx, component, data).await;
+    }
+
     // The disabled volume-level label is still a real button — it's just
     // never clickable — so there's no arm for it below.
-
     let result: Result<(), PlayerError> = match custom_id {
         "toggle" => match data.player.is_paused(guild_id).await {
             Some(true) => data.player.resume(guild_id).await,
@@ -301,19 +165,13 @@ pub async fn handle_component(
         return Ok(());
     }
 
-    let (snapshot, paused, volume) = panel_state(data, guild_id).await;
-    let components = player_components(&snapshot, paused, volume);
-    let message = match &snapshot.now_playing {
-        Some(queued) => {
-            let position = data.player.now_playing_position(guild_id).await;
-            serenity::CreateInteractionResponseMessage::new()
-                .embeds(vec![now_playing_embed(queued, position)])
-                .components(components)
-        }
-        None => serenity::CreateInteractionResponseMessage::new()
-            .content("Nothing is playing.")
-            .embeds(Vec::new())
-            .components(components),
+    let (content, embed, components) = crate::voice::panel::render(&data.player, guild_id).await;
+    let mut message = serenity::CreateInteractionResponseMessage::new()
+        .content(content)
+        .components(components);
+    message = match embed {
+        Some(embed) => message.embeds(vec![embed]),
+        None => message.embeds(Vec::new()),
     };
 
     component
@@ -323,6 +181,54 @@ pub async fn handle_component(
         )
         .await?;
     Ok(())
+}
+
+/// Handles the panel's `player:search` button: shows a one-field modal for a
+/// search query, waits for it to be submitted, then hands the query off to
+/// [`library::handle_search_modal_submit`] for the actual search + picker.
+///
+/// The modal's custom id is namespaced with the clicking interaction's own
+/// id so concurrent searches (different users, or the same user opening it
+/// twice) don't cross-collect each other's submissions.
+async fn handle_search_button(
+    ctx: &serenity::Context,
+    component: &serenity::ComponentInteraction,
+    data: &Data,
+) -> Result<(), Error> {
+    let modal_custom_id = format!("player:search_modal:{}", component.id);
+
+    component
+        .create_response(
+            &ctx.http,
+            serenity::CreateInteractionResponse::Modal(
+                serenity::CreateModal::new(modal_custom_id.clone(), "Search YouTube").components(
+                    vec![serenity::CreateActionRow::InputText(
+                        serenity::CreateInputText::new(
+                            serenity::InputTextStyle::Short,
+                            "Search query",
+                            "query",
+                        )
+                        .placeholder("e.g. lofi hip hop radio"),
+                    )],
+                ),
+            ),
+        )
+        .await?;
+
+    let user_id = component.user.id;
+    let Some(modal) = serenity::ModalInteractionCollector::new(&ctx.shard)
+        .filter(move |submission| {
+            submission.data.custom_id == modal_custom_id && submission.user.id == user_id
+        })
+        .timeout(SEARCH_MODAL_TIMEOUT)
+        .await
+    else {
+        // Nobody submitted before the timeout — nothing to clean up, the
+        // modal just closes itself client-side.
+        return Ok(());
+    };
+
+    library::handle_search_modal_submit(ctx, &modal, data).await
 }
 
 /// The invoking user's current voice channel in this guild, if any.
@@ -517,29 +423,37 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     }
 }
 
-/// Shows the currently playing track.
+/// Posts (or reposts) this guild's persistent player panel.
+///
+/// Combines playback controls with Search/Playlists entry points into the
+/// library, kept up to date on its own (by [`crate::voice::PlayerRegistry`])
+/// as state changes — whether via its own buttons, a slash command, or a
+/// track ending on its own.
+///
+/// Deletes this guild's previous panel first, if it had one, so there's
+/// never more than one live panel per guild.
 #[poise::command(slash_command, guild_only)]
-pub async fn now_playing(ctx: Context<'_>) -> Result<(), Error> {
+pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx
         .guild_id()
         .expect("guild_only commands always have a guild");
-    let snapshot = ctx.data().player.queue_snapshot(guild_id).await;
 
-    let Some(queued) = &snapshot.now_playing else {
-        return reply_error(ctx, "nothing is playing").await;
-    };
+    let (content, embed, components) =
+        crate::voice::panel::render(&ctx.data().player, guild_id).await;
+    let mut reply = poise::CreateReply::default()
+        .content(content)
+        .components(components);
+    if let Some(embed) = embed {
+        reply = reply.embed(embed);
+    }
 
-    let position = ctx.data().player.now_playing_position(guild_id).await;
-    let paused = ctx.data().player.is_paused(guild_id).await;
-    let volume = ctx.data().player.get_volume(guild_id).await;
-    let components = player_components(&snapshot, paused, volume);
+    let handle = ctx.send(reply).await?;
+    let message = handle.message().await?;
+    ctx.data()
+        .player
+        .replace_panel(guild_id, message.channel_id, message.id)
+        .await;
 
-    ctx.send(
-        poise::CreateReply::default()
-            .embed(now_playing_embed(queued, position))
-            .components(components),
-    )
-    .await?;
     Ok(())
 }
 
@@ -635,18 +549,6 @@ mod tests {
         assert_eq!(extract_video_id("https://example.com/foo"), None);
     }
 
-    // ---- format_duration ----
-
-    #[test]
-    fn formats_sub_hour_duration() {
-        assert_eq!(format_duration(Duration::from_secs(213)), "3:33");
-    }
-
-    #[test]
-    fn formats_over_an_hour_duration() {
-        assert_eq!(format_duration(Duration::from_secs(3723)), "1:02:03");
-    }
-
     // ---- access_token_error_message ----
 
     #[test]
@@ -676,156 +578,27 @@ mod tests {
         assert!(!message.contains("/link"));
     }
 
-    // ---- now_playing_embed ----
-
-    fn sample_queued_track(duration: Option<Duration>) -> QueuedTrack {
-        QueuedTrack {
-            track: Track {
-                video_id: "dQw4w9WgXcQ".to_string(),
-                title: "Some Video".to_string(),
-                channel: "Some Channel".to_string(),
-                duration,
-            },
-            requested_by: serenity::UserId::new(123_456_789_012_345_678),
-        }
-    }
-
-    /// `CreateEmbed` derives `Serialize`; round-tripping through JSON is the
-    /// only way to inspect a built embed's fields from outside the crate.
-    fn embed_json(embed: serenity::CreateEmbed) -> serde_json::Value {
-        serde_json::to_value(embed).expect("CreateEmbed should serialize")
-    }
+    // ---- format_track ----
 
     #[test]
-    fn embed_includes_title_url_thumbnail_and_requester() {
-        let queued = sample_queued_track(Some(Duration::from_secs(213)));
-        let json = embed_json(now_playing_embed(&queued, Some(Duration::from_secs(30))));
-
-        assert_eq!(json["title"], "Some Video");
-        assert_eq!(json["url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
-        assert_eq!(
-            json["thumbnail"]["url"],
-            "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
-        );
-
-        let fields = json["fields"]
-            .as_array()
-            .expect("fields should be an array");
-        let field_value = |name: &str| {
-            fields
-                .iter()
-                .find(|f| f["name"] == name)
-                .map(|f| f["value"].as_str().unwrap().to_string())
+    fn format_track_includes_duration_when_known() {
+        let track = Track {
+            video_id: "abc123".to_string(),
+            title: "Some Video".to_string(),
+            channel: "Some Channel".to_string(),
+            duration: Some(Duration::from_secs(213)),
         };
-        assert_eq!(field_value("Channel"), Some("Some Channel".to_string()));
-        assert_eq!(
-            field_value("Requested by"),
-            Some("<@123456789012345678>".to_string())
-        );
-        assert_eq!(field_value("Progress"), Some("0:30 / 3:33".to_string()));
+        assert_eq!(format_track(&track), "**Some Video** — Some Channel (3:33)");
     }
 
     #[test]
-    fn embed_omits_progress_field_when_position_unknown() {
-        let queued = sample_queued_track(Some(Duration::from_secs(213)));
-        let json = embed_json(now_playing_embed(&queued, None));
-
-        let fields = json["fields"]
-            .as_array()
-            .expect("fields should be an array");
-        assert!(!fields.iter().any(|f| f["name"] == "Progress"));
-    }
-
-    #[test]
-    fn embed_shows_bare_position_when_duration_unknown() {
-        let queued = sample_queued_track(None);
-        let json = embed_json(now_playing_embed(&queued, Some(Duration::from_secs(30))));
-
-        let fields = json["fields"]
-            .as_array()
-            .expect("fields should be an array");
-        let progress = fields
-            .iter()
-            .find(|f| f["name"] == "Progress")
-            .map(|f| f["value"].as_str().unwrap());
-        assert_eq!(progress, Some("0:30"));
-    }
-
-    // ---- truncate_label ----
-
-    #[test]
-    fn truncate_label_leaves_short_labels_untouched() {
-        assert_eq!(truncate_label("short title"), "short title");
-    }
-
-    #[test]
-    fn truncate_label_truncates_long_labels_to_100_chars_with_ellipsis() {
-        let long = "x".repeat(150);
-        let truncated = truncate_label(&long);
-        assert_eq!(truncated.chars().count(), 100);
-        assert!(truncated.ends_with("..."));
-    }
-
-    // ---- player_components ----
-
-    fn sample_queue_snapshot(now_playing: bool, upcoming_count: usize) -> QueueSnapshot {
-        QueueSnapshot {
-            now_playing: now_playing.then(|| sample_queued_track(Some(Duration::from_secs(120)))),
-            upcoming: (0..upcoming_count)
-                .map(|i| QueuedTrack {
-                    track: Track {
-                        video_id: format!("id{i}"),
-                        title: format!("Track {i}"),
-                        channel: "Channel".to_string(),
-                        duration: None,
-                    },
-                    requested_by: serenity::UserId::new(1),
-                })
-                .collect(),
-        }
-    }
-
-    fn components_json(components: &[serenity::CreateActionRow]) -> serde_json::Value {
-        serde_json::to_value(components).expect("components should serialize")
-    }
-
-    #[test]
-    fn toggle_button_shows_resume_when_paused_and_pause_otherwise() {
-        let snapshot = sample_queue_snapshot(true, 0);
-
-        let paused_json = components_json(&player_components(&snapshot, Some(true), 50));
-        assert_eq!(paused_json[0]["components"][0]["label"], "Resume");
-
-        let playing_json = components_json(&player_components(&snapshot, Some(false), 50));
-        assert_eq!(playing_json[0]["components"][0]["label"], "Pause");
-    }
-
-    #[test]
-    fn playback_buttons_disabled_when_nothing_playing() {
-        let snapshot = sample_queue_snapshot(false, 0);
-        let json = components_json(&player_components(&snapshot, None, 50));
-        // toggle, skip, stop, shuffle
-        for button in json[0]["components"].as_array().unwrap() {
-            assert_eq!(button["disabled"], true, "{button:?} should be disabled");
-        }
-    }
-
-    #[test]
-    fn select_menu_omitted_when_queue_empty_and_present_otherwise() {
-        let empty = sample_queue_snapshot(true, 0);
-        let empty_json = components_json(&player_components(&empty, Some(false), 50));
-        assert_eq!(empty_json.as_array().unwrap().len(), 2);
-
-        let nonempty = sample_queue_snapshot(true, 3);
-        let nonempty_json = components_json(&player_components(&nonempty, Some(false), 50));
-        assert_eq!(nonempty_json.as_array().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn select_menu_caps_options_at_25() {
-        let snapshot = sample_queue_snapshot(true, 30);
-        let json = components_json(&player_components(&snapshot, Some(false), 50));
-        let options = json[2]["components"][0]["options"].as_array().unwrap();
-        assert_eq!(options.len(), 25);
+    fn format_track_omits_duration_when_unknown() {
+        let track = Track {
+            video_id: "abc123".to_string(),
+            title: "Some Video".to_string(),
+            channel: "Some Channel".to_string(),
+            duration: None,
+        };
+        assert_eq!(format_track(&track), "**Some Video** — Some Channel");
     }
 }
