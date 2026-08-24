@@ -17,7 +17,9 @@ use rand::seq::SliceRandom;
 use serenity::{ChannelId, GuildId, UserId};
 use songbird::input::Input;
 use songbird::tracks::{PlayMode, TrackHandle};
-use songbird::{Call, Event, EventContext, EventHandler as SongbirdEventHandler, Songbird, TrackEvent};
+use songbird::{
+    Call, Event, EventContext, EventHandler as SongbirdEventHandler, Songbird, TrackEvent,
+};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -34,7 +36,7 @@ type Prefetch = JoinHandle<Result<Input, PlaybackError>>;
 /// How long an empty, drained queue waits before the bot leaves the voice
 /// channel on its own. Re-checked when the timer fires (not just scheduled
 /// once) so a track queued in the meantime cancels the disconnect.
-const IDLE_DISCONNECT: Duration = Duration::from_secs(5 * 60);
+const IDLE_DISCONNECT: Duration = Duration::from_mins(5);
 
 /// A track paired with who queued it.
 #[derive(Debug, Clone)]
@@ -63,15 +65,18 @@ pub enum PlayerError {
 impl std::fmt::Display for PlayerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlayerError::NotConnected => write!(f, "not connected to a voice channel"),
-            PlayerError::NothingPlaying => write!(f, "nothing is playing"),
-            PlayerError::NothingToShuffle => write!(f, "not enough upcoming tracks to shuffle"),
-            PlayerError::InvalidSelection => {
-                write!(f, "that queue selection is no longer valid — the queue may have changed")
+            Self::NotConnected => write!(f, "not connected to a voice channel"),
+            Self::NothingPlaying => write!(f, "nothing is playing"),
+            Self::NothingToShuffle => write!(f, "not enough upcoming tracks to shuffle"),
+            Self::InvalidSelection => {
+                write!(
+                    f,
+                    "that queue selection is no longer valid — the queue may have changed"
+                )
             }
-            PlayerError::Join(message) => write!(f, "failed to join voice channel: {message}"),
-            PlayerError::Playback(message) => write!(f, "playback error: {message}"),
-            PlayerError::Storage(message) => write!(f, "failed to save setting: {message}"),
+            Self::Join(message) => write!(f, "failed to join voice channel: {message}"),
+            Self::Playback(message) => write!(f, "playback error: {message}"),
+            Self::Storage(message) => write!(f, "failed to save setting: {message}"),
         }
     }
 }
@@ -152,11 +157,7 @@ impl PlayerRegistry {
 
     /// Enqueues a track. If nothing is currently playing, starts it
     /// immediately instead of leaving it queued.
-    pub async fn enqueue(
-        &self,
-        guild_id: GuildId,
-        queued: QueuedTrack,
-    ) -> Result<(), PlayerError> {
+    pub async fn enqueue(&self, guild_id: GuildId, queued: QueuedTrack) -> Result<(), PlayerError> {
         let call = self
             .songbird
             .get(guild_id)
@@ -174,9 +175,7 @@ impl PlayerRegistry {
             should_start
         };
 
-        if should_start
-            && let Err(err) = self.start_playback(guild_id, call, queued, None).await
-        {
+        if should_start && let Err(err) = self.start_playback(guild_id, call, queued, None).await {
             // `state.now_playing` was set speculatively above, before the
             // resolve/play attempt above was known to succeed. Roll it back
             // on failure — otherwise it's left pointing at a track with no
@@ -251,7 +250,7 @@ impl PlayerRegistry {
         let volume = db::get_guild_volume(&self.db, &guild_id.to_string())
             .await
             .unwrap_or(db::DEFAULT_VOLUME);
-        if let Err(err) = handle.set_volume(volume as f32 / 100.0) {
+        if let Err(err) = handle.set_volume(f32::from(volume) / 100.0) {
             tracing::warn!(%err, "failed to apply saved volume to new track");
         }
 
@@ -276,7 +275,9 @@ impl PlayerRegistry {
             // download runs in the background while this track plays.
             if let Some(next) = state.queue.front().cloned() {
                 let registry = self.clone();
-                state.prefetch = Some(tokio::spawn(async move { registry.cached_input(&next).await }));
+                state.prefetch = Some(tokio::spawn(
+                    async move { registry.cached_input(&next).await },
+                ));
             }
         }
 
@@ -423,7 +424,9 @@ impl PlayerRegistry {
     pub async fn jump_to(&self, guild_id: GuildId, index: usize) -> Result<(), PlayerError> {
         let handle = {
             let mut guilds = self.guilds.lock().await;
-            let state = guilds.get_mut(&guild_id).ok_or(PlayerError::InvalidSelection)?;
+            let state = guilds
+                .get_mut(&guild_id)
+                .ok_or(PlayerError::InvalidSelection)?;
             if index >= state.queue.len() {
                 return Err(PlayerError::InvalidSelection);
             }
@@ -440,7 +443,9 @@ impl PlayerRegistry {
     pub async fn is_paused(&self, guild_id: GuildId) -> Option<bool> {
         let handle = {
             let guilds = self.guilds.lock().await;
-            guilds.get(&guild_id).and_then(|state| state.current_handle.clone())
+            guilds
+                .get(&guild_id)
+                .and_then(|state| state.current_handle.clone())
         }?;
         handle
             .get_info()
@@ -471,7 +476,7 @@ impl PlayerRegistry {
                 .and_then(|state| state.current_handle.clone())
         };
         if let Some(handle) = handle
-            && let Err(err) = handle.set_volume(volume as f32 / 100.0)
+            && let Err(err) = handle.set_volume(f32::from(volume) / 100.0)
         {
             tracing::warn!(%err, "failed to apply volume change to current track");
         }

@@ -1,6 +1,6 @@
-//! Google OAuth2 client construction and token lifecycle helpers.
+//! Google `OAuth2` client construction and token lifecycle helpers.
 //!
-//! Scopes requested are limited to read-only YouTube access (`/link` only
+//! Scopes requested are limited to read-only `YouTube` access (`/link` only
 //! needs to look up videos/playlists on the user's behalf, never to modify
 //! their account).
 
@@ -49,7 +49,7 @@ pub type GoogleOAuthClient =
 /// which isn't worth the extra bookkeeping at this bot's scale.
 pub type PendingLinks = Arc<Mutex<HashMap<String, serenity::UserId>>>;
 
-/// Builds the Google OAuth2 client from bot configuration.
+/// Builds the Google `OAuth2` client from bot configuration.
 pub fn build_oauth_client(config: &Config) -> Result<GoogleOAuthClient> {
     Ok(
         BasicClient::new(ClientId::new(config.google_client_id.clone()))
@@ -83,7 +83,7 @@ pub fn build_http_client() -> Result<oauth2::reqwest::Client> {
 /// EXPIRY_BUFFER_SECS`) this returns `true` — the buffer is inclusive, so a
 /// token is refreshed as soon as it enters the buffer window rather than on
 /// the call just after.
-pub fn needs_refresh(expires_at_unix: i64, now_unix: i64) -> bool {
+pub const fn needs_refresh(expires_at_unix: i64, now_unix: i64) -> bool {
     now_unix >= expires_at_unix - EXPIRY_BUFFER_SECS
 }
 
@@ -91,7 +91,8 @@ fn now_unix() -> Result<i64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?
-        .as_secs() as i64)
+        .as_secs()
+        .cast_signed())
 }
 
 /// Why [`get_valid_access_token`] couldn't produce a token, distinguished so
@@ -118,11 +119,11 @@ pub enum AccessTokenError {
 impl std::fmt::Display for AccessTokenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AccessTokenError::NotLinked => write!(f, "no linked Google account"),
-            AccessTokenError::RefreshFailed { revoked: true, .. } => {
+            Self::NotLinked => write!(f, "no linked Google account"),
+            Self::RefreshFailed { revoked: true, .. } => {
                 write!(f, "Google access was revoked or expired")
             }
-            AccessTokenError::RefreshFailed {
+            Self::RefreshFailed {
                 revoked: false,
                 message,
             } => write!(f, "failed to refresh Google access token: {message}"),
@@ -190,8 +191,7 @@ pub async fn get_valid_access_token(
 
     let expires_in = token_result
         .expires_in()
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
+        .map_or(DEFAULT_TOKEN_LIFETIME_SECS, |d| d.as_secs().cast_signed());
     let refresh_token = token_result
         .refresh_token()
         .map(|t| t.secret().clone())
@@ -239,8 +239,7 @@ pub async fn exchange_code_and_store(
     let now = now_unix()?;
     let expires_in = token_result
         .expires_in()
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
+        .map_or(DEFAULT_TOKEN_LIFETIME_SECS, |d| d.as_secs().cast_signed());
 
     let refresh_token = match token_result.refresh_token() {
         Some(rt) => rt.secret().clone(),

@@ -58,9 +58,9 @@ pub fn decrypt(key: &TokenKey, encoded: &str) -> Result<String> {
     let nonce = Nonce::from_slice(nonce_bytes);
 
     let cipher = Aes256Gcm::new(key);
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|_| anyhow::anyhow!("failed to decrypt stored token (wrong key or corrupted data)"))?;
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+        anyhow::anyhow!("failed to decrypt stored token (wrong key or corrupted data)")
+    })?;
 
     String::from_utf8(plaintext).context("decrypted token is not valid UTF-8")
 }
@@ -89,7 +89,8 @@ mod tests {
     #[test]
     fn wrong_key_fails_to_decrypt() {
         let key = test_key();
-        let other_key = parse_key("enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6eno=").expect("valid key");
+        let other_key =
+            parse_key("enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6eno=").expect("valid key");
         let encrypted = encrypt(&key, "super-secret-token");
         assert!(decrypt(&other_key, &encrypted).is_err());
     }

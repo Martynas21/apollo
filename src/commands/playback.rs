@@ -40,7 +40,7 @@ const QUEUE_SELECT_LIMIT: usize = 25;
 /// How much each volume button click changes the level by.
 const VOLUME_STEP: u8 = 10;
 
-/// Extracts a YouTube video ID from a URL, recognizing `youtu.be` short
+/// Extracts a `YouTube` video ID from a URL, recognizing `youtu.be` short
 /// links, `.../watch?v=...`, and `.../shorts/...`. Returns `None` for
 /// anything that isn't a URL at all (treated by callers as a search query)
 /// or a recognized host with an unrecognized path.
@@ -114,7 +114,11 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
     );
 
     let progress = match (position, queued.track.duration) {
-        (Some(pos), Some(dur)) => Some(format!("{} / {}", format_duration(pos), format_duration(dur))),
+        (Some(pos), Some(dur)) => Some(format!(
+            "{} / {}",
+            format_duration(pos),
+            format_duration(dur)
+        )),
         (Some(pos), None) => Some(format_duration(pos)),
         (None, _) => None,
     };
@@ -225,7 +229,10 @@ fn player_components(
 
 /// Fetches everything [`player_components`] and the now-playing embed need
 /// in one place, for both `/now_playing` and [`handle_component`].
-async fn panel_state(data: &Data, guild_id: serenity::GuildId) -> (QueueSnapshot, Option<bool>, u8) {
+async fn panel_state(
+    data: &Data,
+    guild_id: serenity::GuildId,
+) -> (QueueSnapshot, Option<bool>, u8) {
     let snapshot = data.player.queue_snapshot(guild_id).await;
     let paused = data.player.is_paused(guild_id).await;
     let volume = data.player.get_volume(guild_id).await;
@@ -310,7 +317,10 @@ pub async fn handle_component(
     };
 
     component
-        .create_response(&ctx.http, serenity::CreateInteractionResponse::UpdateMessage(message))
+        .create_response(
+            &ctx.http,
+            serenity::CreateInteractionResponse::UpdateMessage(message),
+        )
         .await?;
     Ok(())
 }
@@ -322,8 +332,12 @@ pub async fn handle_component(
 /// Extracting just the `ChannelId` we need in one expression, with nothing
 /// held afterward, is required for this to compile.
 fn voice_channel_of(ctx: Context<'_>) -> Option<serenity::ChannelId> {
-    ctx.guild()
-        .and_then(|guild| guild.voice_states.get(&ctx.author().id).and_then(|vs| vs.channel_id))
+    ctx.guild().and_then(|guild| {
+        guild
+            .voice_states
+            .get(&ctx.author().id)
+            .and_then(|vs| vs.channel_id)
+    })
 }
 
 async fn reply_public(ctx: Context<'_>, content: impl Into<String>) -> Result<(), Error> {
@@ -342,14 +356,16 @@ async fn reply_error(ctx: Context<'_>, content: impl Into<String>) -> Result<(),
     Ok(())
 }
 
-/// Plays a YouTube video (URL or video ID), or searches and queues the top
+/// Plays a `YouTube` video (URL or video ID), or searches and queues the top
 /// result if given free text.
 #[poise::command(slash_command, guild_only)]
 pub async fn play(
     ctx: Context<'_>,
     #[description = "YouTube URL/video ID, or a search query"] query: String,
 ) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
+    let guild_id = ctx
+        .guild_id()
+        .expect("guild_only commands always have a guild");
 
     let access_token = match get_valid_access_token(
         &ctx.data().oauth_client,
@@ -368,17 +384,14 @@ pub async fn play(
     };
 
     if !ctx.data().player.is_connected(guild_id) {
-        match voice_channel_of(ctx) {
-            Some(channel_id) => {
-                if let Err(err) = ctx.data().player.join(guild_id, channel_id).await {
-                    reply_error(ctx, err.to_string()).await?;
-                    return Ok(());
-                }
-            }
-            None => {
-                reply_error(ctx, "join a voice channel first, or use `/join`.").await?;
+        if let Some(channel_id) = voice_channel_of(ctx) {
+            if let Err(err) = ctx.data().player.join(guild_id, channel_id).await {
+                reply_error(ctx, err.to_string()).await?;
                 return Ok(());
             }
+        } else {
+            reply_error(ctx, "join a voice channel first, or use `/join`.").await?;
+            return Ok(());
         }
     }
 
@@ -421,7 +434,9 @@ pub async fn play(
 /// Shows the current queue.
 #[poise::command(slash_command, guild_only)]
 pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
+    let guild_id = ctx
+        .guild_id()
+        .expect("guild_only commands always have a guild");
     let snapshot = ctx.data().player.queue_snapshot(guild_id).await;
 
     let mut lines = Vec::new();
@@ -449,7 +464,9 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
 /// Skips the currently playing track.
 #[poise::command(slash_command, guild_only)]
 pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
+    let guild_id = ctx
+        .guild_id()
+        .expect("guild_only commands always have a guild");
 
     match ctx.data().player.skip(guild_id).await {
         Ok(()) => reply_public(ctx, "Skipped.").await,
@@ -461,7 +478,9 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
 /// Pauses the currently playing track.
 #[poise::command(slash_command, guild_only)]
 pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
+    let guild_id = ctx
+        .guild_id()
+        .expect("guild_only commands always have a guild");
 
     match ctx.data().player.pause(guild_id).await {
         Ok(()) => reply_public(ctx, "Paused.").await,
@@ -473,7 +492,9 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
 /// Resumes a paused track.
 #[poise::command(slash_command, guild_only)]
 pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
+    let guild_id = ctx
+        .guild_id()
+        .expect("guild_only commands always have a guild");
 
     match ctx.data().player.resume(guild_id).await {
         Ok(()) => reply_public(ctx, "Resumed.").await,
@@ -485,7 +506,9 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
 /// Stops playback and clears the queue.
 #[poise::command(slash_command, guild_only)]
 pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
+    let guild_id = ctx
+        .guild_id()
+        .expect("guild_only commands always have a guild");
 
     match ctx.data().player.stop(guild_id).await {
         Ok(()) => reply_public(ctx, "Stopped and cleared the queue.").await,
@@ -497,7 +520,9 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
 /// Shows the currently playing track.
 #[poise::command(slash_command, guild_only)]
 pub async fn now_playing(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
+    let guild_id = ctx
+        .guild_id()
+        .expect("guild_only commands always have a guild");
     let snapshot = ctx.data().player.queue_snapshot(guild_id).await;
 
     let Some(queued) = &snapshot.now_playing else {
@@ -521,7 +546,9 @@ pub async fn now_playing(ctx: Context<'_>) -> Result<(), Error> {
 /// Shuffles the upcoming queue. Leaves the currently playing track alone.
 #[poise::command(slash_command, guild_only)]
 pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
+    let guild_id = ctx
+        .guild_id()
+        .expect("guild_only commands always have a guild");
 
     match ctx.data().player.shuffle(guild_id).await {
         Ok(()) => reply_public(ctx, "Shuffled the queue.").await,
@@ -542,7 +569,9 @@ pub async fn volume(
     #[max = 100]
     level: u8,
 ) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
+    let guild_id = ctx
+        .guild_id()
+        .expect("guild_only commands always have a guild");
 
     match ctx.data().player.set_volume(guild_id, level).await {
         Ok(()) => reply_public(ctx, format!("Volume set to {level}.")).await,
@@ -657,7 +686,7 @@ mod tests {
                 channel: "Some Channel".to_string(),
                 duration,
             },
-            requested_by: serenity::UserId::new(123456789012345678),
+            requested_by: serenity::UserId::new(123_456_789_012_345_678),
         }
     }
 
@@ -679,7 +708,9 @@ mod tests {
             "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
         );
 
-        let fields = json["fields"].as_array().expect("fields should be an array");
+        let fields = json["fields"]
+            .as_array()
+            .expect("fields should be an array");
         let field_value = |name: &str| {
             fields
                 .iter()
@@ -699,7 +730,9 @@ mod tests {
         let queued = sample_queued_track(Some(Duration::from_secs(213)));
         let json = embed_json(now_playing_embed(&queued, None));
 
-        let fields = json["fields"].as_array().expect("fields should be an array");
+        let fields = json["fields"]
+            .as_array()
+            .expect("fields should be an array");
         assert!(!fields.iter().any(|f| f["name"] == "Progress"));
     }
 
@@ -708,7 +741,9 @@ mod tests {
         let queued = sample_queued_track(None);
         let json = embed_json(now_playing_embed(&queued, Some(Duration::from_secs(30))));
 
-        let fields = json["fields"].as_array().expect("fields should be an array");
+        let fields = json["fields"]
+            .as_array()
+            .expect("fields should be an array");
         let progress = fields
             .iter()
             .find(|f| f["name"] == "Progress")

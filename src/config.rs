@@ -20,12 +20,12 @@ pub struct Config {
     pub google_client_secret: String,
     pub google_oauth_redirect_uri: String,
     pub database_url: String,
-    /// AES-256-GCM key used to encrypt OAuth2 tokens before they're written
+    /// AES-256-GCM key used to encrypt `OAuth2` tokens before they're written
     /// to `users.access_token`/`refresh_token`. See `.env.example` for how
     /// to generate one.
     pub token_encryption_key: crypto::TokenKey,
     /// Path to a Netscape-format cookies file passed to `yt-dlp` as
-    /// `--cookies`. YouTube increasingly requires a proof-of-origin signal
+    /// `--cookies`. `YouTube` increasingly requires a proof-of-origin signal
     /// from a real logged-in browser session before it'll serve a stream to
     /// `yt-dlp` at all (surfaces as a "Sign in to confirm you're not a bot"
     /// failure) — this is the standard workaround, and matters most from a

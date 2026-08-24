@@ -1,4 +1,4 @@
-//! SQLite-backed persistence for linked Google OAuth2 tokens.
+//! SQLite-backed persistence for linked Google `OAuth2` tokens.
 //!
 //! Schema lives in `migrations/` and is embedded into the binary via
 //! [`sqlx::migrate!`], so a fresh SQLite file is brought up to date
@@ -18,7 +18,7 @@ pub struct StoredToken {
     pub refresh_token: String,
     /// Unix timestamp (seconds) at which `access_token` expires.
     pub expires_at: i64,
-    /// Space-separated OAuth2 scopes.
+    /// Space-separated `OAuth2` scopes.
     pub scopes: String,
 }
 
@@ -136,13 +136,16 @@ pub const DEFAULT_VOLUME: u8 = 100;
 /// Reads a guild's persisted playback volume (0-100), defaulting to
 /// [`DEFAULT_VOLUME`] if it's never been set.
 pub async fn get_guild_volume(pool: &SqlitePool, guild_id: &str) -> Result<u8> {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT volume FROM guild_settings WHERE guild_id = ?1")
-        .bind(guild_id)
-        .fetch_optional(pool)
-        .await
-        .context("failed to fetch guild volume")?;
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT volume FROM guild_settings WHERE guild_id = ?1")
+            .bind(guild_id)
+            .fetch_optional(pool)
+            .await
+            .context("failed to fetch guild volume")?;
 
-    Ok(row.map_or(DEFAULT_VOLUME, |(volume,)| volume as u8))
+    Ok(row
+        .and_then(|(volume,)| u8::try_from(volume).ok())
+        .unwrap_or(DEFAULT_VOLUME))
 }
 
 /// Persists a guild's playback volume (0-100).
@@ -152,7 +155,7 @@ pub async fn set_guild_volume(pool: &SqlitePool, guild_id: &str, volume: u8) -> 
          ON CONFLICT(guild_id) DO UPDATE SET volume = excluded.volume",
     )
     .bind(guild_id)
-    .bind(volume as i64)
+    .bind(i64::from(volume))
     .execute(pool)
     .await
     .context("failed to set guild volume")?;

@@ -14,15 +14,15 @@ pub use playback::handle_component as handle_player_component;
 pub struct Data {
     /// Pool of connections to the token-persistence SQLite database.
     pub db: sqlx::SqlitePool,
-    /// AES-256-GCM key used to encrypt/decrypt stored OAuth2 tokens.
+    /// AES-256-GCM key used to encrypt/decrypt stored `OAuth2` tokens.
     pub token_key: crate::crypto::TokenKey,
-    /// Configured Google OAuth2 client (auth/token/revocation endpoints set).
+    /// Configured Google `OAuth2` client (auth/token/revocation endpoints set).
     pub oauth_client: crate::youtube::oauth::GoogleOAuthClient,
-    /// Shared HTTP client used for all OAuth2 token endpoint requests.
+    /// Shared HTTP client used for all `OAuth2` token endpoint requests.
     pub oauth_http: oauth2::reqwest::Client,
     /// In-flight `/link` attempts, keyed by CSRF state token.
     pub pending_links: crate::youtube::oauth::PendingLinks,
-    /// Thin wrapper around the YouTube Data API v3 endpoints used to browse
+    /// Thin wrapper around the `YouTube` Data API v3 endpoints used to browse
     /// a linked account's playlists/liked videos and to search.
     pub youtube: crate::youtube::api::YouTubeClient,
     /// Per-guild playback queues and the shared songbird manager handle.

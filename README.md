@@ -7,7 +7,7 @@ playlists, or ad-hoc search/URL — directly into a Discord voice channel.
 ## Status
 
 Functionally complete: linking, browsing, and playback all work end to
-end in code (`cargo build`/`clippy`/`test` all pass — see `ROADMAP.md` for
+end in code (`cargo build`/`clippy`/`test` all pass — see `git log` for
 what's implemented phase by phase). It has **not** been run against a
 live Discord bot token or a real Google OAuth2 client yet — do that before
 trusting it in a real server. `yt-dlp` and `ffmpeg` also need to actually
@@ -88,7 +88,7 @@ be installed wherever you run it (see Prerequisites).
    unverified ("Testing" status, External audience) app after exactly 7
    days, regardless of use. A linked account will silently need to
    `/link` again every week — Apollo's `/link`/`/unlink` handle this
-   gracefully (see `ROADMAP.md` Phase 7), but it's still a bad experience
+   gracefully, but it's still a bad experience
    for anyone actually using the bot day to day. To get an indefinite
    refresh token lifetime, move the consent screen to "In production" —
    for a sensitive scope like `youtube.readonly` (not "restricted", so no
@@ -147,6 +147,22 @@ all, which is the simpler default here.
    sections above.
 2. `cargo run` (fails fast at startup if `yt-dlp`/`ffmpeg` are missing, or
    if any required `.env` value is unset).
+
+## Development
+
+CI (`.github/workflows/ci.yml`) runs these on every push/PR; run them
+locally before pushing:
+
+- `cargo fmt --check` / `cargo fmt` — formatting.
+- `cargo clippy --all-targets --all-features -- -D warnings` — linting.
+- `cargo test` — the unit test suite (all in-crate, no live Discord/Google/
+  YouTube credentials needed).
+- `cargo llvm-cov --all-features --workspace --summary-only` — coverage
+  report in the terminal. Requires the `llvm-tools-preview` rustup
+  component (`rustup component add llvm-tools-preview`) and
+  [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
+  (`cargo install cargo-llvm-cov`). Add `--open` instead of
+  `--summary-only` for an HTML report per source line.
 
 ## Environment variables
 

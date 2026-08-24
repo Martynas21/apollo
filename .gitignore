@@ -8,5 +8,9 @@
 *.db
 *.db-journal
 
+# cargo-llvm-cov output
+lcov.info
+*.profraw
+
 # Editor/OS cruft
 .DS_Store

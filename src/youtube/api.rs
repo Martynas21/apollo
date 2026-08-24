@@ -1,4 +1,4 @@
-//! Thin YouTube Data API v3 client.
+//! Thin `YouTube` Data API v3 client.
 //!
 //! Callers are expected to obtain a valid access token themselves (see
 //! `crate::youtube::oauth::get_valid_access_token`) and pass it in — this
@@ -12,6 +12,7 @@
 //! hits, not everything that matched.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -20,18 +21,18 @@ const API_BASE: &str = "https://www.googleapis.com/youtube/v3";
 
 /// A single playable video, as resolved from a playlist, liked-videos list,
 /// uploads list, or search results.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub video_id: String,
     pub title: String,
     pub channel: String,
-    /// `None` when YouTube didn't report a usable duration (e.g. an
+    /// `None` when `YouTube` didn't report a usable duration (e.g. an
     /// in-progress livestream, which the API reports as `P0D`).
     pub duration: Option<Duration>,
 }
 
 /// A playlist owned by (or otherwise visible to) the linked account.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Playlist {
     pub id: String,
     pub title: String,
@@ -57,16 +58,16 @@ pub enum YouTubeApiError {
 impl std::fmt::Display for YouTubeApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            YouTubeApiError::QuotaExceeded => write!(f, "YouTube API quota exceeded"),
-            YouTubeApiError::RateLimited => write!(f, "YouTube API rate limited"),
-            YouTubeApiError::Unauthorized => write!(
+            Self::QuotaExceeded => write!(f, "YouTube API quota exceeded"),
+            Self::RateLimited => write!(f, "YouTube API rate limited"),
+            Self::Unauthorized => write!(
                 f,
                 "YouTube API request unauthorized (token invalid/expired)"
             ),
-            YouTubeApiError::Api { status, message } => {
+            Self::Api { status, message } => {
                 write!(f, "YouTube API error (HTTP {status}): {message}")
             }
-            YouTubeApiError::Transport(message) => {
+            Self::Transport(message) => {
                 write!(f, "YouTube API transport error: {message}")
             }
         }
@@ -321,9 +322,9 @@ fn map_video_durations(resp: VideosResponse) -> HashMap<String, Option<Duration>
 }
 
 /// Parses a restricted-form ISO 8601 duration (`P[nD]T[nH][nM][nS]`) as
-/// returned by YouTube for video/content durations.
+/// returned by `YouTube` for video/content durations.
 ///
-/// `"P0D"` is YouTube's convention for "no fixed duration" (e.g. an
+/// `"P0D"` is `YouTube`'s convention for "no fixed duration" (e.g. an
 /// in-progress livestream) and is deliberately mapped to `None` rather than
 /// `Some(Duration::ZERO)` — it means "unknown", not "zero-length". Any other
 /// string that doesn't parse also returns `None` rather than panicking.
@@ -384,7 +385,7 @@ pub struct YouTubeClient {
 
 #[allow(dead_code)]
 impl YouTubeClient {
-    pub fn new(http: oauth2::reqwest::Client) -> Self {
+    pub const fn new(http: oauth2::reqwest::Client) -> Self {
         Self { http }
     }
 
@@ -565,7 +566,9 @@ fn urlencoding_encode(s: &str) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(byte as char);
             }
-            _ => out.push_str(&format!("%{byte:02X}")),
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
         }
     }
     out
@@ -620,7 +623,7 @@ mod tests {
     fn parses_days_and_hours() {
         assert_eq!(
             parse_iso8601_duration("P1DT2H"),
-            Some(Duration::from_secs(26 * 3_600))
+            Some(Duration::from_hours(26))
         );
     }
 

@@ -6,7 +6,7 @@ use super::{Context, Error};
 use crate::db;
 use crate::youtube::oauth::YOUTUBE_READONLY_SCOPE;
 
-/// Links your Google account so the bot can play YouTube videos on your
+/// Links your Google account so the bot can play `YouTube` videos on your
 /// behalf.
 #[poise::command(slash_command)]
 pub async fn link(ctx: Context<'_>) -> Result<(), Error> {

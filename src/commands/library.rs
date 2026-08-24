@@ -1,5 +1,5 @@
 //! `/add_to_queue`, `/playlists`, `/playlist_play`: browsing a linked
-//! account's YouTube library and queuing tracks from it.
+//! account's `YouTube` library and queuing tracks from it.
 //!
 //! Every listing (search results, playlists, a playlist's tracks) pairs its
 //! numbered text with a select-menu/button picker, so the common path is one
@@ -170,9 +170,12 @@ fn voice_channel_of(
     guild_id: serenity::GuildId,
     user_id: serenity::UserId,
 ) -> Option<serenity::ChannelId> {
-    ctx.cache
-        .guild(guild_id)
-        .and_then(|guild| guild.voice_states.get(&user_id).and_then(|vs| vs.channel_id))
+    ctx.cache.guild(guild_id).and_then(|guild| {
+        guild
+            .voice_states
+            .get(&user_id)
+            .and_then(|vs| vs.channel_id)
+    })
 }
 
 /// Edits the picker message in place with a plain-text result and drops
@@ -202,7 +205,7 @@ async fn update_picker(
 /// playlist's tracks), or `library:playlist_play:<id>` (queue a whole
 /// playlist). Any other custom id is ignored.
 ///
-/// Defers immediately (before any of the handlers' YouTube API calls, voice
+/// Defers immediately (before any of the handlers' `YouTube` API calls, voice
 /// joins, or track resolution) rather than letting each handler send its
 /// own first response: Discord invalidates a component interaction if
 /// nothing acknowledges it within 3 seconds, and those steps routinely take
@@ -238,7 +241,8 @@ async fn handle_queue_track(
     component: &serenity::ComponentInteraction,
     data: &Data,
 ) -> Result<(), Error> {
-    let serenity::ComponentInteractionDataKind::StringSelect { values } = &component.data.kind else {
+    let serenity::ComponentInteractionDataKind::StringSelect { values } = &component.data.kind
+    else {
         return update_picker(ctx, component, "Something went wrong with that selection.").await;
     };
     let (Some(video_id), Some(guild_id)) = (values.first(), component.guild_id) else {
@@ -260,15 +264,27 @@ async fn handle_queue_track(
 
     let track = match data.youtube.get_video(&token, video_id).await {
         Ok(track) => track,
-        Err(err) => return update_picker(ctx, component, format!("Failed to queue track: {err}")).await,
+        Err(err) => {
+            return update_picker(ctx, component, format!("Failed to queue track: {err}")).await;
+        }
     };
 
     if !data.player.is_connected(guild_id) {
         let Some(channel_id) = voice_channel_of(ctx, guild_id, component.user.id) else {
-            return update_picker(ctx, component, "Join a voice channel first, or use `/join`.").await;
+            return update_picker(
+                ctx,
+                component,
+                "Join a voice channel first, or use `/join`.",
+            )
+            .await;
         };
         if let Err(err) = data.player.join(guild_id, channel_id).await {
-            return update_picker(ctx, component, format!("Failed to join voice channel: {err}")).await;
+            return update_picker(
+                ctx,
+                component,
+                format!("Failed to join voice channel: {err}"),
+            )
+            .await;
         }
     }
 
@@ -295,7 +311,8 @@ async fn handle_browse_playlist(
     component: &serenity::ComponentInteraction,
     data: &Data,
 ) -> Result<(), Error> {
-    let serenity::ComponentInteractionDataKind::StringSelect { values } = &component.data.kind else {
+    let serenity::ComponentInteractionDataKind::StringSelect { values } = &component.data.kind
+    else {
         return update_picker(ctx, component, "Something went wrong with that selection.").await;
     };
     let Some(playlist_id) = values.first() else {
@@ -318,7 +335,12 @@ async fn handle_browse_playlist(
     let tracks = match data.youtube.list_playlist_items(&token, playlist_id).await {
         Ok(tracks) => tracks,
         Err(err) => {
-            return update_picker(ctx, component, format!("Failed to list playlist items: {err}")).await;
+            return update_picker(
+                ctx,
+                component,
+                format!("Failed to list playlist items: {err}"),
+            )
+            .await;
         }
     };
 
@@ -381,7 +403,12 @@ async fn handle_playlist_play_button(
     let tracks = match data.youtube.list_playlist_items(&token, playlist_id).await {
         Ok(tracks) => tracks,
         Err(err) => {
-            return update_picker(ctx, component, format!("Failed to list playlist items: {err}")).await;
+            return update_picker(
+                ctx,
+                component,
+                format!("Failed to list playlist items: {err}"),
+            )
+            .await;
         }
     };
 
@@ -391,10 +418,20 @@ async fn handle_playlist_play_button(
 
     if !data.player.is_connected(guild_id) {
         let Some(channel_id) = voice_channel_of(ctx, guild_id, component.user.id) else {
-            return update_picker(ctx, component, "Join a voice channel first, or use `/join`.").await;
+            return update_picker(
+                ctx,
+                component,
+                "Join a voice channel first, or use `/join`.",
+            )
+            .await;
         };
         if let Err(err) = data.player.join(guild_id, channel_id).await {
-            return update_picker(ctx, component, format!("Failed to join voice channel: {err}")).await;
+            return update_picker(
+                ctx,
+                component,
+                format!("Failed to join voice channel: {err}"),
+            )
+            .await;
         }
     }
 
@@ -413,7 +450,10 @@ async fn handle_playlist_play_button(
     let content = if queued_count == total {
         format!("Queued {queued_count} track(s).")
     } else {
-        format!("Queued {queued_count}/{total} track(s) ({} failed).", total - queued_count)
+        format!(
+            "Queued {queued_count}/{total} track(s) ({} failed).",
+            total - queued_count
+        )
     };
     update_picker(ctx, component, content).await
 }
@@ -503,7 +543,11 @@ async fn join_and_enqueue(ctx: Context<'_>, track: Track) -> Result<(), Error> {
 /// the rest — it's tallied and reported alongside the successes, since one
 /// bad track (e.g. region-locked) shouldn't block queuing the rest of a
 /// playlist.
-async fn join_and_enqueue_all(ctx: Context<'_>, label: &str, tracks: Vec<Track>) -> Result<(), Error> {
+async fn join_and_enqueue_all(
+    ctx: Context<'_>,
+    label: &str,
+    tracks: Vec<Track>,
+) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only command has a guild id");
 
     if !ensure_connected(ctx, guild_id).await? {
@@ -530,12 +574,13 @@ async fn join_and_enqueue_all(ctx: Context<'_>, label: &str, tracks: Vec<Track>)
             total - queued_count
         )
     };
-    ctx.send(poise::CreateReply::default().content(content)).await?;
+    ctx.send(poise::CreateReply::default().content(content))
+        .await?;
 
     Ok(())
 }
 
-/// Searches YouTube for `query` and shows the top 5 matches, or queues one.
+/// Searches `YouTube` for `query` and shows the top 5 matches, or queues one.
 ///
 /// Call with no `number` to see the top 5 matches; call again with the same
 /// `query` plus a `number` from that list to queue one.
@@ -543,7 +588,9 @@ async fn join_and_enqueue_all(ctx: Context<'_>, label: &str, tracks: Vec<Track>)
 pub async fn add_to_queue(
     ctx: Context<'_>,
     #[description = "Search query"] query: String,
-    #[description = "Result number from a previous /add_to_queue with this query"] number: Option<u8>,
+    #[description = "Result number from a previous /add_to_queue with this query"] number: Option<
+        u8,
+    >,
 ) -> Result<(), Error> {
     let Some(token) = require_access_token(ctx).await? else {
         return Ok(());
@@ -580,7 +627,10 @@ pub async fn add_to_queue(
                     "Search results for \"{query}\":\n{listing}\n\nSelect one below to queue it, \
                      or run `/add_to_queue {query} <number>` to do the same without the menu."
                 ))
-                .components(vec![track_select_menu(&results, ADD_TO_QUEUE_DISPLAY_LIMIT)])
+                .components(vec![track_select_menu(
+                    &results,
+                    ADD_TO_QUEUE_DISPLAY_LIMIT,
+                )])
                 .ephemeral(true),
         )
         .await?;
@@ -735,7 +785,10 @@ mod tests {
     #[test]
     fn formats_line_with_duration() {
         let t = track("Some Song", "Some Channel", Some(Duration::from_secs(253)));
-        assert_eq!(format_track_line(1, &t), "1. Some Song — Some Channel (4:13)");
+        assert_eq!(
+            format_track_line(1, &t),
+            "1. Some Song — Some Channel (4:13)"
+        );
     }
 
     #[test]

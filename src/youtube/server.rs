@@ -1,4 +1,4 @@
-//! Local HTTP server that receives the Google OAuth2 redirect and completes
+//! Local HTTP server that receives the Google `OAuth2` redirect and completes
 //! the `/link` flow.
 //!
 //! Bound to loopback only (see `src/main.rs`) — this endpoint exists purely
@@ -24,7 +24,7 @@ struct CallbackParams {
 }
 
 /// Extracts the local bind port and callback path from the configured
-/// OAuth2 redirect URI. Defaults to port 8080 when the URI has no explicit
+/// `OAuth2` redirect URI. Defaults to port 8080 when the URI has no explicit
 /// port (matching `.env.example`'s default `http://localhost:8080/...`) —
 /// a missing port here isn't a misconfiguration worth failing startup over.
 pub fn parse_redirect_uri(redirect_uri: &str) -> Result<(u16, String)> {
@@ -34,7 +34,7 @@ pub fn parse_redirect_uri(redirect_uri: &str) -> Result<(u16, String)> {
     Ok((port, url.path().to_string()))
 }
 
-/// Builds the axum app serving the OAuth2 callback at `callback_path`.
+/// Builds the axum app serving the `OAuth2` callback at `callback_path`.
 pub fn app(data: Data, callback_path: &str) -> Router {
     Router::new()
         .route(callback_path, get(callback))

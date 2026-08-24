@@ -1,4 +1,4 @@
-//! Resolving a YouTube video ID into a playable songbird [`Input`], plus a
+//! Resolving a `YouTube` video ID into a playable songbird [`Input`], plus a
 //! pre-flight `yt-dlp` check for user-facing errors on common unplayable
 //! videos (age-restricted, region-locked, private/deleted).
 //!
@@ -22,7 +22,7 @@ const STDERR_TRUNCATE_LEN: usize = 200;
 /// Tracks longer than this (or with no known duration, e.g. livestreams)
 /// skip full pre-buffering and fall back to [`track_input`]'s live-streaming
 /// path, to bound worst-case memory use. See `cached_track_input`.
-const MAX_BUFFERED_TRACK_DURATION: Duration = Duration::from_secs(20 * 60);
+const MAX_BUFFERED_TRACK_DURATION: Duration = Duration::from_mins(20);
 
 #[derive(Debug)]
 pub enum PlaybackError {
@@ -41,11 +41,11 @@ pub enum PlaybackError {
 impl std::fmt::Display for PlaybackError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PlaybackError::AgeRestricted => write!(f, "video is age-restricted"),
-            PlaybackError::RegionLocked => write!(f, "video is not available in this region"),
-            PlaybackError::Unavailable => write!(f, "video is unavailable (private or deleted)"),
-            PlaybackError::YtDlpMissing => write!(f, "yt-dlp is not installed or not on PATH"),
-            PlaybackError::Other(message) => write!(f, "yt-dlp failed: {message}"),
+            Self::AgeRestricted => write!(f, "video is age-restricted"),
+            Self::RegionLocked => write!(f, "video is not available in this region"),
+            Self::Unavailable => write!(f, "video is unavailable (private or deleted)"),
+            Self::YtDlpMissing => write!(f, "yt-dlp is not installed or not on PATH"),
+            Self::Other(message) => write!(f, "yt-dlp failed: {message}"),
         }
     }
 }
@@ -88,7 +88,7 @@ pub fn classify_ytdlp_stderr(stderr: &str) -> PlaybackError {
 /// voice.
 ///
 /// `cookies_file`, if set, is passed through as `--cookies` — increasingly
-/// required for `yt-dlp` to get YouTube to serve a stream at all (see
+/// required for `yt-dlp` to get `YouTube` to serve a stream at all (see
 /// `Config::yt_dlp_cookies_file`), so the preflight check needs the same
 /// credential the real resolution in [`track_input`] will use, or it'll
 /// reject videos that would actually have played.
@@ -122,7 +122,7 @@ pub async fn preflight_check(
     Err(classify_ytdlp_stderr(&stderr))
 }
 
-/// Builds a lazily-resolved songbird input for a YouTube video ID.
+/// Builds a lazily-resolved songbird input for a `YouTube` video ID.
 /// The actual `yt-dlp` invocation and stream resolution happens when
 /// songbird's driver plays this input, not here (songbird's `YoutubeDl`
 /// source is lazy by design).
