@@ -135,31 +135,39 @@ See `.env.example` for the full list and inline docs:
 
 ## Deployment
 
-Two starting points are provided — pick whichever matches your hosting,
-neither is required over the other:
+Apollo is meant to run **locally** (your own machine, not a remote
+server) — so the simplest option is just `cargo run` (or a release build)
+with a `.env` file next to it. For that setup, `.env` with restrictive
+file permissions (`chmod 600 .env`) is a genuinely sufficient way to hold
+secrets — there's no multi-tenant server or remote attack surface to
+defend against, so a secrets manager/vault would be solving a problem
+this deployment doesn't have.
 
+Two other starting points are provided if you'd rather run it under a
+process supervisor on the same machine — pick whichever fits, neither is
+required over the other:
+
+- **systemd** (the more natural fit for "runs continuously on my own
+  Linux machine"): `deploy/apollo.service` runs the binary via
+  `EnvironmentFile`. It expects the binary and an `.env` file at
+  `/opt/apollo/`, owned by a dedicated `apollo` user, with the `.env` file
+  `chmod 600` — same reasoning as above, just formalized as a service.
 - **Docker**: `Dockerfile` builds a release binary and a runtime image
   with `yt-dlp` (upstream's standalone binary, not the often-stale distro
   package) and `ffmpeg` installed. Mount a volume for `DATABASE_URL`'s
   SQLite file so it survives container recreation, and pass the
-  environment variables above via `--env-file`/`-e`/your orchestrator's
-  secret mechanism (don't bake `.env` into the image — see `.dockerignore`).
-- **systemd**: `deploy/apollo.service` runs the binary directly via
-  `EnvironmentFile`. It expects the binary and an `.env` file at
-  `/opt/apollo/`, owned by a dedicated `apollo` user, with the `.env` file
-  `chmod 600` — a systemd unit file itself is commonly world-readable, so
-  secrets belong in the separately-permissioned `EnvironmentFile`, not the
-  unit.
+  environment variables above via `--env-file`/`-e` (don't bake `.env`
+  into the image — see `.dockerignore`).
 
-Neither of these is a full recommendation on *where* to host this or *how*
-to manage secrets in whatever environment you pick (a secrets
-manager/vault, systemd-creds, your cloud provider's native secret store,
-etc. are all reasonable depending on context) — that's a deliberate choice
-left to you, not baked in here.
+If this ever moves to a remote/shared host, the secrets-handling calculus
+changes — a proper secrets manager, systemd-creds, or your platform's
+native secret store would then be worth it — but that's not this
+project's current shape, so it isn't built in.
 
 Beyond local `tracing` output to stdout/stderr (captured by
-`journalctl`/`docker logs` either way), no additional logging/metrics
-backend is wired in.
+`journalctl`/your terminal either way), no additional logging/metrics
+backend is wired in — reasonable for a local single-user deployment, and
+premature before this has even been run live once.
 
 ## Project layout
 

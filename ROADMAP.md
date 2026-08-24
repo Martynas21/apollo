@@ -185,21 +185,21 @@ videos, and control playback end-to-end in a live guild.
       account silently needs `/link` again weekly unless the consent
       screen is moved to "In production," which requires Google's
       standard verification review for `youtube.readonly`.)
-- [ ] Production secrets handling (not just `.env`). README.md documents
-      the systemd `EnvironmentFile` pattern (chmod 600, separate from the
-      world-readable unit file) as one option and names alternatives
-      (a secrets manager/vault, systemd-creds, a cloud provider's native
-      secret store) without picking one — this is a real deployment
-      decision I'm not making unilaterally. Left unchecked pending your
-      choice of hosting target, which determines which option actually
-      fits.
-- [ ] Basic logging/observability beyond local `tracing` output. Not
-      implemented — `tracing` output currently goes to stdout/stderr only
-      (captured by `journalctl`/`docker logs` either way this gets
-      deployed). Adding a metrics/tracing backend (Prometheus endpoint,
-      OpenTelemetry export, a hosted log aggregator, etc.) is another
-      deployment-target-dependent choice left open rather than picked for
-      you.
+- [x] Production secrets handling (not just `.env`). Decided with the
+      user: this deploys **locally** (own machine), not to a remote/
+      shared host, so a `.env` file with restrictive permissions
+      (`chmod 600`) is a genuinely sufficient answer here — a secrets
+      manager/vault would defend against an attack surface (multi-tenant
+      hosts, remote access) this deployment doesn't have. README.md's
+      Deployment section documents this reasoning plus the same pattern
+      formalized as a systemd `EnvironmentFile` if run as a service. If
+      this ever moves to a remote host, that calculus changes — noted in
+      the docs, not built preemptively.
+- [x] Basic logging/observability beyond local `tracing` output. Decided
+      with the user: skip for now — nothing has been run live yet, and
+      stdout/stderr `tracing` output (captured by `journalctl`/the
+      terminal either way) is enough for a local single-user deployment.
+      Revisit if/when this runs somewhere that actually needs it.
 
 ## Phase 9 — Testing
 
