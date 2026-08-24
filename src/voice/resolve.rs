@@ -234,14 +234,13 @@ mod tests {
         }
     }
 
-    /// Legitimate assertion about this sandbox's actual state: `yt-dlp` is
-    /// genuinely not installed here, so this exercises the real
-    /// spawn-failure path rather than mocking anything.
-    #[tokio::test]
-    async fn preflight_check_reports_missing_binary_in_this_sandbox() {
-        assert!(matches!(
-            preflight_check("dQw4w9WgXcQ", None).await,
-            Err(PlaybackError::YtDlpMissing)
-        ));
-    }
+    // `preflight_check` hardcodes the `yt-dlp` program name, so its
+    // spawn-failure (`YtDlpMissing`) branch can't be exercised
+    // deterministically without either a real missing binary (no longer
+    // true now that yt-dlp is actually installed) or a live network call
+    // (a real video ID, unsuitable for a unit test). The same
+    // spawn-failure-detection logic is covered deterministically by
+    // `voice::tests::binary_runnable_reports_false_for_nonexistent_program`;
+    // this path is otherwise exercised by manual E2E testing
+    // (`docs/e2e-test-plan.md`).
 }

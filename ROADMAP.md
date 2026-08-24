@@ -91,7 +91,17 @@ Land in `src/voice/`.
       the resolved URL straight into symphonia — Opus-in-WebM, YouTube's
       typical best-audio pick, decodes without a separate `ffmpeg`
       subprocess. `ffmpeg` is still checked for at startup since yt-dlp
-      may shell out to it for some post-processing paths.)
+      may shell out to it for some post-processing paths. **Caught during
+      live testing**: songbird's own `symphonia` dependency requests zero
+      codecs/formats by design (documented in songbird's README) — the
+      consuming crate must depend on `symphonia` directly to get any decode
+      support at all, via Cargo feature unification. This was missing
+      entirely, so audio silently failed to decode (`reached probe limit`)
+      the first time this was tried against a real voice channel. Fixed by
+      adding `symphonia = { version = "0.5", features = ["aac", "isomp4"] }`
+      to `Cargo.toml` — default features already cover MKV/WebM (Opus),
+      Ogg, Wave, Vorbis, FLAC, PCM; `aac`/`isomp4` cover YouTube's AAC-in-MP4
+      fallback format.)
 - [x] Handle common failure modes (age-restricted, region-locked,
       private/deleted video) with a user-facing error rather than a
       panic. (`voice::preflight_check` + `classify_ytdlp_stderr`.)

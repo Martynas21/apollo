@@ -61,13 +61,12 @@ async fn binary_runnable(program: &str, version_arg: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Legitimate assertion about this sandbox's actual state: neither
-    /// binary is installed here, so both are reported missing in one error.
+    /// Uses a program name that can never exist on any machine, rather than
+    /// relying on `yt-dlp`/`ffmpeg` being absent from this particular
+    /// sandbox — that assumption doesn't hold once a dev actually installs
+    /// them, as happened here.
     #[tokio::test]
-    async fn reports_both_missing_binaries_in_this_sandbox() {
-        let err = check_playback_dependencies().await.unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("yt-dlp"));
-        assert!(message.contains("ffmpeg"));
+    async fn binary_runnable_reports_false_for_nonexistent_program() {
+        assert!(!binary_runnable("apollo-test-definitely-not-a-real-binary", "--version").await);
     }
 }

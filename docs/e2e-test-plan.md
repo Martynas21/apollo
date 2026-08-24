@@ -14,21 +14,21 @@ share with other people — some steps involve deliberately breaking things
 
 ## 0. Prerequisites
 
-- [ ] `.env` filled in per README's Discord/Google Cloud setup sections.
-- [ ] `which yt-dlp ffmpeg` both resolve; `cargo run` gets past the
+- [x] `.env` filled in per README's Discord/Google Cloud setup sections.
+- [x] `which yt-dlp ffmpeg` both resolve; `cargo run` gets past the
       startup dependency check without erroring.
-- [ ] The bot's invite URL (README) has been used to add it to your test
+- [x] The bot's invite URL (README) has been used to add it to your test
       server, and it shows **online** within a few seconds of `cargo run`.
-- [ ] `/ping` replies "Pong!" — confirms slash command registration
+- [x] `/ping` replies "Pong!" — confirms slash command registration
       actually worked before testing anything more complex.
 
 ## 1. Linking
 
-- [ ] `/link` replies ephemerally with a Google auth URL.
-- [ ] Opening it in a browser shows Google's consent screen for the
+- [x] `/link` replies ephemerally with a Google auth URL.
+- [x] Opening it in a browser shows Google's consent screen for the
       correct app name, requesting only the `youtube.readonly` scope (not
       more).
-- [ ] Completing consent shows a "Linked!" page from the bot's local
+- [x] Completing consent shows a "Linked!" page from the bot's local
       callback server, and the browser tab can be closed.
 - [ ] Running `/link` again (already linked) still works, and the reply
       mentions it replaces the existing link.
