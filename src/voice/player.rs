@@ -281,9 +281,19 @@ impl PlayerRegistry {
             tracing::warn!(%err, "failed to apply saved volume to new track");
         }
 
-        // Best-effort: if registering the end-of-track hook itself fails,
-        // the track still plays, it just won't auto-advance the queue —
-        // surfacing that as a playback failure would be misleading.
+        // Best-effort: if registering these hooks itself fails, the track
+        // still plays, it just won't auto-advance the queue — surfacing
+        // that as a playback failure would be misleading.
+        //
+        // `Error` (not just `End`) is required: a track whose lazy input
+        // fails to resolve/stream/decode after it starts (network drop,
+        // yt-dlp hiccup, a bad remote stream) goes to songbird's
+        // `PlayMode::Errored` without ever firing `End` — see
+        // `driver::tasks::mixer`'s handling of `InputReadyingError`/
+        // `MixStatus::Errored` in songbird 0.6. Without this handler too,
+        // such a track leaves `now_playing` stuck forever: no auto-advance,
+        // no idle-disconnect (since `now_playing` looks occupied), and no
+        // error ever surfaced to Discord — playback just silently stalls.
         if let Err(err) = handle.add_event(
             Event::Track(TrackEvent::End),
             TrackEndHandler {
@@ -292,6 +302,15 @@ impl PlayerRegistry {
             },
         ) {
             tracing::warn!(%err, "failed to register track-end handler");
+        }
+        if let Err(err) = handle.add_event(
+            Event::Track(TrackEvent::Error),
+            TrackEndHandler {
+                registry: self.clone(),
+                guild_id,
+            },
+        ) {
+            tracing::warn!(%err, "failed to register track-error handler");
         }
 
         let mut guilds = self.guilds.lock().await;

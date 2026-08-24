@@ -15,7 +15,7 @@ use poise::serenity_prelude as serenity;
 use super::playback::access_token_error_message;
 use super::{Context, Data, Error};
 use crate::voice::QueuedTrack;
-use crate::voice::panel::truncate_label;
+use crate::voice::panel::{format_duration, truncate_label};
 use crate::youtube::api::{Playlist, Track, YouTubeClient};
 use crate::youtube::oauth::get_valid_access_token;
 
@@ -50,19 +50,17 @@ async fn require_access_token(ctx: Context<'_>) -> Result<Option<String>, Error>
     }
 }
 
-/// Formats one line of a numbered track listing: `N. Title — Channel (mm:ss)`,
-/// omitting the duration parens entirely when unknown.
+/// Formats one line of a numbered track listing: `N. Title — Channel (mm:ss)`
+/// (or `h:mm:ss` past an hour), omitting the duration parens entirely when
+/// unknown.
 fn format_track_line(index: usize, track: &Track) -> String {
     match track.duration {
-        Some(duration) => {
-            let total_secs = duration.as_secs();
-            let minutes = total_secs / 60;
-            let seconds = total_secs % 60;
-            format!(
-                "{index}. {} — {} ({minutes}:{seconds:02})",
-                track.title, track.channel
-            )
-        }
+        Some(duration) => format!(
+            "{index}. {} — {} ({})",
+            track.title,
+            track.channel,
+            format_duration(duration)
+        ),
         None => format!("{index}. {} — {}", track.title, track.channel),
     }
 }
@@ -954,6 +952,19 @@ mod tests {
     fn formats_line_with_duration_under_a_minute_pads_seconds() {
         let t = track("Short", "Channel", Some(Duration::from_secs(5)));
         assert_eq!(format_track_line(1, &t), "1. Short — Channel (0:05)");
+    }
+
+    #[test]
+    fn formats_line_with_duration_past_an_hour_rolls_over() {
+        // Regression: this used to render as the raw minute count (e.g.
+        // "1477:03") instead of rolling over into hours, since this
+        // function computed mm:ss itself instead of using
+        // `panel::format_duration`.
+        let t = track("Long Mix", "Channel", Some(Duration::from_secs(88_623)));
+        assert_eq!(
+            format_track_line(1, &t),
+            "1. Long Mix — Channel (24:37:03)"
+        );
     }
 
     #[test]
