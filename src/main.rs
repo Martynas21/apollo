@@ -3,6 +3,9 @@ mod config;
 mod voice;
 mod youtube;
 
+use commands::{Data, Error};
+use poise::serenity_prelude as serenity;
+use songbird::serenity::SerenityInit;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -20,9 +23,58 @@ async fn main() -> anyhow::Result<()> {
         "apollo starting up"
     );
 
-    // TODO: build the serenity client with the poise framework, register
-    // songbird, and start the axum-based OAuth callback server. This lands
-    // in a later task.
+    let intents = serenity::GatewayIntents::GUILDS | serenity::GatewayIntents::GUILD_VOICE_STATES;
+    let guild_id = config.discord_guild_id;
 
+    let framework = poise::Framework::builder()
+        .options(poise::FrameworkOptions {
+            commands: commands::commands(),
+            event_handler: |_ctx, event, _framework, _data| Box::pin(event_handler(event)),
+            ..Default::default()
+        })
+        .setup(move |ctx, _ready, framework| {
+            Box::pin(async move {
+                // Guild-scoped registration propagates near-instantly, which
+                // is what you want while iterating locally; global
+                // registration can take up to an hour to show up everywhere.
+                match guild_id {
+                    Some(id) => {
+                        poise::builtins::register_in_guild(
+                            ctx,
+                            &framework.options().commands,
+                            serenity::GuildId::new(id),
+                        )
+                        .await?;
+                    }
+                    None => {
+                        poise::builtins::register_globally(ctx, &framework.options().commands)
+                            .await?;
+                    }
+                }
+                Ok(Data)
+            })
+        })
+        .build();
+
+    let mut client = serenity::ClientBuilder::new(config.discord_token, intents)
+        .framework(framework)
+        .register_songbird()
+        .await?;
+
+    client.start().await?;
+
+    Ok(())
+}
+
+async fn event_handler(event: &serenity::FullEvent) -> Result<(), Error> {
+    match event {
+        serenity::FullEvent::Ready { data_about_bot } => {
+            tracing::info!(user = %data_about_bot.user.name, "ready");
+        }
+        serenity::FullEvent::Resume { .. } => {
+            tracing::info!("resumed");
+        }
+        _ => {}
+    }
     Ok(())
 }
