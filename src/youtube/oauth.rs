@@ -140,8 +140,9 @@ pub async fn get_valid_access_token(
     http_client: &oauth2::reqwest::Client,
     pool: &sqlx::SqlitePool,
     discord_user_id: &str,
+    key: &crate::crypto::TokenKey,
 ) -> Result<String, AccessTokenError> {
-    let stored = db::get_token(pool, discord_user_id)
+    let stored = db::get_token(pool, discord_user_id, key)
         .await
         .map_err(|e| AccessTokenError::RefreshFailed {
             revoked: false,
@@ -204,7 +205,7 @@ pub async fn get_valid_access_token(
         expires_at: now + expires_in,
         scopes: stored.scopes,
     };
-    db::upsert_token(pool, &updated)
+    db::upsert_token(pool, &updated, key)
         .await
         .map_err(|e| AccessTokenError::RefreshFailed {
             revoked: false,
@@ -227,6 +228,7 @@ pub async fn exchange_code_and_store(
     pool: &sqlx::SqlitePool,
     discord_user_id: &str,
     code: String,
+    key: &crate::crypto::TokenKey,
 ) -> Result<()> {
     let token_result = oauth_client
         .exchange_code(AuthorizationCode::new(code))
@@ -242,7 +244,7 @@ pub async fn exchange_code_and_store(
 
     let refresh_token = match token_result.refresh_token() {
         Some(rt) => rt.secret().clone(),
-        None => db::get_token(pool, discord_user_id)
+        None => db::get_token(pool, discord_user_id, key)
             .await?
             .map(|t| t.refresh_token)
             .ok_or_else(|| {
@@ -270,7 +272,7 @@ pub async fn exchange_code_and_store(
         expires_at: now + expires_in,
         scopes,
     };
-    db::upsert_token(pool, &token).await?;
+    db::upsert_token(pool, &token, key).await?;
 
     Ok(())
 }

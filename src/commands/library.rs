@@ -31,6 +31,7 @@ async fn require_access_token(ctx: Context<'_>) -> Result<Option<String>, Error>
         &ctx.data().oauth_http,
         &ctx.data().db,
         &ctx.author().id.to_string(),
+        &ctx.data().token_key,
     )
     .await
     {

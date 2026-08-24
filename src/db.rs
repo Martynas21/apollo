@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
 
+use crate::crypto::{self, TokenKey};
+
 /// A row from the `users` table: one linked Google account's tokens.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct StoredToken {
@@ -41,7 +43,12 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool> {
 }
 
 /// Inserts a token, or replaces the existing one for the same Discord user.
-pub async fn upsert_token(pool: &SqlitePool, token: &StoredToken) -> Result<()> {
+/// `access_token`/`refresh_token` are encrypted under `key` before being
+/// written.
+pub async fn upsert_token(pool: &SqlitePool, token: &StoredToken, key: &TokenKey) -> Result<()> {
+    let encrypted_access_token = crypto::encrypt(key, &token.access_token);
+    let encrypted_refresh_token = crypto::encrypt(key, &token.refresh_token);
+
     sqlx::query(
         "INSERT INTO users (discord_user_id, access_token, refresh_token, expires_at, scopes)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -52,8 +59,8 @@ pub async fn upsert_token(pool: &SqlitePool, token: &StoredToken) -> Result<()> 
              scopes = excluded.scopes",
     )
     .bind(&token.discord_user_id)
-    .bind(&token.access_token)
-    .bind(&token.refresh_token)
+    .bind(encrypted_access_token)
+    .bind(encrypted_refresh_token)
     .bind(token.expires_at)
     .bind(&token.scopes)
     .execute(pool)
@@ -64,7 +71,12 @@ pub async fn upsert_token(pool: &SqlitePool, token: &StoredToken) -> Result<()> 
 }
 
 /// Looks up the stored token for a Discord user, if one is linked.
-pub async fn get_token(pool: &SqlitePool, discord_user_id: &str) -> Result<Option<StoredToken>> {
+/// `access_token`/`refresh_token` are decrypted under `key` after reading.
+pub async fn get_token(
+    pool: &SqlitePool,
+    discord_user_id: &str,
+    key: &TokenKey,
+) -> Result<Option<StoredToken>> {
     let token = sqlx::query_as::<_, StoredToken>(
         "SELECT discord_user_id, access_token, refresh_token, expires_at, scopes
          FROM users WHERE discord_user_id = ?1",
@@ -74,7 +86,37 @@ pub async fn get_token(pool: &SqlitePool, discord_user_id: &str) -> Result<Optio
     .await
     .context("failed to fetch token")?;
 
-    Ok(token)
+    token
+        .map(|mut token| {
+            token.access_token = crypto::decrypt(key, &token.access_token)
+                .context("failed to decrypt stored access token")?;
+            token.refresh_token = crypto::decrypt(key, &token.refresh_token)
+                .context("failed to decrypt stored refresh token")?;
+            Ok(token)
+        })
+        .transpose()
+}
+
+/// Fails loudly, before the bot does anything else, if `key` doesn't match
+/// the key that encrypted whatever's already in `users`. Call this on every
+/// startup — it's the guard against a mistyped or rotated
+/// `TOKEN_ENCRYPTION_KEY`: better to refuse to start than to let every
+/// command fail confusingly.
+pub async fn verify_token_key(pool: &SqlitePool, key: &TokenKey) -> Result<()> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT access_token FROM users LIMIT 1")
+        .fetch_optional(pool)
+        .await
+        .context("failed to read a token for key verification")?;
+
+    let Some((access_token,)) = row else {
+        return Ok(());
+    };
+
+    crypto::decrypt(key, &access_token).map(|_| ()).context(
+        "TOKEN_ENCRYPTION_KEY does not match the key that encrypted the tokens already stored \
+         in the database — check .env for a typo or an accidental rotation. Refusing to start \
+         rather than risk further corrupting stored tokens.",
+    )
 }
 
 /// Deletes the stored token for a Discord user, if any. Idempotent.
@@ -132,20 +174,29 @@ mod tests {
         }
     }
 
+    fn test_key() -> TokenKey {
+        crypto::parse_key("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=").expect("valid test key")
+    }
+
+    fn other_test_key() -> TokenKey {
+        crypto::parse_key("enp6enp6enp6enp6enp6enp6enp6enp6enp6enp6eno=").expect("valid test key")
+    }
+
     #[tokio::test]
     async fn upsert_get_delete_round_trip() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
+        let key = test_key();
 
         // No row yet.
         assert_eq!(
-            get_token(&pool, &sample_token().discord_user_id).await?,
+            get_token(&pool, &sample_token().discord_user_id, &key).await?,
             None
         );
 
         let token = sample_token();
-        upsert_token(&pool, &token).await?;
+        upsert_token(&pool, &token, &key).await?;
 
-        let fetched = get_token(&pool, &token.discord_user_id)
+        let fetched = get_token(&pool, &token.discord_user_id, &key)
             .await?
             .expect("token should have been stored");
         assert_eq!(fetched, token);
@@ -155,13 +206,15 @@ mod tests {
         let mut updated = token.clone();
         updated.access_token = "access-new".to_string();
         updated.expires_at = 1_900_000_000;
-        upsert_token(&pool, &updated).await?;
+        upsert_token(&pool, &updated, &key).await?;
 
-        let fetched = get_token(&pool, &token.discord_user_id).await?.unwrap();
+        let fetched = get_token(&pool, &token.discord_user_id, &key)
+            .await?
+            .unwrap();
         assert_eq!(fetched, updated);
 
         delete_token(&pool, &token.discord_user_id).await?;
-        assert_eq!(get_token(&pool, &token.discord_user_id).await?, None);
+        assert_eq!(get_token(&pool, &token.discord_user_id, &key).await?, None);
 
         // Deleting again is a no-op, not an error.
         delete_token(&pool, &token.discord_user_id).await?;
@@ -177,23 +230,67 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db_path = dir.path().join("apollo-test.db");
         let url = format!("sqlite://{}", db_path.display());
+        let key = test_key();
 
         let token = sample_token();
 
         {
             let pool = connect(&url).await?;
-            upsert_token(&pool, &token).await?;
+            upsert_token(&pool, &token, &key).await?;
             pool.close().await;
         }
 
         // Reopen — simulates the bot restarting and reconnecting to the
         // same database file.
         let pool = connect(&url).await?;
-        let fetched = get_token(&pool, &token.discord_user_id)
+        let fetched = get_token(&pool, &token.discord_user_id, &key)
             .await?
             .expect("token should still be present after reopening the pool");
         assert_eq!(fetched, token);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tokens_are_encrypted_at_rest() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        let key = test_key();
+        let token = sample_token();
+        upsert_token(&pool, &token, &key).await?;
+
+        let (raw_access_token,): (String,) =
+            sqlx::query_as("SELECT access_token FROM users WHERE discord_user_id = ?1")
+                .bind(&token.discord_user_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_ne!(raw_access_token, token.access_token);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verify_token_key_accepts_matching_key() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        let key = test_key();
+        upsert_token(&pool, &sample_token(), &key).await?;
+
+        assert!(verify_token_key(&pool, &key).await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verify_token_key_rejects_wrong_key() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        upsert_token(&pool, &sample_token(), &test_key()).await?;
+
+        assert!(verify_token_key(&pool, &other_test_key()).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verify_token_key_passes_on_empty_table() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        assert!(verify_token_key(&pool, &test_key()).await.is_ok());
         Ok(())
     }
 

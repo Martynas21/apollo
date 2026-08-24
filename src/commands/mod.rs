@@ -11,6 +11,8 @@ mod youtube;
 pub struct Data {
     /// Pool of connections to the token-persistence SQLite database.
     pub db: sqlx::SqlitePool,
+    /// AES-256-GCM key used to encrypt/decrypt stored OAuth2 tokens.
+    pub token_key: crate::crypto::TokenKey,
     /// Configured Google OAuth2 client (auth/token/revocation endpoints set).
     pub oauth_client: crate::youtube::oauth::GoogleOAuthClient,
     /// Shared HTTP client used for all OAuth2 token endpoint requests.

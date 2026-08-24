@@ -168,6 +168,7 @@ pub async fn play(
         &ctx.data().oauth_http,
         &ctx.data().db,
         &ctx.author().id.to_string(),
+        &ctx.data().token_key,
     )
     .await
     {

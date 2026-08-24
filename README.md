@@ -156,6 +156,11 @@ See `.env.example` for the full list and inline docs:
 - `DISCORD_GUILD_ID` — optional, see [Discord application setup](#discord-application-setup).
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI` — required.
 - `DATABASE_URL` — required (e.g. `sqlite://apollo.db`).
+- `TOKEN_ENCRYPTION_KEY` — required. AES-256 key (base64, 32 raw bytes) that
+  encrypts linked accounts' OAuth2 tokens at rest. Generate with
+  `openssl rand -base64 32`; keep it secret and back it up alongside the
+  database — losing or rotating it makes existing stored tokens
+  undecryptable.
 - `YT_DLP_COOKIES_FILE` — optional but increasingly necessary in practice:
   YouTube requires a proof-of-origin signal from a real logged-in browser
   session before serving a stream to `yt-dlp` at all, especially from a

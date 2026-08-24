@@ -81,6 +81,7 @@ async fn callback(
         &data.db,
         &discord_user_id.to_string(),
         code,
+        &data.token_key,
     )
     .await;
 

@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod crypto;
 mod db;
 mod voice;
 mod youtube;
@@ -34,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
     let guild_id = config.discord_guild_id;
 
     let db_pool = db::connect(&config.database_url).await?;
+    db::verify_token_key(&db_pool, &config.token_encryption_key).await?;
     let oauth_client = youtube::oauth::build_oauth_client(&config)?;
     let oauth_http = youtube::oauth::build_http_client()?;
     let pending_links = youtube::oauth::PendingLinks::default();
@@ -54,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
 
     let data = Data {
         db: db_pool,
+        token_key: config.token_encryption_key,
         oauth_client,
         oauth_http,
         pending_links,

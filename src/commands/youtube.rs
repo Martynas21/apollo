@@ -10,9 +10,13 @@ use crate::youtube::oauth::YOUTUBE_READONLY_SCOPE;
 /// behalf.
 #[poise::command(slash_command)]
 pub async fn link(ctx: Context<'_>) -> Result<(), Error> {
-    let already_linked = db::get_token(&ctx.data().db, &ctx.author().id.to_string())
-        .await?
-        .is_some();
+    let already_linked = db::get_token(
+        &ctx.data().db,
+        &ctx.author().id.to_string(),
+        &ctx.data().token_key,
+    )
+    .await?
+    .is_some();
 
     let (auth_url, csrf_token) = ctx
         .data()
@@ -55,7 +59,9 @@ pub async fn link(ctx: Context<'_>) -> Result<(), Error> {
 pub async fn unlink(ctx: Context<'_>) -> Result<(), Error> {
     let discord_user_id = ctx.author().id.to_string();
 
-    let Some(stored) = db::get_token(&ctx.data().db, &discord_user_id).await? else {
+    let Some(stored) =
+        db::get_token(&ctx.data().db, &discord_user_id, &ctx.data().token_key).await?
+    else {
         ctx.send(
             poise::CreateReply::default()
                 .content("You don't have a linked Google account.")

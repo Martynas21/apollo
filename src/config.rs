@@ -5,6 +5,8 @@
 
 use anyhow::{Context, Result};
 
+use crate::crypto;
+
 /// All configuration the bot needs, sourced from environment variables
 /// (see `.env.example`).
 #[derive(Debug, Clone)]
@@ -18,6 +20,10 @@ pub struct Config {
     pub google_client_secret: String,
     pub google_oauth_redirect_uri: String,
     pub database_url: String,
+    /// AES-256-GCM key used to encrypt OAuth2 tokens before they're written
+    /// to `users.access_token`/`refresh_token`. See `.env.example` for how
+    /// to generate one.
+    pub token_encryption_key: crypto::TokenKey,
     /// Path to a Netscape-format cookies file passed to `yt-dlp` as
     /// `--cookies`. YouTube increasingly requires a proof-of-origin signal
     /// from a real logged-in browser session before it'll serve a stream to
@@ -44,6 +50,7 @@ impl Config {
             google_client_secret: env_var("GOOGLE_CLIENT_SECRET")?,
             google_oauth_redirect_uri: env_var("GOOGLE_OAUTH_REDIRECT_URI")?,
             database_url: env_var("DATABASE_URL")?,
+            token_encryption_key: crypto::parse_key(&env_var("TOKEN_ENCRYPTION_KEY")?)?,
             yt_dlp_cookies_file: optional_env_var("YT_DLP_COOKIES_FILE"),
         })
     }
