@@ -30,9 +30,6 @@ const IDLE_DISCONNECT: Duration = Duration::from_secs(5 * 60);
 #[derive(Debug, Clone)]
 pub struct QueuedTrack {
     pub track: Track,
-    /// Not displayed by any command yet — Phase 7's now-playing embeds
-    /// ("title, thumbnail, requester, progress") are what read this.
-    #[allow(dead_code)]
     pub requested_by: UserId,
 }
 
@@ -315,6 +312,20 @@ impl PlayerRegistry {
                 upcoming: Vec::new(),
             },
         }
+    }
+
+    /// Live playback position of the current track, for a `/nowplaying`
+    /// progress display. `None` if nothing is playing or songbird couldn't
+    /// report a position (e.g. the track just ended in a race with this
+    /// call) — a missing position isn't worth surfacing as an error.
+    pub async fn now_playing_position(&self, guild_id: GuildId) -> Option<Duration> {
+        let handle = {
+            let guilds = self.guilds.lock().await;
+            guilds
+                .get(&guild_id)
+                .and_then(|state| state.current_handle.clone())
+        }?;
+        handle.get_info().await.ok().map(|state| state.position)
     }
 }
 

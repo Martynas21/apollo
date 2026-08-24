@@ -94,24 +94,65 @@ fn now_unix() -> Result<i64> {
         .as_secs() as i64)
 }
 
+/// Why [`get_valid_access_token`] couldn't produce a token, distinguished so
+/// callers can prompt correctly: "you've never linked" reads very
+/// differently from "your link broke and needs to be redone."
+#[derive(Debug)]
+pub enum AccessTokenError {
+    /// No row in the DB for this Discord user at all.
+    NotLinked,
+    /// A stored token exists but refreshing it failed.
+    RefreshFailed {
+        /// `true` when Google's response was specifically `invalid_grant`
+        /// (RFC 6749) — the refresh token is revoked, expired, or otherwise
+        /// permanently invalid, not a transient failure. The stored row has
+        /// already been deleted in this case, since it can never succeed
+        /// again unmodified. When `false` (network blip, Google-side
+        /// hiccup, etc.), the row is left alone — a later call may well
+        /// succeed with no user action needed.
+        revoked: bool,
+        message: String,
+    },
+}
+
+impl std::fmt::Display for AccessTokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccessTokenError::NotLinked => write!(f, "no linked Google account"),
+            AccessTokenError::RefreshFailed { revoked: true, .. } => {
+                write!(f, "Google access was revoked or expired")
+            }
+            AccessTokenError::RefreshFailed {
+                revoked: false,
+                message,
+            } => write!(f, "failed to refresh Google access token: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for AccessTokenError {}
+
 /// Returns a valid (non-expired) access token for `discord_user_id`,
 /// transparently refreshing and persisting a new one if the stored token is
-/// at or near expiry. Fails with a clear error if the user has no linked
-/// account.
-// Not called yet — this is what the YouTube Data API client (a later
-// phase) will use before making requests on a linked user's behalf.
-#[allow(dead_code)]
+/// at or near expiry.
 pub async fn get_valid_access_token(
     oauth_client: &GoogleOAuthClient,
     http_client: &oauth2::reqwest::Client,
     pool: &sqlx::SqlitePool,
     discord_user_id: &str,
-) -> Result<String> {
+) -> Result<String, AccessTokenError> {
     let stored = db::get_token(pool, discord_user_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no linked YouTube account for this user"))?;
+        .await
+        .map_err(|e| AccessTokenError::RefreshFailed {
+            revoked: false,
+            message: e.to_string(),
+        })?
+        .ok_or(AccessTokenError::NotLinked)?;
 
-    let now = now_unix()?;
+    let now = now_unix().map_err(|e| AccessTokenError::RefreshFailed {
+        revoked: false,
+        message: e.to_string(),
+    })?;
     if !needs_refresh(stored.expires_at, now) {
         return Ok(stored.access_token);
     }
@@ -119,8 +160,32 @@ pub async fn get_valid_access_token(
     let token_result = oauth_client
         .exchange_refresh_token(&RefreshToken::new(stored.refresh_token.clone()))
         .request_async(http_client)
-        .await
-        .context("failed to refresh Google OAuth2 access token")?;
+        .await;
+
+    let token_result = match token_result {
+        Ok(token_result) => token_result,
+        Err(oauth2::RequestTokenError::ServerResponse(resp))
+            if matches!(
+                resp.error(),
+                oauth2::basic::BasicErrorResponseType::InvalidGrant
+            ) =>
+        {
+            // The refresh token itself is invalid/revoked/expired — no retry
+            // of this exact request will ever succeed, so there's nothing
+            // worth keeping around; delete it so `/link` cleanly re-links.
+            let _ = db::delete_token(pool, discord_user_id).await;
+            return Err(AccessTokenError::RefreshFailed {
+                revoked: true,
+                message: "refresh token invalid_grant".to_string(),
+            });
+        }
+        Err(err) => {
+            return Err(AccessTokenError::RefreshFailed {
+                revoked: false,
+                message: err.to_string(),
+            });
+        }
+    };
 
     let expires_in = token_result
         .expires_in()
@@ -139,7 +204,12 @@ pub async fn get_valid_access_token(
         expires_at: now + expires_in,
         scopes: stored.scopes,
     };
-    db::upsert_token(pool, &updated).await?;
+    db::upsert_token(pool, &updated)
+        .await
+        .map_err(|e| AccessTokenError::RefreshFailed {
+            revoked: false,
+            message: e.to_string(),
+        })?;
 
     Ok(access_token)
 }

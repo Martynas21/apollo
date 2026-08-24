@@ -8,7 +8,26 @@ use poise::serenity_prelude as serenity;
 use super::{Context, Error};
 use crate::voice::player::{PlayerError, QueuedTrack};
 use crate::youtube::api::Track;
-use crate::youtube::oauth::get_valid_access_token;
+use crate::youtube::oauth::{AccessTokenError, get_valid_access_token};
+
+/// User-facing message for a failed [`get_valid_access_token`] call,
+/// distinguishing "never linked" from "linked but broken" so the prompt
+/// tells the user the right thing to do.
+pub(super) fn access_token_error_message(err: &AccessTokenError) -> String {
+    match err {
+        AccessTokenError::NotLinked => {
+            "you need to link your Google account first — run `/link`".to_string()
+        }
+        AccessTokenError::RefreshFailed { revoked: true, .. } => {
+            "your Google account link was revoked or expired — run `/link` again to reconnect it"
+                .to_string()
+        }
+        AccessTokenError::RefreshFailed { revoked: false, .. } => {
+            "couldn't refresh your Google account link right now — try again in a moment"
+                .to_string()
+        }
+    }
+}
 
 /// Max `upcoming` entries shown in `/queue` before truncating with a
 /// "...and N more" trailer, to stay well under Discord's ~2000 char message
@@ -73,6 +92,39 @@ fn format_track(track: &Track) -> String {
         ),
         None => format!("**{}** — {}", track.title, track.channel),
     }
+}
+
+/// Builds the `/nowplaying` embed: title (linked to the video), thumbnail,
+/// requester, and progress (`position / duration`, or just `position` if
+/// the video's total duration is unknown, or omitted entirely if songbird
+/// couldn't report a position).
+fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> serenity::CreateEmbed {
+    let video_url = format!("https://www.youtube.com/watch?v={}", queued.track.video_id);
+    // YouTube's thumbnail CDN follows this URL shape for every public video
+    // ID — no extra API call needed to get it.
+    let thumbnail_url = format!(
+        "https://i.ytimg.com/vi/{}/hqdefault.jpg",
+        queued.track.video_id
+    );
+
+    let progress = match (position, queued.track.duration) {
+        (Some(pos), Some(dur)) => Some(format!("{} / {}", format_duration(pos), format_duration(dur))),
+        (Some(pos), None) => Some(format_duration(pos)),
+        (None, _) => None,
+    };
+
+    let mut embed = serenity::CreateEmbed::new()
+        .title(&queued.track.title)
+        .url(video_url)
+        .thumbnail(thumbnail_url)
+        .field("Channel", &queued.track.channel, true)
+        .field("Requested by", format!("<@{}>", queued.requested_by), true);
+
+    if let Some(progress) = progress {
+        embed = embed.field("Progress", progress, true);
+    }
+
+    embed
 }
 
 /// The invoking user's current voice channel in this guild, if any.
@@ -147,8 +199,8 @@ pub async fn play(
     .await
     {
         Ok(token) => token,
-        Err(_) => {
-            reply_error(ctx, "you need to link your Google account first — run `/link`").await?;
+        Err(err) => {
+            reply_error(ctx, access_token_error_message(&err)).await?;
             return Ok(());
         }
     };
@@ -286,10 +338,14 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
     let snapshot = ctx.data().player.queue_snapshot(guild_id).await;
 
-    match snapshot.now_playing {
-        Some(queued) => reply_public(ctx, format!("Now playing: {}", format_track(&queued.track))).await,
-        None => reply_error(ctx, "nothing is playing").await,
-    }
+    let Some(queued) = snapshot.now_playing else {
+        return reply_error(ctx, "nothing is playing").await;
+    };
+
+    let position = ctx.data().player.now_playing_position(guild_id).await;
+    ctx.send(poise::CreateReply::default().embed(now_playing_embed(&queued, position)))
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -358,5 +414,103 @@ mod tests {
     #[test]
     fn formats_over_an_hour_duration() {
         assert_eq!(format_duration(Duration::from_secs(3723)), "1:02:03");
+    }
+
+    // ---- access_token_error_message ----
+
+    #[test]
+    fn not_linked_message_prompts_link() {
+        assert!(access_token_error_message(&AccessTokenError::NotLinked).contains("/link"));
+    }
+
+    #[test]
+    fn revoked_message_differs_from_not_linked() {
+        let revoked = access_token_error_message(&AccessTokenError::RefreshFailed {
+            revoked: true,
+            message: "refresh token invalid_grant".to_string(),
+        });
+        assert!(revoked.contains("revoked") || revoked.contains("expired"));
+        assert_ne!(
+            revoked,
+            access_token_error_message(&AccessTokenError::NotLinked)
+        );
+    }
+
+    #[test]
+    fn transient_refresh_failure_suggests_retry_not_relink() {
+        let message = access_token_error_message(&AccessTokenError::RefreshFailed {
+            revoked: false,
+            message: "network error".to_string(),
+        });
+        assert!(!message.contains("/link"));
+    }
+
+    // ---- now_playing_embed ----
+
+    fn sample_queued_track(duration: Option<Duration>) -> QueuedTrack {
+        QueuedTrack {
+            track: Track {
+                video_id: "dQw4w9WgXcQ".to_string(),
+                title: "Some Video".to_string(),
+                channel: "Some Channel".to_string(),
+                duration,
+            },
+            requested_by: serenity::UserId::new(123456789012345678),
+        }
+    }
+
+    /// `CreateEmbed` derives `Serialize`; round-tripping through JSON is the
+    /// only way to inspect a built embed's fields from outside the crate.
+    fn embed_json(embed: serenity::CreateEmbed) -> serde_json::Value {
+        serde_json::to_value(embed).expect("CreateEmbed should serialize")
+    }
+
+    #[test]
+    fn embed_includes_title_url_thumbnail_and_requester() {
+        let queued = sample_queued_track(Some(Duration::from_secs(213)));
+        let json = embed_json(now_playing_embed(&queued, Some(Duration::from_secs(30))));
+
+        assert_eq!(json["title"], "Some Video");
+        assert_eq!(json["url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        assert_eq!(
+            json["thumbnail"]["url"],
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
+        );
+
+        let fields = json["fields"].as_array().expect("fields should be an array");
+        let field_value = |name: &str| {
+            fields
+                .iter()
+                .find(|f| f["name"] == name)
+                .map(|f| f["value"].as_str().unwrap().to_string())
+        };
+        assert_eq!(field_value("Channel"), Some("Some Channel".to_string()));
+        assert_eq!(
+            field_value("Requested by"),
+            Some("<@123456789012345678>".to_string())
+        );
+        assert_eq!(field_value("Progress"), Some("0:30 / 3:33".to_string()));
+    }
+
+    #[test]
+    fn embed_omits_progress_field_when_position_unknown() {
+        let queued = sample_queued_track(Some(Duration::from_secs(213)));
+        let json = embed_json(now_playing_embed(&queued, None));
+
+        let fields = json["fields"].as_array().expect("fields should be an array");
+        assert!(!fields.iter().any(|f| f["name"] == "Progress"));
+    }
+
+    #[test]
+    fn embed_shows_bare_position_when_duration_unknown() {
+        let queued = sample_queued_track(None);
+        let json = embed_json(now_playing_embed(&queued, Some(Duration::from_secs(30))));
+
+        let fields = json["fields"].as_array().expect("fields should be an array");
+        let progress = fields
+            .iter()
+            .find(|f| f["name"] == "Progress")
+            .map(|f| f["value"].as_str().unwrap());
+        assert_eq!(progress, Some("0:30"));
     }
 }

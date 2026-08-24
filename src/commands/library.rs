@@ -12,6 +12,7 @@
 
 use poise::serenity_prelude as serenity;
 
+use super::playback::access_token_error_message;
 use super::{Context, Error};
 use crate::voice::QueuedTrack;
 use crate::youtube::api::Track;
@@ -35,10 +36,10 @@ async fn require_access_token(ctx: Context<'_>) -> Result<Option<String>, Error>
     .await
     {
         Ok(token) => Ok(Some(token)),
-        Err(_) => {
+        Err(err) => {
             ctx.send(
                 poise::CreateReply::default()
-                    .content("You don't have a linked Google account yet. Run `/link` first.")
+                    .content(access_token_error_message(&err))
                     .ephemeral(true),
             )
             .await?;

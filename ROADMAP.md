@@ -136,9 +136,30 @@ videos, and control playback end-to-end in a live guild.
 
 ## Phase 7 — Error handling & UX polish
 
-- [ ] Ephemeral (user-only) replies for errors.
-- [ ] Graceful re-link prompt when a token is revoked or refresh fails.
-- [ ] Now-playing embeds (title, thumbnail, requester, progress).
+- [x] Ephemeral (user-only) replies for errors. (Established from Phase 2
+      onward — every error path across `/link`, `/unlink`, and all Phase 6
+      commands replies ephemerally; success confirmations are public.)
+- [x] Graceful re-link prompt when a token is revoked or refresh fails.
+      `youtube::oauth::get_valid_access_token` now returns a typed
+      `AccessTokenError` (`NotLinked` vs. `RefreshFailed { revoked, .. }`)
+      instead of a flat `anyhow::Error`, distinguishing "never linked" from
+      "was linked but broke." A refresh failure specifically due to Google
+      returning `invalid_grant` (RFC 6749 — the standard signal for a
+      revoked/expired refresh token) deletes the stale DB row so `/link`
+      cleanly re-establishes it; any other refresh failure (network blip,
+      etc.) leaves the row alone, since a later call may succeed
+      unassisted. `commands::playback::access_token_error_message` maps
+      each case to a distinct user-facing message, shared by both
+      `/play` and the library-browsing commands.
+- [x] Now-playing embeds (title, thumbnail, requester, progress).
+      `/nowplaying` now sends a `serenity::CreateEmbed` (title linked to
+      the video, thumbnail via YouTube's public `i.ytimg.com` CDN
+      convention — no extra API call needed, channel, requester mention,
+      and live progress via a new `PlayerRegistry::now_playing_position`
+      backed by songbird's `TrackHandle::get_info()`). `/play`-family
+      "Queued: ..." confirmations and `/queue`'s listing stay plain text —
+      only the roadmap's explicit "now-playing" ask got the embed
+      treatment, to keep this pass's scope tight.
 
 ## Phase 8 — Ops/deployment
 
