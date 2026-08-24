@@ -1,8 +1,7 @@
 //! Slash command implementations (registered with `poise`).
-//!
-//! Placeholder — commands such as `/play` and `/queue` will be added in a
-//! later task.
 
+mod library;
+mod playback;
 mod youtube;
 
 /// Shared state made available to every command invocation.
@@ -20,12 +19,8 @@ pub struct Data {
     pub pending_links: crate::youtube::oauth::PendingLinks,
     /// Thin wrapper around the YouTube Data API v3 endpoints used to browse
     /// a linked account's playlists/liked videos and to search.
-    // Not read yet — Phase 6's `/play`/`/search`/`/playlists`/`/liked` wire
-    // this in.
-    #[allow(dead_code)]
     pub youtube: crate::youtube::api::YouTubeClient,
     /// Per-guild playback queues and the shared songbird manager handle.
-    #[allow(dead_code)]
     pub player: crate::voice::PlayerRegistry,
 }
 
@@ -41,5 +36,25 @@ async fn ping(ctx: Context<'_>) -> Result<(), Error> {
 
 /// All commands registered with the framework.
 pub fn commands() -> Vec<poise::Command<Data, Error>> {
-    vec![ping(), youtube::link(), youtube::unlink()]
+    vec![
+        ping(),
+        youtube::link(),
+        youtube::unlink(),
+        playback::join(),
+        playback::leave(),
+        playback::play(),
+        playback::queue(),
+        playback::skip(),
+        playback::pause(),
+        playback::resume(),
+        playback::stop(),
+        playback::nowplaying(),
+        library::search(),
+        library::searchplay(),
+        library::playlists(),
+        library::playlistplay(),
+        library::playlistqueue(),
+        library::liked(),
+        library::likedplay(),
+    ]
 }

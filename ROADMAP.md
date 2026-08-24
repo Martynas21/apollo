@@ -97,11 +97,10 @@ Land in `src/voice/`.
       panic. (`voice::preflight_check` + `classify_ytdlp_stderr`.)
 - [x] Confirm `yt-dlp` and `ffmpeg` are on `PATH` at startup (fail fast
       with a clear message if missing) — both are already called out as
-      prerequisites in `README.md`. (`voice::check_playback_dependencies`;
-      implemented but not yet called from `main.rs` — deliberately, since
-      neither binary is installed in dev/CI sandboxes and wiring it in
-      would hard-fail every `cargo run` there. Phase 6 or deployment
-      wiring should call this before accepting `/play`.)
+      prerequisites in `README.md`. (`voice::check_playback_dependencies`,
+      called from `main.rs` at startup as of Phase 6 — note this means
+      `cargo run` in a sandbox without yt-dlp/ffmpeg installed, like this
+      one, will fail immediately at startup; that's intentional.)
 
 **Done when:** a hardcoded video ID plays audio into a test voice channel.
 
@@ -109,15 +108,28 @@ Land in `src/voice/`.
 
 Land in `src/commands/`.
 
-- [ ] `/join`, `/leave` — voice channel connect/disconnect.
-- [ ] `/play <query|url>` — resolves via Phase 4/5 and enqueues.
-- [ ] `/search` — ad-hoc YouTube search with a pick-one-of-N reply.
-- [ ] `/playlists`, `/liked` — browse the linked account's library and
-      queue from it.
-- [ ] `/queue`, `/skip`, `/pause`, `/resume`, `/stop`, `/nowplaying`.
-- [ ] An in-memory per-guild queue (`VecDeque<Track>`) driven by the
+- [x] `/join`, `/leave` — voice channel connect/disconnect.
+- [x] `/play <query|url>` — resolves via Phase 4/5 and enqueues.
+- [x] `/search` — ad-hoc YouTube search with a pick-one-of-N reply.
+      (No interactive button/select picker — shows a numbered list and a
+      follow-up `/searchplay <query> <number>` command queues the pick.
+      Component interactions weren't worth the risk to get right without
+      live Discord testing; can be upgraded later.)
+- [x] `/playlists`, `/liked` — browse the linked account's library and
+      queue from it. (Same numbered-list-then-follow-up-command pattern:
+      `/playlistplay`, `/playlistqueue`, `/likedplay`. Each follow-up
+      re-fetches the listing rather than caching it between commands —
+      deliberate MVP simplicity, not an oversight.)
+- [x] `/queue`, `/skip`, `/pause`, `/resume`, `/stop`, `/nowplaying`.
+- [x] An in-memory per-guild queue (`VecDeque<Track>`) driven by the
       songbird track-end event to advance automatically.
-- [ ] Auto-disconnect on empty voice channel or idle timeout.
+      (`voice::player::PlayerRegistry`.)
+- [x] Auto-disconnect on empty voice channel or idle timeout. (Idle
+      timeout only — 5 minutes after the queue drains, re-checked when
+      the timer fires. Explicit "channel has zero human members" detection
+      via voice-state-update events was scoped out: idle timeout already
+      covers that case, just not instantly, and the added event-handling
+      surface wasn't worth it for this pass.)
 
 **Done when:** a user can `/link`, `/play` something from their liked
 videos, and control playback end-to-end in a live guild.

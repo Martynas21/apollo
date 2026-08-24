@@ -6,10 +6,7 @@
 //! command (`/play`, `/skip`, `/queue`, ...) goes through the same state
 //! rather than each reaching into songbird directly.
 //!
-//! Constructed once in `main.rs` and shared via `Data::player`, but no
-//! command calls into it yet — that lands with Phase 6's `/join`, `/play`,
-//! `/skip`, etc.
-#![allow(dead_code)]
+//! Constructed once in `main.rs` and shared via `Data::player`.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -33,6 +30,9 @@ const IDLE_DISCONNECT: Duration = Duration::from_secs(5 * 60);
 #[derive(Debug, Clone)]
 pub struct QueuedTrack {
     pub track: Track,
+    /// Not displayed by any command yet — Phase 7's now-playing embeds
+    /// ("title, thumbnail, requester, progress") are what read this.
+    #[allow(dead_code)]
     pub requested_by: UserId,
 }
 

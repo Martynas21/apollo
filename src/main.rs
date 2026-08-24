@@ -26,6 +26,10 @@ async fn main() -> anyhow::Result<()> {
         "apollo starting up"
     );
 
+    // Fail fast on a missing yt-dlp/ffmpeg rather than a confusing error on
+    // someone's first `/play`.
+    voice::check_playback_dependencies().await?;
+
     let intents = serenity::GatewayIntents::GUILDS | serenity::GatewayIntents::GUILD_VOICE_STATES;
     let guild_id = config.discord_guild_id;
 

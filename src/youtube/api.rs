@@ -188,6 +188,31 @@ struct VideoContentDetails {
     duration: String,
 }
 
+/// Response shape for `videos.list?part=snippet,contentDetails`, used by
+/// [`YouTubeClient::get_video`]. Separate from [`VideosResponse`] (used by
+/// the duration-only batch lookup in `fetch_durations`) because that one
+/// only ever requests `contentDetails`, not `snippet`.
+#[derive(Debug, Deserialize)]
+struct VideoWithSnippetResponse {
+    #[serde(default)]
+    items: Vec<VideoWithSnippetItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoWithSnippetItem {
+    id: String,
+    snippet: VideoSnippet,
+    content_details: VideoContentDetails,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoSnippet {
+    title: String,
+    channel_title: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChannelsResponse {
     #[serde(default)]
@@ -270,6 +295,15 @@ fn map_search_results(
             })
         })
         .collect()
+}
+
+fn map_video_with_snippet(resp: VideoWithSnippetResponse) -> Option<Track> {
+    resp.items.into_iter().next().map(|item| Track {
+        video_id: item.id,
+        title: item.snippet.title,
+        channel: item.snippet.channel_title,
+        duration: parse_iso8601_duration(&item.content_details.duration),
+    })
 }
 
 fn map_video_durations(resp: VideosResponse) -> HashMap<String, Option<Duration>> {
@@ -426,6 +460,21 @@ impl YouTubeClient {
         let durations = self.fetch_durations(access_token, &video_ids).await?;
 
         Ok(map_search_results(resp, &durations))
+    }
+
+    /// Looks up a single video by ID (used by `/play` for a direct video
+    /// ID/URL, where no search or playlist listing is involved).
+    pub async fn get_video(
+        &self,
+        access_token: &str,
+        video_id: &str,
+    ) -> Result<Track, YouTubeApiError> {
+        let url = format!("{API_BASE}/videos?part=snippet,contentDetails&id={video_id}");
+        let resp: VideoWithSnippetResponse = self.get_json(&url, access_token).await?;
+        map_video_with_snippet(resp).ok_or_else(|| YouTubeApiError::Api {
+            status: 404,
+            message: "video not found".to_string(),
+        })
     }
 
     async fn fetch_durations(
@@ -693,6 +742,37 @@ mod tests {
             Some(&Some(Duration::from_secs(213)))
         );
         assert_eq!(durations.get("livestreamvid"), Some(&None));
+    }
+
+    #[test]
+    fn maps_video_with_snippet_response() {
+        let json = r#"{
+            "items": [
+                {
+                    "id": "dQw4w9WgXcQ",
+                    "snippet": { "title": "Some Video", "channelTitle": "Uploader Channel" },
+                    "contentDetails": { "duration": "PT3M33S" }
+                }
+            ]
+        }"#;
+        let resp: VideoWithSnippetResponse = serde_json::from_str(json).unwrap();
+        let track = map_video_with_snippet(resp);
+        assert_eq!(
+            track,
+            Some(Track {
+                video_id: "dQw4w9WgXcQ".to_string(),
+                title: "Some Video".to_string(),
+                channel: "Uploader Channel".to_string(),
+                duration: Some(Duration::from_secs(213)),
+            })
+        );
+    }
+
+    #[test]
+    fn maps_video_with_snippet_response_empty_items() {
+        let json = r#"{ "items": [] }"#;
+        let resp: VideoWithSnippetResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(map_video_with_snippet(resp), None);
     }
 
     #[test]
