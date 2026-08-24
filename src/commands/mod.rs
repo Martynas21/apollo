@@ -3,10 +3,16 @@
 //! Placeholder — commands such as `/link`, `/play`, and `/queue` will be
 //! added in a later task.
 
-/// Shared state made available to every command invocation. Empty for now;
-/// later phases will add a database pool, YouTube client, etc.
-#[derive(Debug, Default)]
-pub struct Data;
+/// Shared state made available to every command invocation. Later phases
+/// will add a YouTube client, etc.
+// `db` isn't read by any command yet — it's wired up here so the OAuth
+// linking commands (`/link`, `/unlink`) landing next can use it directly.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct Data {
+    /// Pool of connections to the token-persistence SQLite database.
+    pub db: sqlx::SqlitePool,
+}
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Context<'a> = poise::Context<'a, Data, Error>;

@@ -50,13 +50,13 @@ the bot confirms the account is linked.
 
 New `migrations/` directory + `src/youtube/`.
 
-- [ ] Add an sqlx SQLite migration for a `users` table:
+- [x] Add an sqlx SQLite migration for a `users` table:
       `discord_user_id`, `access_token`, `refresh_token`, `expires_at`,
       `scopes`.
-- [ ] Add `DATABASE_URL` to `.env.example` and `Config`
+- [x] Add `DATABASE_URL` to `.env.example` and `Config`
       (`src/config.rs`) — intentionally left out of the initial scaffold
       until this lands.
-- [ ] Wire `sqlx::SqlitePool` into the bot's shared state (poise
+- [x] Wire `sqlx::SqlitePool` into the bot's shared state (poise
       `Data` type) so commands can read/write tokens.
 
 **Done when:** linked tokens survive a bot restart.

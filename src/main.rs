@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod db;
 mod voice;
 mod youtube;
 
@@ -26,6 +27,8 @@ async fn main() -> anyhow::Result<()> {
     let intents = serenity::GatewayIntents::GUILDS | serenity::GatewayIntents::GUILD_VOICE_STATES;
     let guild_id = config.discord_guild_id;
 
+    let db_pool = db::connect(&config.database_url).await?;
+
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: commands::commands(),
@@ -51,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
                             .await?;
                     }
                 }
-                Ok(Data)
+                Ok(Data { db: db_pool })
             })
         })
         .build();

@@ -20,6 +20,7 @@ pub struct Config {
     pub google_client_id: String,
     pub google_client_secret: String,
     pub google_oauth_redirect_uri: String,
+    pub database_url: String,
 }
 
 impl Config {
@@ -35,6 +36,7 @@ impl Config {
             google_client_id: env_var("GOOGLE_CLIENT_ID")?,
             google_client_secret: env_var("GOOGLE_CLIENT_SECRET")?,
             google_oauth_redirect_uri: env_var("GOOGLE_OAUTH_REDIRECT_URI")?,
+            database_url: env_var("DATABASE_URL")?,
         })
     }
 }
