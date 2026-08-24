@@ -163,16 +163,43 @@ videos, and control playback end-to-end in a live guild.
 
 ## Phase 8 — Ops/deployment
 
-- [ ] Process management: systemd unit or a Dockerfile.
-- [ ] Document the Discord application setup: bot invite URL, required
+- [x] Process management: systemd unit or a Dockerfile. Both provided
+      (`Dockerfile`, `deploy/apollo.service`) — neither is a
+      recommendation over the other, pick whichever matches your
+      hosting. **Not build/run-tested**: `docker` isn't functional in
+      this sandbox (no daemon access), so the Dockerfile is
+      hand-reviewed for correctness (multi-stage layout, user/ownership
+      ordering, migration embedding) but not actually built. Confirm it
+      builds before relying on it.
+- [x] Document the Discord application setup: bot invite URL, required
       OAuth2 scopes/permissions, gateway intents to enable in the
-      Developer Portal.
-- [ ] Document the Google Cloud project setup: OAuth consent screen,
+      Developer Portal. (README.md — also notes neither `GUILDS` nor
+      `GUILD_VOICE_STATES` is a privileged intent, so nothing needs
+      toggling on in the portal.)
+- [x] Document the Google Cloud project setup: OAuth consent screen,
       YouTube Data API v3 enablement, verification requirements if the
       `youtube`/`youtube.readonly` scope triggers Google's sensitive-scope
-      review for a public bot.
-- [ ] Production secrets handling (not just `.env`).
-- [ ] Basic logging/observability beyond local `tracing` output.
+      review for a public bot. (README.md — also flags a real operational
+      trap confirmed via research: an unverified "Testing"-status app
+      gets refresh tokens that expire after exactly 7 days, so a linked
+      account silently needs `/link` again weekly unless the consent
+      screen is moved to "In production," which requires Google's
+      standard verification review for `youtube.readonly`.)
+- [ ] Production secrets handling (not just `.env`). README.md documents
+      the systemd `EnvironmentFile` pattern (chmod 600, separate from the
+      world-readable unit file) as one option and names alternatives
+      (a secrets manager/vault, systemd-creds, a cloud provider's native
+      secret store) without picking one — this is a real deployment
+      decision I'm not making unilaterally. Left unchecked pending your
+      choice of hosting target, which determines which option actually
+      fits.
+- [ ] Basic logging/observability beyond local `tracing` output. Not
+      implemented — `tracing` output currently goes to stdout/stderr only
+      (captured by `journalctl`/`docker logs` either way this gets
+      deployed). Adding a metrics/tracing backend (Prometheus endpoint,
+      OpenTelemetry export, a hosted log aggregator, etc.) is another
+      deployment-target-dependent choice left open rather than picked for
+      you.
 
 ## Phase 9 — Testing
 

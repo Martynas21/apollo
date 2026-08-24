@@ -2,16 +2,17 @@
 
 Apollo is a Discord bot that lets a Discord user link their own YouTube
 account (via Google OAuth2) and stream audio from YouTube — their
-playlists, liked videos, subscriptions, or ad-hoc search/URL — directly
-into a Discord voice channel.
+playlists, liked videos, or ad-hoc search/URL — directly into a Discord
+voice channel.
 
 ## Status
 
-This repository is currently scaffolding only. The Discord gateway/voice
-plumbing (serenity + songbird + poise), the Google OAuth2 login flow, and
-the yt-dlp/ffmpeg-based audio pipeline are implemented incrementally in
-follow-up work — see `src/commands/`, `src/youtube/`, and `src/voice/`
-for placeholders.
+Functionally complete: linking, browsing, and playback all work end to
+end in code (`cargo build`/`clippy`/`test` all pass — see `ROADMAP.md` for
+what's implemented phase by phase). It has **not** been run against a
+live Discord bot token or a real Google OAuth2 client yet — do that before
+trusting it in a real server. `yt-dlp` and `ffmpeg` also need to actually
+be installed wherever you run it (see Prerequisites).
 
 ## Architecture
 
@@ -20,35 +21,161 @@ for placeholders.
   small local `axum` web server for the OAuth redirect/callback), so the
   bot can call the YouTube Data API v3 on the user's behalf.
 - **Audio**: the YouTube Data API only returns metadata. Actual audio is
-  resolved with `yt-dlp` and decoded with `ffmpeg` into songbird's voice
-  pipeline (not yet implemented).
+  resolved via songbird's built-in `yt-dlp`-backed input source, which
+  streams straight into songbird's symphonia-based decoder — no separate
+  `ffmpeg` subprocess in the common (Opus-in-WebM) path. `ffmpeg` is still
+  a required dependency: it's checked for at startup since `yt-dlp` itself
+  may shell out to it for some post-processing paths.
 - Per-user OAuth tokens (including refresh tokens) are persisted in a
   local SQLite database via `sqlx`.
 
 ## Prerequisites
 
 - Rust (stable, edition 2024 — see `rustc --version`)
-- A Discord application + bot token (https://discord.com/developers/applications)
+- A Discord application + bot token — see [Discord application setup](#discord-application-setup) below.
 - A Google Cloud project with the YouTube Data API v3 enabled and an
-  OAuth2 client ID/secret (https://console.cloud.google.com/apis/credentials)
-- `yt-dlp` and `ffmpeg` installed and on `PATH` (required once audio
-  playback lands)
+  OAuth2 client ID/secret — see [Google Cloud project setup](#google-cloud-project-setup) below.
+- `yt-dlp` and `ffmpeg` installed and on `PATH`. The bot checks for both at
+  startup and refuses to run if either is missing, with a message naming
+  which one. **Keep `yt-dlp` updated** (`yt-dlp -U`, or reinstall
+  periodically) — YouTube changes its site internals often enough that a
+  stale `yt-dlp` silently starts failing to resolve videos.
+
+## Discord application setup
+
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a New Application.
+2. Under **Bot**: click "Reset Token" (or "Copy") to get the bot token →
+   `DISCORD_TOKEN`. Under **General Information**, copy the "Application
+   ID" → `DISCORD_APPLICATION_ID`.
+3. No privileged gateway intents need to be toggled on in the portal —
+   Apollo only uses `GUILDS` and `GUILD_VOICE_STATES`, neither of which is
+   privileged (unlike, e.g., message content or member list access).
+4. Generate an invite URL with the `bot` and `applications.commands`
+   scopes, and these bot permissions: View Channels, Send Messages, Embed
+   Links, Connect, Speak. You can build this in the portal's OAuth2 → URL
+   Generator page, or use this template with your Application ID:
+   ```
+   https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot%20applications.commands&permissions=3165184
+   ```
+5. For local development, set `DISCORD_GUILD_ID` (in `.env`) to a test
+   server's ID — slash commands registered to a specific guild show up
+   within seconds; global registration (leaving it unset) can take up to
+   an hour to propagate everywhere, which is annoying mid-development.
+
+## Google Cloud project setup
+
+1. Create or select a project at the [Google Cloud Console](https://console.cloud.google.com/).
+2. **Enable the API**: APIs & Services → Library → search "YouTube Data
+   API v3" → Enable.
+3. **Configure the OAuth consent screen** (APIs & Services → OAuth
+   consent screen): choose "External" user type (unless this is a Google
+   Workspace-internal deployment), fill in the required app info, and add
+   the scope `https://www.googleapis.com/auth/youtube.readonly`.
+4. **Create the OAuth2 client** (APIs & Services → Credentials → Create
+   Credentials → OAuth client ID → Application type "Web application").
+   Add an Authorized redirect URI that exactly matches
+   `GOOGLE_OAUTH_REDIRECT_URI` (e.g. `http://localhost:8080/oauth/callback`
+   for local dev). Copy the Client ID/Secret → `GOOGLE_CLIENT_ID` /
+   `GOOGLE_CLIENT_SECRET`.
+5. **While your consent screen's publishing status is "Testing"**, only
+   explicitly-added test users (up to 100, added on the OAuth consent
+   screen page) can complete `/link` at all — anyone else gets blocked by
+   Google before reaching your bot.
+6. **Important trap**: Google expires refresh tokens issued by an
+   unverified ("Testing" status, External audience) app after exactly 7
+   days, regardless of use. A linked account will silently need to
+   `/link` again every week — Apollo's `/link`/`/unlink` handle this
+   gracefully (see `ROADMAP.md` Phase 7), but it's still a bad experience
+   for anyone actually using the bot day to day. To get an indefinite
+   refresh token lifetime, move the consent screen to "In production" —
+   for a sensitive scope like `youtube.readonly` (not "restricted", so no
+   security assessment is required, but Google's standard app
+   verification review still applies), which can take Google several days
+   to review. For a small, personal-use deployment, staying in Testing
+   and accepting weekly re-links is a legitimate tradeoff — just decide
+   deliberately rather than being surprised by it.
 
 ## Setup
 
-1. Copy `.env.example` to `.env` and fill in the values.
-2. `cargo run`
+1. Copy `.env.example` to `.env` and fill in the values from the two
+   sections above.
+2. `cargo run` (fails fast at startup if `yt-dlp`/`ffmpeg` are missing, or
+   if any required `.env` value is unset).
 
 ## Environment variables
 
-See `.env.example` for the full list: `DISCORD_TOKEN`,
-`DISCORD_APPLICATION_ID`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`,
-`GOOGLE_OAUTH_REDIRECT_URI`.
+See `.env.example` for the full list and inline docs:
+
+- `DISCORD_TOKEN`, `DISCORD_APPLICATION_ID` — required.
+- `DISCORD_GUILD_ID` — optional, see [Discord application setup](#discord-application-setup).
+- `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URI` — required.
+- `DATABASE_URL` — required (e.g. `sqlite://apollo.db`).
+- `YT_DLP_COOKIES_FILE` — optional but increasingly necessary in practice:
+  YouTube requires a proof-of-origin signal from a real logged-in browser
+  session before serving a stream to `yt-dlp` at all, especially from a
+  datacenter/cloud IP (which is where this bot will typically run) —
+  without it, video resolution can fail with "Sign in to confirm you're
+  not a bot." Point this at a Netscape-format `cookies.txt` exported from
+  a real browser session.
+- `RUST_LOG` — optional log verbosity (`tracing-subscriber` `EnvFilter` syntax).
+
+## Commands
+
+- **Account**: `/link`, `/unlink`
+- **Playback**: `/join`, `/leave`, `/play <query|url>`, `/queue`, `/skip`,
+  `/pause`, `/resume`, `/stop`, `/nowplaying`
+- **Library browsing**: `/search <query>` → `/searchplay <query> <n>`,
+  `/playlists` → `/playlistplay <n>` → `/playlistqueue <playlist n> <track n>`,
+  `/liked` → `/likedplay <n>`
+
+  The browsing commands show a numbered list and a follow-up command
+  queues a pick by number — there's no interactive button/select-menu
+  picker (that needs live Discord component-interaction testing this
+  project hasn't had yet).
+
+## Deployment
+
+Two starting points are provided — pick whichever matches your hosting,
+neither is required over the other:
+
+- **Docker**: `Dockerfile` builds a release binary and a runtime image
+  with `yt-dlp` (upstream's standalone binary, not the often-stale distro
+  package) and `ffmpeg` installed. Mount a volume for `DATABASE_URL`'s
+  SQLite file so it survives container recreation, and pass the
+  environment variables above via `--env-file`/`-e`/your orchestrator's
+  secret mechanism (don't bake `.env` into the image — see `.dockerignore`).
+- **systemd**: `deploy/apollo.service` runs the binary directly via
+  `EnvironmentFile`. It expects the binary and an `.env` file at
+  `/opt/apollo/`, owned by a dedicated `apollo` user, with the `.env` file
+  `chmod 600` — a systemd unit file itself is commonly world-readable, so
+  secrets belong in the separately-permissioned `EnvironmentFile`, not the
+  unit.
+
+Neither of these is a full recommendation on *where* to host this or *how*
+to manage secrets in whatever environment you pick (a secrets
+manager/vault, systemd-creds, your cloud provider's native secret store,
+etc. are all reasonable depending on context) — that's a deliberate choice
+left to you, not baked in here.
+
+Beyond local `tracing` output to stdout/stderr (captured by
+`journalctl`/`docker logs` either way), no additional logging/metrics
+backend is wired in.
 
 ## Project layout
 
-- `src/main.rs` — entrypoint: loads config, initializes logging.
+- `src/main.rs` — entrypoint: config, logging, client/framework wiring,
+  OAuth callback server.
 - `src/config.rs` — environment-based configuration.
-- `src/commands/` — poise slash commands (`/link`, `/play`, `/queue`, ...).
-- `src/youtube/` — Google OAuth2 login, OAuth callback server, YouTube Data API v3 client.
-- `src/voice/` — songbird voice connection + playback pipeline.
+- `src/db.rs` — SQLite token persistence (`sqlx`).
+- `src/commands/` — poise slash commands: `youtube.rs` (`/link`,
+  `/unlink`), `playback.rs` (playback control), `library.rs` (search/
+  browse/queue).
+- `src/youtube/` — `oauth.rs` (Google OAuth2 client + token lifecycle),
+  `server.rs` (the OAuth callback web server), `api.rs` (YouTube Data API
+  v3 client).
+- `src/voice/` — `player.rs` (per-guild queue engine), `resolve.rs`
+  (yt-dlp-backed audio resolution + startup dependency check).
+- `migrations/` — sqlx SQLite migrations (embedded into the binary at
+  compile time).
+- `Dockerfile`, `deploy/apollo.service` — deployment starting points, see
+  above.
