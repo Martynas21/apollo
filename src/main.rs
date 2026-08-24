@@ -37,11 +37,23 @@ async fn main() -> anyhow::Result<()> {
     let (callback_port, callback_path) =
         youtube::server::parse_redirect_uri(&config.google_oauth_redirect_uri)?;
 
+    // Built here (rather than left to `.register_songbird()`) so the same
+    // `Arc<Songbird>` can back both the serenity client and `Data::player`.
+    let songbird = songbird::Songbird::serenity();
+    let player = voice::PlayerRegistry::new(
+        songbird.clone(),
+        oauth2::reqwest::Client::new(),
+        config.yt_dlp_cookies_file.clone(),
+    );
+    let youtube_client = youtube::api::YouTubeClient::new(oauth2::reqwest::Client::new());
+
     let data = Data {
         db: db_pool,
         oauth_client,
         oauth_http,
         pending_links,
+        youtube: youtube_client,
+        player,
     };
 
     // Loopback-only: this endpoint only ever needs to catch the redirect
@@ -88,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut client = serenity::ClientBuilder::new(config.discord_token, intents)
         .framework(framework)
-        .register_songbird()
+        .register_songbird_with(songbird)
         .await?;
 
     client.start().await?;

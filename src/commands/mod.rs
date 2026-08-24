@@ -5,11 +5,10 @@
 
 mod youtube;
 
-/// Shared state made available to every command invocation. Later phases
-/// will add a YouTube Data API client, etc.
-// `GoogleOAuthClient` and `oauth2::reqwest::Client` both derive/implement
-// `Debug`, so `Data` keeps deriving it too.
-#[derive(Debug, Clone)]
+/// Shared state made available to every command invocation.
+// No `Debug` derive: `PlayerRegistry` holds songbird types (`Arc<Songbird>`,
+// `TrackHandle`) that don't implement it, and it's not needed anywhere.
+#[derive(Clone)]
 pub struct Data {
     /// Pool of connections to the token-persistence SQLite database.
     pub db: sqlx::SqlitePool,
@@ -19,6 +18,15 @@ pub struct Data {
     pub oauth_http: oauth2::reqwest::Client,
     /// In-flight `/link` attempts, keyed by CSRF state token.
     pub pending_links: crate::youtube::oauth::PendingLinks,
+    /// Thin wrapper around the YouTube Data API v3 endpoints used to browse
+    /// a linked account's playlists/liked videos and to search.
+    // Not read yet — Phase 6's `/play`/`/search`/`/playlists`/`/liked` wire
+    // this in.
+    #[allow(dead_code)]
+    pub youtube: crate::youtube::api::YouTubeClient,
+    /// Per-guild playback queues and the shared songbird manager handle.
+    #[allow(dead_code)]
+    pub player: crate::voice::PlayerRegistry,
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

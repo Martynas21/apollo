@@ -341,6 +341,7 @@ fn parse_iso8601_duration(s: &str) -> Option<Duration> {
 // ---- Client ----------------------------------------------------------------
 
 #[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct YouTubeClient {
     http: oauth2::reqwest::Client,
 }
