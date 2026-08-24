@@ -381,20 +381,33 @@ fn parse_iso8601_duration(s: &str) -> Option<Duration> {
 #[derive(Debug, Clone)]
 pub struct YouTubeClient {
     http: oauth2::reqwest::Client,
+    /// `API_BASE` in production; overridden in tests to point at a local
+    /// mock server so request counts/paths can be asserted without hitting
+    /// the real API.
+    base_url: String,
 }
 
 #[allow(dead_code)]
 impl YouTubeClient {
-    pub const fn new(http: oauth2::reqwest::Client) -> Self {
-        Self { http }
+    pub fn new(http: oauth2::reqwest::Client) -> Self {
+        Self {
+            http,
+            base_url: API_BASE.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_base_url(http: oauth2::reqwest::Client, base_url: String) -> Self {
+        Self { http, base_url }
     }
 
     pub async fn list_playlists(
         &self,
         access_token: &str,
     ) -> Result<Vec<Playlist>, YouTubeApiError> {
+        let base = &self.base_url;
         let url =
-            format!("{API_BASE}/playlists?part=snippet,contentDetails&mine=true&maxResults=50");
+            format!("{base}/playlists?part=snippet,contentDetails&mine=true&maxResults=50");
         let resp: PlaylistsResponse = self.get_json(&url, access_token).await?;
         Ok(map_playlists(resp))
     }
@@ -409,9 +422,10 @@ impl YouTubeClient {
     ) -> Result<Vec<Track>, YouTubeApiError> {
         let mut items = Vec::new();
         let mut page_token: Option<String> = None;
+        let base = &self.base_url;
         loop {
             let mut url = format!(
-                "{API_BASE}/playlistItems?part=snippet,contentDetails&playlistId={playlist_id}&maxResults=50"
+                "{base}/playlistItems?part=snippet,contentDetails&playlistId={playlist_id}&maxResults=50"
             );
             if let Some(token) = &page_token {
                 url.push_str("&pageToken=");
@@ -439,7 +453,8 @@ impl YouTubeClient {
     /// `channels.list?part=contentDetails&mine=true`), so callers can feed
     /// it into `list_playlist_items` to browse the user's own uploads.
     pub async fn uploads_playlist_id(&self, access_token: &str) -> Result<String, YouTubeApiError> {
-        let url = format!("{API_BASE}/channels?part=contentDetails&mine=true");
+        let base = &self.base_url;
+        let url = format!("{base}/channels?part=contentDetails&mine=true");
         let resp: ChannelsResponse = self.get_json(&url, access_token).await?;
         resp.items
             .into_iter()
@@ -457,8 +472,9 @@ impl YouTubeClient {
         query: &str,
     ) -> Result<Vec<Track>, YouTubeApiError> {
         let encoded_query = urlencoding_encode(query);
+        let base = &self.base_url;
         let url =
-            format!("{API_BASE}/search?part=snippet&type=video&q={encoded_query}&maxResults=25");
+            format!("{base}/search?part=snippet&type=video&q={encoded_query}&maxResults=25");
         let resp: SearchResponse = self.get_json(&url, access_token).await?;
 
         let video_ids: Vec<&str> = resp
@@ -478,7 +494,8 @@ impl YouTubeClient {
         access_token: &str,
         video_id: &str,
     ) -> Result<Track, YouTubeApiError> {
-        let url = format!("{API_BASE}/videos?part=snippet,contentDetails&id={video_id}");
+        let base = &self.base_url;
+        let url = format!("{base}/videos?part=snippet,contentDetails&id={video_id}");
         let resp: VideoWithSnippetResponse = self.get_json(&url, access_token).await?;
         map_video_with_snippet(resp).ok_or_else(|| YouTubeApiError::Api {
             status: 404,
@@ -495,9 +512,10 @@ impl YouTubeClient {
         video_ids: &[&str],
     ) -> Result<HashMap<String, Option<Duration>>, YouTubeApiError> {
         let mut durations = HashMap::new();
+        let base = &self.base_url;
         for chunk in video_ids.chunks(50) {
             let ids = chunk.join(",");
-            let url = format!("{API_BASE}/videos?part=contentDetails&id={ids}");
+            let url = format!("{base}/videos?part=contentDetails&id={ids}");
             let resp: VideosResponse = self.get_json(&url, access_token).await?;
             durations.extend(map_video_durations(resp));
         }
@@ -833,5 +851,175 @@ mod tests {
             }
             other => panic!("expected Api error, got {other:?}"),
         }
+    }
+}
+
+/// Guards against a future change accidentally turning a batched call
+/// pattern into one YouTube API request per item (an "N+1" regression) —
+/// the kind of change that wouldn't fail any of the pure mapping-function
+/// tests above but would quietly multiply real quota usage per `/search`,
+/// `/add_to_queue`, or playlist browse. Each test counts requests against a
+/// local mock server via [`YouTubeClient::with_base_url`] rather than
+/// measuring wall time or memory: request *count* is what actually burns
+/// YouTube's per-project quota, and it stays deterministic where timing-
+/// or allocation-based assertions would be flaky.
+#[cfg(test)]
+mod request_count_tests {
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    async fn mock_client() -> (YouTubeClient, MockServer) {
+        let server = MockServer::start().await;
+        let client = YouTubeClient::with_base_url(oauth2::reqwest::Client::new(), server.uri());
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn search_fetches_durations_in_one_batched_request_not_one_per_result() {
+        let (client, server) = mock_client().await;
+
+        let ids: Vec<String> = (0..3).map(|i| format!("vid{i}")).collect();
+        let search_items: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({
+                    "id": { "videoId": id },
+                    "snippet": { "title": format!("Title {id}"), "channelTitle": "Channel" }
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/search"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "items": search_items })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let duration_items: Vec<_> = ids
+            .iter()
+            .map(|id| serde_json::json!({ "id": id, "contentDetails": { "duration": "PT1M0S" } }))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/videos"))
+            .and(query_param("part", "contentDetails"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": duration_items })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tracks = client.search("token", "lofi").await.unwrap();
+        assert_eq!(tracks.len(), 3);
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn get_video_makes_a_single_request_not_a_separate_duration_lookup() {
+        let (client, server) = mock_client().await;
+
+        Mock::given(method("GET"))
+            .and(path("/videos"))
+            .and(query_param("part", "snippet,contentDetails"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "id": "abc123",
+                    "snippet": { "title": "Some Video", "channelTitle": "Some Channel" },
+                    "contentDetails": { "duration": "PT3M33S" }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let track = client.get_video("token", "abc123").await.unwrap();
+        assert_eq!(track.video_id, "abc123");
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn list_playlist_items_batches_durations_by_fifty_regardless_of_page_count() {
+        let (client, server) = mock_client().await;
+
+        // 60 items split across two `playlistItems` pages (50 + 10) — chosen
+        // so the 50-item page boundary lands exactly on `fetch_durations`'s
+        // own chunk size, the case most likely to silently regress into one
+        // `videos` request per page (or per item) instead of per 50 ids.
+        let page1_ids: Vec<String> = (0..50).map(|i| format!("p1-{i}")).collect();
+        let page2_ids: Vec<String> = (0..10).map(|i| format!("p2-{i}")).collect();
+
+        let items_json = |ids: &[String]| -> serde_json::Value {
+            serde_json::json!(
+                ids.iter()
+                    .map(|id| serde_json::json!({
+                        "snippet": { "title": format!("Track {id}"), "channelTitle": "Channel" },
+                        "contentDetails": { "videoId": id }
+                    }))
+                    .collect::<Vec<_>>()
+            )
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/playlistItems"))
+            .and(query_param_is_missing("pageToken"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": items_json(&page1_ids),
+                "nextPageToken": "PAGE2",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/playlistItems"))
+            .and(query_param("pageToken", "PAGE2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": items_json(&page2_ids),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let durations_json = |ids: &[String]| -> serde_json::Value {
+            serde_json::json!({
+                "items": ids.iter()
+                    .map(|id| serde_json::json!({ "id": id, "contentDetails": { "duration": "PT1M0S" } }))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/videos"))
+            .and(query_param("id", page1_ids.join(",")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(durations_json(&page1_ids)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/videos"))
+            .and(query_param("id", page2_ids.join(",")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(durations_json(&page2_ids)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tracks = client
+            .list_playlist_items("token", "PLsomeplaylist")
+            .await
+            .unwrap();
+        assert_eq!(tracks.len(), 60);
+
+        // Exactly 4 requests total (2 pages + 2 duration batches) — asserted
+        // by `expect(1)` on each mock above; `verify` fails loudly on either
+        // a missed or an extra/unmatched call.
+        server.verify().await;
     }
 }
