@@ -67,13 +67,13 @@ New `migrations/` directory + `src/youtube/`.
 
 Land in `src/youtube/`.
 
-- [ ] Thin client wrapper around the relevant endpoints:
+- [x] Thin client wrapper around the relevant endpoints:
       `playlists.list` (a user's playlists), `playlistItems.list`
       (including the special `LL` liked-videos playlist and `uploads`),
       `search.list` (ad-hoc query/URL lookup).
-- [ ] Map API responses into a simple internal `Track` type (title,
+- [x] Map API responses into a simple internal `Track` type (title,
       video ID, channel, duration).
-- [ ] Handle quota errors / rate limiting with a clear internal error
+- [x] Handle quota errors / rate limiting with a clear internal error
       type (surfaced to the user in Phase 6/7).
 
 **Done when:** given a linked user, the client can list their liked
