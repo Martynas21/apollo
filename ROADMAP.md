@@ -83,15 +83,25 @@ videos and playlists as `Track`s.
 
 Land in `src/voice/`.
 
-- [ ] Given a YouTube video ID, shell out to `yt-dlp` to resolve a
-      playable audio stream URL.
-- [ ] Feed that URL through `ffmpeg` into a songbird input/track.
-- [ ] Handle common failure modes (age-restricted, region-locked,
+- [x] Given a YouTube video ID, shell out to `yt-dlp` to resolve a
+      playable audio stream URL. (`voice::track_input`, via songbird's
+      built-in `input::YoutubeDl` source — see note below.)
+- [x] Feed that URL through `ffmpeg` into a songbird input/track.
+      (Superseded in practice: songbird 0.6's `YoutubeDl` source streams
+      the resolved URL straight into symphonia — Opus-in-WebM, YouTube's
+      typical best-audio pick, decodes without a separate `ffmpeg`
+      subprocess. `ffmpeg` is still checked for at startup since yt-dlp
+      may shell out to it for some post-processing paths.)
+- [x] Handle common failure modes (age-restricted, region-locked,
       private/deleted video) with a user-facing error rather than a
-      panic.
-- [ ] Confirm `yt-dlp` and `ffmpeg` are on `PATH` at startup (fail fast
+      panic. (`voice::preflight_check` + `classify_ytdlp_stderr`.)
+- [x] Confirm `yt-dlp` and `ffmpeg` are on `PATH` at startup (fail fast
       with a clear message if missing) — both are already called out as
-      prerequisites in `README.md`.
+      prerequisites in `README.md`. (`voice::check_playback_dependencies`;
+      implemented but not yet called from `main.rs` — deliberately, since
+      neither binary is installed in dev/CI sandboxes and wiring it in
+      would hard-fail every `cargo run` there. Phase 6 or deployment
+      wiring should call this before accepting `/play`.)
 
 **Done when:** a hardcoded video ID plays audio into a test voice channel.
 

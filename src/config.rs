@@ -18,6 +18,16 @@ pub struct Config {
     pub google_client_secret: String,
     pub google_oauth_redirect_uri: String,
     pub database_url: String,
+    /// Path to a Netscape-format cookies file passed to `yt-dlp` as
+    /// `--cookies`. YouTube increasingly requires a proof-of-origin signal
+    /// from a real logged-in browser session before it'll serve a stream to
+    /// `yt-dlp` at all (surfaces as a "Sign in to confirm you're not a bot"
+    /// failure) — this is the standard workaround, and matters most from a
+    /// datacenter/cloud host IP, which is where this bot will typically run.
+    // Not read yet — Phase 6 threads this into `voice::track_input`/
+    // `preflight_check` alongside the rest of the `/play` wiring.
+    #[allow(dead_code)]
+    pub yt_dlp_cookies_file: Option<String>,
 }
 
 impl Config {
@@ -34,12 +44,21 @@ impl Config {
             google_client_secret: env_var("GOOGLE_CLIENT_SECRET")?,
             google_oauth_redirect_uri: env_var("GOOGLE_OAUTH_REDIRECT_URI")?,
             database_url: env_var("DATABASE_URL")?,
+            yt_dlp_cookies_file: optional_env_var("YT_DLP_COOKIES_FILE"),
         })
     }
 }
 
 fn env_var(key: &str) -> Result<String> {
     std::env::var(key).with_context(|| format!("missing required environment variable: {key}"))
+}
+
+/// Reads an optional environment variable, treating both "unset" and "set
+/// but empty" as absent.
+fn optional_env_var(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn optional_guild_id() -> Result<Option<u64>> {
