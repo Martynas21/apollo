@@ -36,7 +36,7 @@ type Prefetch = JoinHandle<Result<Input, PlaybackError>>;
 /// How long an empty, drained queue waits before the bot leaves the voice
 /// channel on its own. Re-checked when the timer fires (not just scheduled
 /// once) so a track queued in the meantime cancels the disconnect.
-const IDLE_DISCONNECT: Duration = Duration::from_mins(5);
+const IDLE_DISCONNECT: Duration = Duration::from_secs(150);
 
 /// A track paired with who queued it.
 #[derive(Debug, Clone)]
