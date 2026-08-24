@@ -203,11 +203,25 @@ videos, and control playback end-to-end in a live guild.
 
 ## Phase 9 — Testing
 
-- [ ] Unit tests for token refresh/expiry logic (Phase 2/3).
-- [ ] Unit tests for `Track` mapping from YouTube API responses
-      (Phase 4).
-- [ ] A manual end-to-end test plan: link → browse liked videos → play →
+- [x] Unit tests for token refresh/expiry logic (Phase 2/3).
+      (`youtube::oauth::tests` — `needs_refresh` buffer-boundary cases,
+      plus Phase 7's typed `AccessTokenError` distinguishing a revoked
+      refresh token from any other failure.)
+- [x] Unit tests for `Track` mapping from YouTube API responses
+      (Phase 4). (`youtube::api::tests` — JSON-fixture-to-`Track`/
+      `Playlist` mapping for every endpoint, including the
+      `videoOwnerChannelTitle` fallback and `P0D`-means-unknown-duration
+      edge cases.)
+- [x] A manual end-to-end test plan: link → browse liked videos → play →
       queue → skip → unlink, run against a staging Discord server.
+      Written as `docs/e2e-test-plan.md` — covers linking (including a
+      CSRF-replay check), browsing, playback, common failure modes, the
+      Phase 7 re-link path (deliberately revoking access via Google
+      Account settings to trigger it), unlinking, and cross-guild queue
+      isolation. **Not yet run** — needs the same live Discord/Google
+      setup every other live-verification item in this roadmap is
+      blocked on; this is the checklist to work through once that's in
+      place.
 
 ## Stretch / nice-to-haves
 
