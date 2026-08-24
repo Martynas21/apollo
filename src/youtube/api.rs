@@ -5,9 +5,11 @@
 //! module has no opinion on token storage or refresh, only on talking to
 //! the API and mapping its responses into [`Track`]/[`Playlist`].
 //!
-//! None of these endpoints paginate past the first page (`maxResults=50`
-//! for playlists/playlist items, `25` for search) — following
-//! `nextPageToken` is out of scope for this MVP pass.
+//! `list_playlist_items` follows `nextPageToken` to fetch a whole playlist,
+//! not just its first 50 items. `list_playlists` and `search` stay
+//! single-page (`maxResults=50`/`25`) — an account realistically has under
+//! 50 playlists, and search intentionally shows only the top handful of
+//! hits, not everything that matched.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -113,9 +115,12 @@ struct PlaylistContentDetails {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PlaylistItemsResponse {
     #[serde(default)]
     items: Vec<PlaylistItemEntry>,
+    #[serde(default)]
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,10 +253,10 @@ fn map_playlists(resp: PlaylistsResponse) -> Vec<Playlist> {
 }
 
 fn map_playlist_items(
-    resp: PlaylistItemsResponse,
+    items: Vec<PlaylistItemEntry>,
     durations: &HashMap<String, Option<Duration>>,
 ) -> Vec<Track> {
-    resp.items
+    items
         .into_iter()
         .map(|item| {
             let video_id = item.content_details.video_id;
@@ -394,25 +399,39 @@ impl YouTubeClient {
     }
 
     /// Generic: lists items of any playlist ID, including the special
-    /// `LL` (liked videos) playlist.
+    /// `LL` (liked videos) playlist. Follows `nextPageToken` across as many
+    /// pages as it takes to fetch the whole playlist.
     pub async fn list_playlist_items(
         &self,
         access_token: &str,
         playlist_id: &str,
     ) -> Result<Vec<Track>, YouTubeApiError> {
-        let url = format!(
-            "{API_BASE}/playlistItems?part=snippet,contentDetails&playlistId={playlist_id}&maxResults=50"
-        );
-        let resp: PlaylistItemsResponse = self.get_json(&url, access_token).await?;
+        let mut items = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "{API_BASE}/playlistItems?part=snippet,contentDetails&playlistId={playlist_id}&maxResults=50"
+            );
+            if let Some(token) = &page_token {
+                url.push_str("&pageToken=");
+                url.push_str(token);
+            }
 
-        let video_ids: Vec<&str> = resp
-            .items
+            let resp: PlaylistItemsResponse = self.get_json(&url, access_token).await?;
+            items.extend(resp.items);
+            page_token = resp.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
+
+        let video_ids: Vec<&str> = items
             .iter()
             .map(|item| item.content_details.video_id.as_str())
             .collect();
         let durations = self.fetch_durations(access_token, &video_ids).await?;
 
-        Ok(map_playlist_items(resp, &durations))
+        Ok(map_playlist_items(items, &durations))
     }
 
     /// Resolves the signed-in user's uploads playlist ID (via
@@ -466,18 +485,22 @@ impl YouTubeClient {
         })
     }
 
+    /// `videos.list`'s `id` filter takes a comma-separated list; chunking
+    /// keeps each request in line with this module's other `maxResults=50`
+    /// calls rather than sending an unbounded id list for a large playlist.
     async fn fetch_durations(
         &self,
         access_token: &str,
         video_ids: &[&str],
     ) -> Result<HashMap<String, Option<Duration>>, YouTubeApiError> {
-        if video_ids.is_empty() {
-            return Ok(HashMap::new());
+        let mut durations = HashMap::new();
+        for chunk in video_ids.chunks(50) {
+            let ids = chunk.join(",");
+            let url = format!("{API_BASE}/videos?part=contentDetails&id={ids}");
+            let resp: VideosResponse = self.get_json(&url, access_token).await?;
+            durations.extend(map_video_durations(resp));
         }
-        let ids = video_ids.join(",");
-        let url = format!("{API_BASE}/videos?part=contentDetails&id={ids}");
-        let resp: VideosResponse = self.get_json(&url, access_token).await?;
-        Ok(map_video_durations(resp))
+        Ok(durations)
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(
@@ -669,7 +692,7 @@ mod tests {
         durations.insert("dQw4w9WgXcQ".to_string(), Some(Duration::from_secs(213)));
         // "zzzzzzzzzzz" intentionally absent -> should map to None.
 
-        let tracks = map_playlist_items(resp, &durations);
+        let tracks = map_playlist_items(resp.items, &durations);
         assert_eq!(
             tracks,
             vec![

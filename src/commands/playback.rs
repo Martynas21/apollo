@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
 
-use super::{Context, Error};
-use crate::voice::player::{PlayerError, QueuedTrack};
+use super::{Context, Data, Error};
+use crate::voice::player::{PlayerError, QueueSnapshot, QueuedTrack};
 use crate::youtube::api::Track;
 use crate::youtube::oauth::{AccessTokenError, get_valid_access_token};
 
@@ -33,6 +33,12 @@ pub(super) fn access_token_error_message(err: &AccessTokenError) -> String {
 /// "...and N more" trailer, to stay well under Discord's ~2000 char message
 /// cap on a long queue.
 const QUEUE_DISPLAY_LIMIT: usize = 10;
+
+/// Discord select menus cap out at 25 options.
+const QUEUE_SELECT_LIMIT: usize = 25;
+
+/// How much each volume button click changes the level by.
+const VOLUME_STEP: u8 = 10;
 
 /// Extracts a YouTube video ID from a URL, recognizing `youtu.be` short
 /// links, `.../watch?v=...`, and `.../shorts/...`. Returns `None` for
@@ -125,6 +131,188 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
     }
 
     embed
+}
+
+/// Discord caps select-menu option labels at 100 characters.
+pub(super) fn truncate_label(label: &str) -> String {
+    if label.chars().count() > 100 {
+        let mut truncated: String = label.chars().take(97).collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        label.to_string()
+    }
+}
+
+/// Builds the now-playing control panel's button/select-menu rows:
+/// play/pause toggle, skip, stop, shuffle, volume +/-, and — when the
+/// queue isn't empty — a select menu to jump straight to an upcoming
+/// track. Used both by `/now_playing` and by [`handle_component`] when
+/// refreshing the panel after a click.
+fn player_components(
+    snapshot: &QueueSnapshot,
+    paused: Option<bool>,
+    volume: u8,
+) -> Vec<serenity::CreateActionRow> {
+    let has_now_playing = snapshot.now_playing.is_some();
+
+    let toggle = match paused {
+        Some(true) => serenity::CreateButton::new("player:toggle")
+            .label("Resume")
+            .style(serenity::ButtonStyle::Success),
+        _ => serenity::CreateButton::new("player:toggle")
+            .label("Pause")
+            .style(serenity::ButtonStyle::Secondary),
+    }
+    .disabled(!has_now_playing);
+
+    let playback_row = serenity::CreateActionRow::Buttons(vec![
+        toggle,
+        serenity::CreateButton::new("player:skip")
+            .label("Skip")
+            .style(serenity::ButtonStyle::Primary)
+            .disabled(!has_now_playing),
+        serenity::CreateButton::new("player:stop")
+            .label("Stop")
+            .style(serenity::ButtonStyle::Danger)
+            .disabled(!has_now_playing),
+        serenity::CreateButton::new("player:shuffle")
+            .label("Shuffle")
+            .style(serenity::ButtonStyle::Secondary)
+            .disabled(snapshot.upcoming.len() < 2),
+    ]);
+
+    let volume_row = serenity::CreateActionRow::Buttons(vec![
+        serenity::CreateButton::new("player:vol_down")
+            .label("Vol \u{2212}")
+            .style(serenity::ButtonStyle::Secondary)
+            .disabled(volume == 0),
+        serenity::CreateButton::new("player:vol_label")
+            .label(format!("{volume}%"))
+            .style(serenity::ButtonStyle::Secondary)
+            .disabled(true),
+        serenity::CreateButton::new("player:vol_up")
+            .label("Vol +")
+            .style(serenity::ButtonStyle::Secondary)
+            .disabled(volume >= 100),
+    ]);
+
+    let mut rows = vec![playback_row, volume_row];
+
+    if !snapshot.upcoming.is_empty() {
+        let options = snapshot
+            .upcoming
+            .iter()
+            .take(QUEUE_SELECT_LIMIT)
+            .enumerate()
+            .map(|(i, queued)| {
+                serenity::CreateSelectMenuOption::new(
+                    truncate_label(&format!("{}. {}", i + 1, queued.track.title)),
+                    i.to_string(),
+                )
+            })
+            .collect();
+        let select = serenity::CreateSelectMenu::new(
+            "player:jump",
+            serenity::CreateSelectMenuKind::String { options },
+        )
+        .placeholder("Jump to a track in the queue...");
+        rows.push(serenity::CreateActionRow::SelectMenu(select));
+    }
+
+    rows
+}
+
+/// Fetches everything [`player_components`] and the now-playing embed need
+/// in one place, for both `/now_playing` and [`handle_component`].
+async fn panel_state(data: &Data, guild_id: serenity::GuildId) -> (QueueSnapshot, Option<bool>, u8) {
+    let snapshot = data.player.queue_snapshot(guild_id).await;
+    let paused = data.player.is_paused(guild_id).await;
+    let volume = data.player.get_volume(guild_id).await;
+    (snapshot, paused, volume)
+}
+
+/// Handles a `player:*` button/select click from the now-playing control
+/// panel: applies the action via [`crate::voice::PlayerRegistry`], then
+/// edits the panel message in place with the resulting state. Any other
+/// component interaction is ignored (there's only ever this one panel).
+pub async fn handle_component(
+    ctx: &serenity::Context,
+    component: &serenity::ComponentInteraction,
+    data: &Data,
+) -> Result<(), Error> {
+    let Some(custom_id) = component.data.custom_id.strip_prefix("player:") else {
+        return Ok(());
+    };
+    let Some(guild_id) = component.guild_id else {
+        return Ok(());
+    };
+    // The disabled volume-level label is still a real button — it's just
+    // never clickable — so there's no arm for it below.
+
+    let result: Result<(), PlayerError> = match custom_id {
+        "toggle" => match data.player.is_paused(guild_id).await {
+            Some(true) => data.player.resume(guild_id).await,
+            Some(false) => data.player.pause(guild_id).await,
+            None => Err(PlayerError::NothingPlaying),
+        },
+        "skip" => data.player.skip(guild_id).await,
+        "stop" => data.player.stop(guild_id).await,
+        "shuffle" => data.player.shuffle(guild_id).await,
+        "vol_down" | "vol_up" => {
+            let current = data.player.get_volume(guild_id).await;
+            let next = if custom_id == "vol_up" {
+                current.saturating_add(VOLUME_STEP).min(100)
+            } else {
+                current.saturating_sub(VOLUME_STEP)
+            };
+            data.player.set_volume(guild_id, next).await
+        }
+        "jump" => match &component.data.kind {
+            serenity::ComponentInteractionDataKind::StringSelect { values } => {
+                match values.first().and_then(|v| v.parse::<usize>().ok()) {
+                    Some(index) => data.player.jump_to(guild_id, index).await,
+                    None => Err(PlayerError::InvalidSelection),
+                }
+            }
+            _ => Err(PlayerError::InvalidSelection),
+        },
+        _ => return Ok(()),
+    };
+
+    if let Err(err) = result {
+        component
+            .create_response(
+                &ctx.http,
+                serenity::CreateInteractionResponse::Message(
+                    serenity::CreateInteractionResponseMessage::new()
+                        .content(err.to_string())
+                        .ephemeral(true),
+                ),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let (snapshot, paused, volume) = panel_state(data, guild_id).await;
+    let components = player_components(&snapshot, paused, volume);
+    let message = match &snapshot.now_playing {
+        Some(queued) => {
+            let position = data.player.now_playing_position(guild_id).await;
+            serenity::CreateInteractionResponseMessage::new()
+                .embeds(vec![now_playing_embed(queued, position)])
+                .components(components)
+        }
+        None => serenity::CreateInteractionResponseMessage::new()
+            .content("Nothing is playing.")
+            .embeds(Vec::new())
+            .components(components),
+    };
+
+    component
+        .create_response(&ctx.http, serenity::CreateInteractionResponse::UpdateMessage(message))
+        .await?;
+    Ok(())
 }
 
 /// The invoking user's current voice channel in this guild, if any.
@@ -312,13 +500,21 @@ pub async fn now_playing(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx.guild_id().expect("guild_only commands always have a guild");
     let snapshot = ctx.data().player.queue_snapshot(guild_id).await;
 
-    let Some(queued) = snapshot.now_playing else {
+    let Some(queued) = &snapshot.now_playing else {
         return reply_error(ctx, "nothing is playing").await;
     };
 
     let position = ctx.data().player.now_playing_position(guild_id).await;
-    ctx.send(poise::CreateReply::default().embed(now_playing_embed(&queued, position)))
-        .await?;
+    let paused = ctx.data().player.is_paused(guild_id).await;
+    let volume = ctx.data().player.get_volume(guild_id).await;
+    let components = player_components(&snapshot, paused, volume);
+
+    ctx.send(
+        poise::CreateReply::default()
+            .embed(now_playing_embed(queued, position))
+            .components(components),
+    )
+    .await?;
     Ok(())
 }
 
@@ -518,5 +714,83 @@ mod tests {
             .find(|f| f["name"] == "Progress")
             .map(|f| f["value"].as_str().unwrap());
         assert_eq!(progress, Some("0:30"));
+    }
+
+    // ---- truncate_label ----
+
+    #[test]
+    fn truncate_label_leaves_short_labels_untouched() {
+        assert_eq!(truncate_label("short title"), "short title");
+    }
+
+    #[test]
+    fn truncate_label_truncates_long_labels_to_100_chars_with_ellipsis() {
+        let long = "x".repeat(150);
+        let truncated = truncate_label(&long);
+        assert_eq!(truncated.chars().count(), 100);
+        assert!(truncated.ends_with("..."));
+    }
+
+    // ---- player_components ----
+
+    fn sample_queue_snapshot(now_playing: bool, upcoming_count: usize) -> QueueSnapshot {
+        QueueSnapshot {
+            now_playing: now_playing.then(|| sample_queued_track(Some(Duration::from_secs(120)))),
+            upcoming: (0..upcoming_count)
+                .map(|i| QueuedTrack {
+                    track: Track {
+                        video_id: format!("id{i}"),
+                        title: format!("Track {i}"),
+                        channel: "Channel".to_string(),
+                        duration: None,
+                    },
+                    requested_by: serenity::UserId::new(1),
+                })
+                .collect(),
+        }
+    }
+
+    fn components_json(components: &[serenity::CreateActionRow]) -> serde_json::Value {
+        serde_json::to_value(components).expect("components should serialize")
+    }
+
+    #[test]
+    fn toggle_button_shows_resume_when_paused_and_pause_otherwise() {
+        let snapshot = sample_queue_snapshot(true, 0);
+
+        let paused_json = components_json(&player_components(&snapshot, Some(true), 50));
+        assert_eq!(paused_json[0]["components"][0]["label"], "Resume");
+
+        let playing_json = components_json(&player_components(&snapshot, Some(false), 50));
+        assert_eq!(playing_json[0]["components"][0]["label"], "Pause");
+    }
+
+    #[test]
+    fn playback_buttons_disabled_when_nothing_playing() {
+        let snapshot = sample_queue_snapshot(false, 0);
+        let json = components_json(&player_components(&snapshot, None, 50));
+        // toggle, skip, stop, shuffle
+        for button in json[0]["components"].as_array().unwrap() {
+            assert_eq!(button["disabled"], true, "{button:?} should be disabled");
+        }
+    }
+
+    #[test]
+    fn select_menu_omitted_when_queue_empty_and_present_otherwise() {
+        let empty = sample_queue_snapshot(true, 0);
+        let empty_json = components_json(&player_components(&empty, Some(false), 50));
+        assert_eq!(empty_json.as_array().unwrap().len(), 2);
+
+        let nonempty = sample_queue_snapshot(true, 3);
+        let nonempty_json = components_json(&player_components(&nonempty, Some(false), 50));
+        assert_eq!(nonempty_json.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn select_menu_caps_options_at_25() {
+        let snapshot = sample_queue_snapshot(true, 30);
+        let json = components_json(&player_components(&snapshot, Some(false), 50));
+        let options = json[2]["components"][0]["options"].as_array().unwrap();
+        assert_eq!(options.len(), 25);
     }
 }

@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: commands::commands(),
-            event_handler: |_ctx, event, _framework, _data| Box::pin(event_handler(event)),
+            event_handler: |ctx, event, _framework, data| Box::pin(event_handler(ctx, event, data)),
             ..Default::default()
         })
         .setup(move |ctx, _ready, framework| {
@@ -116,13 +116,26 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn event_handler(event: &serenity::FullEvent) -> Result<(), Error> {
+async fn event_handler(
+    ctx: &serenity::Context,
+    event: &serenity::FullEvent,
+    data: &Data,
+) -> Result<(), Error> {
     match event {
         serenity::FullEvent::Ready { data_about_bot } => {
             tracing::info!(user = %data_about_bot.user.name, "ready");
         }
         serenity::FullEvent::Resume { .. } => {
             tracing::info!("resumed");
+        }
+        serenity::FullEvent::InteractionCreate {
+            interaction: serenity::Interaction::Component(component),
+        } => {
+            if component.data.custom_id.starts_with("player:") {
+                commands::handle_player_component(ctx, component, data).await?;
+            } else if component.data.custom_id.starts_with("library:") {
+                commands::handle_library_component(ctx, component, data).await?;
+            }
         }
         _ => {}
     }

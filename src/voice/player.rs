@@ -16,7 +16,7 @@ use poise::serenity_prelude as serenity;
 use rand::seq::SliceRandom;
 use serenity::{ChannelId, GuildId, UserId};
 use songbird::input::Input;
-use songbird::tracks::TrackHandle;
+use songbird::tracks::{PlayMode, TrackHandle};
 use songbird::{Call, Event, EventContext, EventHandler as SongbirdEventHandler, Songbird, TrackEvent};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -51,6 +51,9 @@ pub enum PlayerError {
     NothingPlaying,
     /// `/shuffle` with fewer than two upcoming tracks to shuffle.
     NothingToShuffle,
+    /// A queue-jump selection that's out of range, e.g. because the queue
+    /// changed between the panel being rendered and the click landing.
+    InvalidSelection,
     Join(String),
     Playback(String),
     /// Persisting a `/volume` change to the database failed.
@@ -63,6 +66,9 @@ impl std::fmt::Display for PlayerError {
             PlayerError::NotConnected => write!(f, "not connected to a voice channel"),
             PlayerError::NothingPlaying => write!(f, "nothing is playing"),
             PlayerError::NothingToShuffle => write!(f, "not enough upcoming tracks to shuffle"),
+            PlayerError::InvalidSelection => {
+                write!(f, "that queue selection is no longer valid — the queue may have changed")
+            }
             PlayerError::Join(message) => write!(f, "failed to join voice channel: {message}"),
             PlayerError::Playback(message) => write!(f, "playback error: {message}"),
             PlayerError::Storage(message) => write!(f, "failed to save setting: {message}"),
@@ -168,8 +174,21 @@ impl PlayerRegistry {
             should_start
         };
 
-        if should_start {
-            self.start_playback(guild_id, call, queued, None).await?;
+        if should_start
+            && let Err(err) = self.start_playback(guild_id, call, queued, None).await
+        {
+            // `state.now_playing` was set speculatively above, before the
+            // resolve/play attempt above was known to succeed. Roll it back
+            // on failure — otherwise it's left pointing at a track with no
+            // `current_handle` and no `TrackEndHandler` ever registered to
+            // advance past it, permanently orphaning every track queued
+            // behind it (they just see `now_playing.is_some()` and pile up
+            // in `state.queue` instead of ever being tried).
+            let mut guilds = self.guilds.lock().await;
+            if let Some(state) = guilds.get_mut(&guild_id) {
+                state.now_playing = None;
+            }
+            return Err(err);
         }
 
         Ok(())
@@ -394,6 +413,48 @@ impl PlayerRegistry {
         state.queue = items.into();
 
         Ok(())
+    }
+
+    /// Skips directly to the upcoming track at `index` (0-based, matching
+    /// [`QueueSnapshot::upcoming`]), discarding every track ahead of it.
+    /// Reuses the current track's stop path — [`TrackEndHandler`] advances
+    /// to the new front of the queue exactly as it would on a natural
+    /// track end or a `/skip`.
+    pub async fn jump_to(&self, guild_id: GuildId, index: usize) -> Result<(), PlayerError> {
+        let handle = {
+            let mut guilds = self.guilds.lock().await;
+            let state = guilds.get_mut(&guild_id).ok_or(PlayerError::InvalidSelection)?;
+            if index >= state.queue.len() {
+                return Err(PlayerError::InvalidSelection);
+            }
+            state.queue.drain(..index);
+            state.current_handle.clone()
+        };
+        let handle = handle.ok_or(PlayerError::NothingPlaying)?;
+        handle
+            .stop()
+            .map_err(|e| PlayerError::Playback(e.to_string()))
+    }
+
+    /// Whether the current track is paused. `None` if nothing is playing.
+    pub async fn is_paused(&self, guild_id: GuildId) -> Option<bool> {
+        let handle = {
+            let guilds = self.guilds.lock().await;
+            guilds.get(&guild_id).and_then(|state| state.current_handle.clone())
+        }?;
+        handle
+            .get_info()
+            .await
+            .ok()
+            .map(|state| matches!(state.playing, PlayMode::Pause))
+    }
+
+    /// This guild's persisted playback volume (0-100), for display — the
+    /// same lookup [`Self::start_playback`] uses to apply it to a new track.
+    pub async fn get_volume(&self, guild_id: GuildId) -> u8 {
+        db::get_guild_volume(&self.db, &guild_id.to_string())
+            .await
+            .unwrap_or(db::DEFAULT_VOLUME)
     }
 
     /// Sets and persists this guild's playback volume (0-100), applying it

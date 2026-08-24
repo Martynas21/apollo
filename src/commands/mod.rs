@@ -4,6 +4,9 @@ mod library;
 mod playback;
 mod youtube;
 
+pub use library::handle_component as handle_library_component;
+pub use playback::handle_component as handle_player_component;
+
 /// Shared state made available to every command invocation.
 // No `Debug` derive: `PlayerRegistry` holds songbird types (`Arc<Songbird>`,
 // `TrackHandle`) that don't implement it, and it's not needed anywhere.
@@ -45,7 +48,6 @@ pub fn commands() -> Vec<poise::Command<Data, Error>> {
         playback::volume(),
         library::add_to_queue(),
         library::playlists(),
-        library::playlist_browse(),
         library::playlist_play(),
     ]
 }

@@ -176,15 +176,12 @@ See `.env.example` for the full list and inline docs:
 - **Playback**: `/play <query|url>` (auto-joins your voice channel), `/queue`,
   `/skip`, `/pause`, `/resume`, `/stop`, `/now_playing`, `/shuffle`,
   `/volume <0-100>` (persists per-guild across restarts)
-- **Library browsing**: `/add_to_queue <query>` (no `number` → shows the top 5
-  matches; same `query` plus a `number` → queues one), `/playlists` →
-  `/playlist_browse <n>` (or `/playlist_play <n>` to queue the whole playlist
-  in one shot without browsing it first)
-
-  The browsing commands show a numbered list and a follow-up call queues a
-  pick by number — there's no interactive button/select-menu picker (that
-  needs live Discord component-interaction testing this project hasn't had
-  yet).
+- **Library browsing**: `/add_to_queue <query>` and `/playlists` each show a
+  numbered listing alongside a select menu — clicking an entry queues it (or,
+  for a playlist, browses its tracks) immediately. The numbered form still
+  works too: `/add_to_queue <query> <number>` queues a search hit directly,
+  and `/playlist_play <n>` queues an entire playlist in one shot without
+  browsing it first.
 
   There's no manual `/join`/`/leave` — the bot joins automatically on
   `/play`/`/add_to_queue`/etc., and leaves on its own 5 minutes after the
