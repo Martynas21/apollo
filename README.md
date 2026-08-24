@@ -76,7 +76,11 @@ be installed wherever you run it (see Prerequisites).
    Add an Authorized redirect URI that exactly matches
    `GOOGLE_OAUTH_REDIRECT_URI` (e.g. `http://localhost:8080/oauth/callback`
    for local dev). Copy the Client ID/Secret → `GOOGLE_CLIENT_ID` /
-   `GOOGLE_CLIENT_SECRET`.
+   `GOOGLE_CLIENT_SECRET`. **If anyone other than you will run `/link`**,
+   also add a second Authorized redirect URI pointing at a public HTTPS
+   URL — see [Exposing the OAuth callback publicly](#exposing-the-oauth-callback-publicly)
+   below; `localhost` only ever works for whoever's sitting at the bot's
+   own machine.
 5. **While your consent screen's publishing status is "Testing"**, only
    explicitly-added test users (up to 100, added on the OAuth consent
    screen page) can complete `/link` at all — anyone else gets blocked by
@@ -94,6 +98,49 @@ be installed wherever you run it (see Prerequisites).
    to review. For a small, personal-use deployment, staying in Testing
    and accepting weekly re-links is a legitimate tradeoff — just decide
    deliberately rather than being surprised by it.
+
+## Exposing the OAuth callback publicly
+
+The bot's OAuth callback server binds to loopback only (`127.0.0.1`). That's
+enough to complete `/link` yourself on the same machine, but Google
+redirects *whoever ran `/link`*'s own browser back to
+`GOOGLE_OAUTH_REDIRECT_URI` — for any other Discord member, `localhost`
+resolves to their machine, not the bot's, and the redirect just fails to
+load. If more than you will ever link an account, the callback needs a
+stable public HTTPS URL that forwards to the same local port.
+
+[Tailscale Funnel](https://tailscale.com/kb/1223/funnel) is the
+recommended way to get one, free, without touching your router or opening
+a port on your home network:
+
+1. Install Tailscale on the bot's host and run `tailscale up` to join (or
+   create) a tailnet.
+2. In the [Tailscale admin console](https://login.tailscale.com/admin/dns),
+   under DNS, enable **HTTPS Certificates** — Funnel needs this to
+   terminate TLS.
+3. With the bot running (so port 8080, or whatever port
+   `GOOGLE_OAUTH_REDIRECT_URI` implies, is listening), run:
+   ```
+   tailscale funnel 8080
+   ```
+   (add `--bg` to keep it running in the background after your shell
+   exits). This prints the public URL, e.g.
+   `https://your-machine.your-tailnet.ts.net`. `tailscale funnel status`
+   shows it again later.
+4. Set `GOOGLE_OAUTH_REDIRECT_URI` in `.env` to that URL plus the callback
+   path, e.g. `https://your-machine.your-tailnet.ts.net/oauth/callback`,
+   and add the exact same URL as a second Authorized redirect URI on the
+   Google OAuth2 client (step 4 above) — Google rejects a redirect URI at
+   `/link` time if it isn't registered.
+5. Funnel needs to stay running alongside the bot itself (both processes,
+   same machine) — if you're using the systemd unit in `deploy/`, start
+   `tailscaled`'s funnel config as its own enabled unit too, or add it as
+   an `ExecStartPre`/sidecar rather than something you remember to run by
+   hand.
+
+Cloudflare Tunnel is a reasonable alternative if you'd rather use a domain
+you already own instead of a `ts.net` one, but Funnel needs no domain at
+all, which is the simpler default here.
 
 ## Setup
 
