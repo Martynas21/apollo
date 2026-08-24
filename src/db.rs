@@ -9,10 +9,6 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
 
 /// A row from the `users` table: one linked Google account's tokens.
-// Not constructed outside of tests yet — the OAuth linking commands
-// (`/link`, `/unlink`) landing next are what will actually use this CRUD
-// surface.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct StoredToken {
     pub discord_user_id: String,
@@ -45,7 +41,6 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool> {
 }
 
 /// Inserts a token, or replaces the existing one for the same Discord user.
-#[allow(dead_code)]
 pub async fn upsert_token(pool: &SqlitePool, token: &StoredToken) -> Result<()> {
     sqlx::query(
         "INSERT INTO users (discord_user_id, access_token, refresh_token, expires_at, scopes)
@@ -69,7 +64,6 @@ pub async fn upsert_token(pool: &SqlitePool, token: &StoredToken) -> Result<()> 
 }
 
 /// Looks up the stored token for a Discord user, if one is linked.
-#[allow(dead_code)]
 pub async fn get_token(pool: &SqlitePool, discord_user_id: &str) -> Result<Option<StoredToken>> {
     let token = sqlx::query_as::<_, StoredToken>(
         "SELECT discord_user_id, access_token, refresh_token, expires_at, scopes
@@ -84,7 +78,6 @@ pub async fn get_token(pool: &SqlitePool, discord_user_id: &str) -> Result<Optio
 }
 
 /// Deletes the stored token for a Discord user, if any. Idempotent.
-#[allow(dead_code)]
 pub async fn delete_token(pool: &SqlitePool, discord_user_id: &str) -> Result<()> {
     sqlx::query("DELETE FROM users WHERE discord_user_id = ?1")
         .bind(discord_user_id)
@@ -114,7 +107,10 @@ mod tests {
         let pool = connect("sqlite::memory:").await?;
 
         // No row yet.
-        assert_eq!(get_token(&pool, &sample_token().discord_user_id).await?, None);
+        assert_eq!(
+            get_token(&pool, &sample_token().discord_user_id).await?,
+            None
+        );
 
         let token = sample_token();
         upsert_token(&pool, &token).await?;

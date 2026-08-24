@@ -14,7 +14,9 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let config = config::Config::from_env()?;
@@ -28,6 +30,31 @@ async fn main() -> anyhow::Result<()> {
     let guild_id = config.discord_guild_id;
 
     let db_pool = db::connect(&config.database_url).await?;
+    let oauth_client = youtube::oauth::build_oauth_client(&config)?;
+    let oauth_http = youtube::oauth::build_http_client()?;
+    let pending_links = youtube::oauth::PendingLinks::default();
+
+    let (callback_port, callback_path) =
+        youtube::server::parse_redirect_uri(&config.google_oauth_redirect_uri)?;
+
+    let data = Data {
+        db: db_pool,
+        oauth_client,
+        oauth_http,
+        pending_links,
+    };
+
+    // Loopback-only: this endpoint only ever needs to catch the redirect
+    // from the linking user's own browser, never traffic from elsewhere.
+    // Bound eagerly (before spawning) so a port conflict is a startup
+    // error, not a silently-dead background task.
+    let callback_listener = tokio::net::TcpListener::bind(("127.0.0.1", callback_port)).await?;
+    let oauth_app = youtube::server::app(data.clone(), &callback_path);
+    tokio::spawn(async move {
+        if let Err(err) = axum::serve(callback_listener, oauth_app).await {
+            tracing::error!(error = %err, "OAuth2 callback server stopped");
+        }
+    });
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -54,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
                             .await?;
                     }
                 }
-                Ok(Data { db: db_pool })
+                Ok(data)
             })
         })
         .build();

@@ -29,17 +29,19 @@ trivial `/ping` command responds.
 
 Land in `src/youtube/`.
 
-- [ ] `/link` command: generate a Google OAuth2 authorization URL (via the
+- [x] `/link` command: generate a Google OAuth2 authorization URL (via the
       `oauth2` crate) with a CSRF `state` parameter bound to the invoking
       Discord user ID, and reply with the link.
-- [ ] Local `axum` server bound to `GOOGLE_OAUTH_REDIRECT_URI` that
+- [x] Local `axum` server bound to `GOOGLE_OAUTH_REDIRECT_URI` that
       receives the callback, validates `state`, and exchanges the
       authorization code for an access + refresh token.
-- [ ] `/unlink` command: revoke the token with Google and delete the
+- [x] `/unlink` command: revoke the token with Google and delete the
       stored record.
-- [ ] Background/lazy refresh: use the stored refresh token to mint a new
-      access token once the current one is near expiry.
-- [ ] Scope selection: request the narrowest YouTube scope that covers
+- [x] Background/lazy refresh: use the stored refresh token to mint a new
+      access token once the current one is near expiry. (`get_valid_access_token`
+      in `src/youtube/oauth.rs`; not called yet — Phase 4's API client will
+      use it before each request.)
+- [x] Scope selection: request the narrowest YouTube scope that covers
       playlists/liked videos/subscriptions (e.g.
       `https://www.googleapis.com/auth/youtube.readonly`).
 

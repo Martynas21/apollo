@@ -7,9 +7,6 @@ use anyhow::{Context, Result};
 
 /// All configuration the bot needs, sourced from environment variables
 /// (see `.env.example`).
-// Fields beyond `discord_application_id`/`discord_guild_id` aren't read yet
-// — they're wired up once the OAuth flow lands.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Config {
     pub discord_token: String,
