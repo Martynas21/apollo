@@ -18,12 +18,29 @@ FROM debian:bookworm-slim
 # (no Python runtime needed, and it's the build yt-dlp's own maintainers
 # test against — apt's yt-dlp package lags upstream and breaks against
 # YouTube's extraction changes far more often).
+#
+# Deno is installed alongside it because yt-dlp now needs an external JS
+# runtime to reliably solve YouTube's "n" parameter challenge; without one
+# it falls back to a pure-Python solver that intermittently fails
+# ("n challenge solving failed"), which surfaces as random playback
+# failures. See https://github.com/yt-dlp/yt-dlp/wiki/EJS.
+ARG TARGETARCH
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg curl \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg curl unzip \
     && curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
         -o /usr/local/bin/yt-dlp \
     && chmod a+rx /usr/local/bin/yt-dlp \
-    && apt-get purge -y curl \
+    && case "$TARGETARCH" in \
+        amd64) deno_arch=x86_64 ;; \
+        arm64) deno_arch=aarch64 ;; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+       esac \
+    && curl -fL "https://github.com/denoland/deno/releases/latest/download/deno-${deno_arch}-unknown-linux-gnu.zip" \
+        -o /tmp/deno.zip \
+    && unzip -q /tmp/deno.zip -d /usr/local/bin \
+    && chmod a+rx /usr/local/bin/deno \
+    && rm /tmp/deno.zip \
+    && apt-get purge -y curl unzip \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 

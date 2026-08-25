@@ -39,6 +39,11 @@ be installed wherever you run it (see Prerequisites).
   which one. **Keep `yt-dlp` updated** (`yt-dlp -U`, or reinstall
   periodically) — YouTube changes its site internals often enough that a
   stale `yt-dlp` silently starts failing to resolve videos.
+- A JS runtime on `PATH` for `yt-dlp` — [Deno](https://github.com/denoland/deno/releases)
+  is its default. Without one, `yt-dlp` falls back to a fragile built-in
+  solver for YouTube's "n" signature challenge that intermittently fails
+  ("n challenge solving failed"), causing random playback failures. Not
+  checked at startup (see `Dockerfile` for an install example).
 
 ## Discord application setup
 
