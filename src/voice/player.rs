@@ -543,6 +543,7 @@ impl PlayerRegistry {
         let mut items: Vec<QueuedTrack> = state.queue.drain(..).collect();
         items.shuffle(&mut rand::rng());
         state.queue = items.into();
+        self.restart_prefetch(state);
         drop(guilds);
 
         self.refresh_panel(guild_id).await;
@@ -564,12 +565,35 @@ impl PlayerRegistry {
                 return Err(PlayerError::InvalidSelection);
             }
             state.queue.drain(..index);
+            if index > 0 {
+                self.restart_prefetch(state);
+            }
             state.current_handle.clone()
         };
         let handle = handle.ok_or(PlayerError::NothingPlaying)?;
         handle
             .stop()
             .map_err(|e| PlayerError::Playback(e.to_string()))
+    }
+
+    /// Cancels any in-flight prefetch and starts a fresh one for the new
+    /// front of `state.queue`, if there is one. `prefetch` is only ever kept
+    /// in sync automatically when the queue is mutated by `push_back`/
+    /// `pop_front` (see the field's doc comment) — `shuffle` and `jump_to`
+    /// instead reorder or drop entries out from under an in-flight prefetch,
+    /// which would otherwise hand the *next* track a download meant for
+    /// whatever used to be at the front (wrong audio playing under the
+    /// right track's title). Must be called with `state`'s guild lock held.
+    fn restart_prefetch(&self, state: &mut GuildState) {
+        if let Some(old) = state.prefetch.take() {
+            old.abort();
+        }
+        if let Some(next) = state.queue.front().cloned() {
+            let registry = self.clone();
+            state.prefetch = Some(tokio::spawn(
+                async move { registry.cached_input(&next).await },
+            ));
+        }
     }
 
     /// Whether the current track is paused. `None` if nothing is playing.
