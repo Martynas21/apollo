@@ -315,7 +315,20 @@ impl Live {
     #[inline(always)]
     #[allow(clippy::inline_always)]
     fn _march_deadline(&mut self) {
-        std::thread::sleep(self.deadline.saturating_duration_since(Instant::now()));
+        let now = Instant::now();
+
+        // If we're more than a full tick behind (this thread got starved
+        // past its deadline), don't fire every missed tick back-to-back to
+        // catch up -- that bursts several packets at once, which Discord
+        // clients hear as a brief speed-up. Drop the backlog and resync to
+        // the current time instead: playback gets a brief silent gap
+        // covering the stall, rather than compressed audio right after it.
+        if now > self.deadline + TIMESTEP_LENGTH {
+            self.deadline = now;
+        } else {
+            std::thread::sleep(self.deadline.saturating_duration_since(now));
+        }
+
         self.deadline += TIMESTEP_LENGTH;
     }
 
@@ -639,13 +652,14 @@ impl Live {
 /// This thread paces and sends audio to Discord on a strict 20ms cadence,
 /// but by default gets no scheduling priority over any other thread on the
 /// system -- ordinary CPU contention (a compile, a browser, anything) can
-/// starve it past a tick, and `_march_deadline`'s fixed-increment deadline
-/// (which never resyncs to `Instant::now()`) then bursts several packets
-/// back-to-back to catch up, which Discord clients hear as a brief
-/// speed-up. Tries real-time scheduling first (needs `CAP_SYS_NICE` or an
-/// `rtprio` limit for this user -- see `/etc/security/limits.conf`),
-/// falling back to a plain niceness bump (works for any user, smaller
-/// effect, still per-thread on Linux) if real-time scheduling is denied.
+/// starve it past a tick, forcing `_march_deadline` to resync its deadline
+/// and skip the backlog (see its doc comment) rather than burst-sending to
+/// catch up. Elevated priority is still the better outcome, since it avoids
+/// the stall (and the resulting silent gap) in the first place. Tries
+/// real-time scheduling first (needs `CAP_SYS_NICE` or an `rtprio` limit
+/// for this user -- see `/etc/security/limits.conf`), falling back to a
+/// plain niceness bump (works for any user, smaller effect, still
+/// per-thread on Linux) if real-time scheduling is denied.
 #[cfg(target_os = "linux")]
 fn raise_mixer_thread_priority() {
     unsafe {
