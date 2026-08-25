@@ -3764,8 +3764,6 @@ dependencies = [
 [[package]]
 name = "songbird"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b9bf4ecb5083685b79a8fc60222f12e4f036e2817c5c341cd2b9ff2b429d237"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -3782,6 +3780,7 @@ dependencies = [
  "enum-map",
  "flume 0.11.1",
  "futures",
+ "libc",
  "nohash-hasher",
  "nonmax",
  "opus2",

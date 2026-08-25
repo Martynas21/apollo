@@ -10,7 +10,12 @@ use poise::serenity_prelude as serenity;
 use songbird::serenity::SerenityInit;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
+// A bot serving a handful of guilds has no real use for one tokio worker
+// thread per core (the default) -- apollo's workload is I/O-bound, not
+// CPU-bound. Trimming this reduces how many threads compete with the
+// songbird mixer thread for CPU time, which is otherwise a plausible source
+// of the transient stalls behind the sporadic playback speed-up bug.
+#[tokio::main(worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 

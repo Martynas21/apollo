@@ -40,5 +40,19 @@ wiremock = "0.6"
 # is otherwise-pristine upstream 0.5.2 plus vendor/stream_lib-hls-leak.patch;
 # see vendor/stream_lib/README.md for what it does and how to carry it
 # forward on a version bump.
+#
+# Songbird's mixer/pacing thread (driver/scheduler/live.rs) is a plain
+# std::thread with no elevated OS scheduling priority: any ordinary CPU
+# contention on the host can starve it past its 20ms tick, and its
+# fixed-increment deadline (which never resyncs to Instant::now() after a
+# stall) then bursts several packets back-to-back to catch up — audible to
+# listeners as a brief playback speed-up. vendor/songbird is otherwise-
+# pristine upstream 0.6.0 plus one addition in `Worker::spawn`: the mixer
+# thread now requests SCHED_FIFO real-time scheduling on startup (falling
+# back to a niceness bump if that's denied) and is named "songbird-mixer".
+# Needs `sudo setcap 'cap_sys_nice=eip' <binary>` (or an rtprio limit for
+# the running user) for the elevation to actually take effect — without it,
+# this is a logged no-op and the thread runs at default priority as before.
 [patch.crates-io]
 stream_lib = { path = "vendor/stream_lib" }
+songbird = { path = "vendor/songbird" }
