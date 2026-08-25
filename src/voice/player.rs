@@ -22,6 +22,7 @@ use songbird::{
 };
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use crate::db;
 use crate::voice::radio;
@@ -89,6 +90,15 @@ struct GuildState {
     queue: VecDeque<QueuedTrack>,
     now_playing: Option<QueuedTrack>,
     current_handle: Option<TrackHandle>,
+    /// `current_handle`'s track uuid, captured at the same time it's set.
+    /// [`TrackEndHandler`] carries the uuid of the track it was registered
+    /// for and `advance` checks it against this before touching state — a
+    /// track that was stopped/skipped/replaced still has an End/Error event
+    /// in flight from songbird's mixer thread, and without this check that
+    /// stale event would land after a *new* track has already started,
+    /// clearing its handle out from under it or layering another track on
+    /// top of it (two tracks audibly playing at once).
+    current_track_id: Option<Uuid>,
     /// Background pre-buffer for `queue`'s front entry, started right after
     /// the current track begins playing. Always corresponds to whatever is
     /// at the front of `queue` — `enqueue`/`advance`/`stop` are the only
@@ -293,6 +303,7 @@ impl PlayerRegistry {
             let mut call = call.lock().await;
             call.play_input(input)
         };
+        let track_id = handle.uuid();
 
         // Best-effort: a missing/unreadable volume setting shouldn't block
         // playback — fall back to songbird's own default (100%) rather than
@@ -322,6 +333,7 @@ impl PlayerRegistry {
             TrackEndHandler {
                 registry: self.clone(),
                 guild_id,
+                track_id,
             },
         ) {
             tracing::warn!(%err, "failed to register track-end handler");
@@ -331,6 +343,7 @@ impl PlayerRegistry {
             TrackEndHandler {
                 registry: self.clone(),
                 guild_id,
+                track_id,
             },
         ) {
             tracing::warn!(%err, "failed to register track-error handler");
@@ -340,6 +353,7 @@ impl PlayerRegistry {
         let mut needs_radio_refill = false;
         if let Some(state) = guilds.get_mut(&guild_id) {
             state.current_handle = Some(handle);
+            state.current_track_id = Some(track_id);
             // Every track start updates the radio seed, regardless of how
             // the track got here (playlist, one-off `/play`, search, or a
             // radio-fetched track itself) — see `maybe_spawn_radio_refill`.
@@ -374,13 +388,25 @@ impl PlayerRegistry {
     /// Advances to the next queued track, or — if the queue is empty —
     /// schedules an idle-timeout disconnect. Called from [`TrackEndHandler`]
     /// whenever a track ends, whether naturally or via `/skip`/`/stop`.
-    async fn advance(&self, guild_id: GuildId) {
+    ///
+    /// `track_id` is the uuid of the track whose End/Error event triggered
+    /// this call. It's checked against the guild's `current_track_id` and
+    /// the call is dropped if they don't match — an End/Error event fired by
+    /// songbird's mixer thread for a track that's already been superseded
+    /// (stopped, skipped, or replaced by a fresh `/play` before this event
+    /// landed). Acting on it anyway would advance past whatever's actually
+    /// playing now, or start a second track on top of it.
+    async fn advance(&self, guild_id: GuildId, track_id: Uuid) {
         let (next, prefetch) = {
             let mut guilds = self.guilds.lock().await;
             let Some(state) = guilds.get_mut(&guild_id) else {
                 return;
             };
+            if state.current_track_id != Some(track_id) {
+                return;
+            }
             state.current_handle = None;
+            state.current_track_id = None;
             state.now_playing = state.queue.pop_front();
             (state.now_playing.clone(), state.prefetch.take())
         };
@@ -428,6 +454,7 @@ impl PlayerRegistry {
             };
             state.queue.clear();
             state.now_playing = None;
+            state.current_track_id = None;
             if let Some(prefetch) = state.prefetch.take() {
                 prefetch.abort();
             }
@@ -438,13 +465,16 @@ impl PlayerRegistry {
             return Err(PlayerError::NothingPlaying);
         };
 
-        // Stopping fires a Track::End event, but `now_playing`/`current_handle`
-        // are already cleared above, so `advance()` will see an empty queue
-        // and just (re-)schedule the idle timer rather than double-advance.
+        // Stopping fires a Track::End event, but `current_track_id` is
+        // already cleared above, so `advance()` will recognize it as stale
+        // (belonging to a track that's no longer current) and ignore it
+        // rather than double-advance — schedule the idle timer ourselves
+        // instead of relying on that event to do it.
         let result = handle
             .stop()
             .map_err(|e| PlayerError::Playback(e.to_string()));
         if result.is_ok() {
+            self.schedule_idle_disconnect(guild_id);
             self.refresh_panel(guild_id).await;
         }
         result
@@ -815,12 +845,15 @@ impl PlayerRegistry {
 struct TrackEndHandler {
     registry: PlayerRegistry,
     guild_id: GuildId,
+    /// Uuid of the track this handler was registered for — see `advance`'s
+    /// doc comment for why this is needed to ignore stale events.
+    track_id: Uuid,
 }
 
 #[async_trait::async_trait]
 impl SongbirdEventHandler for TrackEndHandler {
     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
-        self.registry.advance(self.guild_id).await;
+        self.registry.advance(self.guild_id, self.track_id).await;
         None
     }
 }
