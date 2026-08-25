@@ -32,3 +32,13 @@ base64 = "0.22"
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
+
+# Songbird's HLS backend (used for livestream playback) never notices when
+# songbird drops its reader on track skip/error: it keeps polling the live
+# playlist and downloading segments — for a 24/7 stream, indefinitely —
+# logging a warning on every send into the now-dead channel. vendor/stream_lib
+# is otherwise-pristine upstream 0.5.2 plus vendor/stream_lib-hls-leak.patch;
+# see vendor/stream_lib/README.md for what it does and how to carry it
+# forward on a version bump.
+[patch.crates-io]
+stream_lib = { path = "vendor/stream_lib" }
