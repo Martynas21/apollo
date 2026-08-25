@@ -49,8 +49,8 @@ WORKDIR /app
 COPY --from=build /app/target/release/apollo /usr/local/bin/apollo
 
 # DATABASE_URL should point at a path under a mounted volume (e.g.
-# sqlite:///data/apollo.db with -v apollo-data:/data) so the token store
-# survives container recreation — see README.md.
+# sqlite:///data/apollo.db with -v apollo-data:/data) so per-guild playback
+# settings survive container recreation — see README.md.
 USER apollo
 ENV RUST_LOG=info,apollo=info
 

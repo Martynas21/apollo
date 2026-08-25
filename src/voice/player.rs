@@ -23,12 +23,10 @@ use songbird::{
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::crypto::TokenKey;
 use crate::db;
 use crate::voice::radio;
 use crate::voice::resolve::{self, PlaybackError};
 use crate::youtube::api::{Track, YouTubeClient};
-use crate::youtube::oauth::{self, GoogleOAuthClient};
 
 /// A background pre-buffer for the track that's up next in the queue,
 /// started as soon as the current track begins playing so its download
@@ -109,8 +107,8 @@ struct GuildState {
     /// radio track when the queue runs dry. `None` until something has
     /// played this session.
     radio_seed: Option<String>,
-    /// Requester of the track `radio_seed` points at — whose linked
-    /// `YouTube` account's access token backs the background mix fetch.
+    /// Requester of the track `radio_seed` points at — attributed to
+    /// radio-fetched tracks too, since nothing new requested them.
     radio_requested_by: Option<UserId>,
     /// Video ids already surfaced by radio mode this session, so it doesn't
     /// immediately repeat itself.
@@ -129,7 +127,7 @@ pub struct QueueSnapshot {
 #[derive(Clone)]
 pub struct PlayerRegistry {
     songbird: Arc<Songbird>,
-    http: oauth2::reqwest::Client,
+    http: reqwest::Client,
     /// Used only to edit/delete the live `/player` panel message from
     /// contexts that aren't already handling a Discord interaction (e.g.
     /// [`TrackEndHandler`], or a `/skip` slash command refreshing a panel
@@ -138,31 +136,21 @@ pub struct PlayerRegistry {
     discord_http: Arc<serenity::Http>,
     cookies_file: Option<String>,
     db: sqlx::SqlitePool,
-    /// `YouTube` Data API client, used by radio mode's background refill to
+    /// `yt-dlp`-backed client, used by radio mode's background refill to
     /// hydrate bare video ids (from `crate::voice::radio::list_mix_video_ids`)
     /// into full `Track`s — see `maybe_spawn_radio_refill`.
     youtube: YouTubeClient,
-    /// Needed alongside `token_key` and `http` (reused here as the `OAuth2`
-    /// transport too) so radio mode's background refill task — which runs
-    /// from a songbird track-end callback, not a command — can obtain a
-    /// linked user's access token on its own via
-    /// `crate::youtube::oauth::get_valid_access_token`.
-    oauth_client: GoogleOAuthClient,
-    token_key: TokenKey,
     guilds: Arc<Mutex<HashMap<GuildId, GuildState>>>,
 }
 
 impl PlayerRegistry {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         songbird: Arc<Songbird>,
-        http: oauth2::reqwest::Client,
+        http: reqwest::Client,
         discord_http: Arc<serenity::Http>,
         cookies_file: Option<String>,
         db: sqlx::SqlitePool,
         youtube: YouTubeClient,
-        oauth_client: GoogleOAuthClient,
-        token_key: TokenKey,
     ) -> Self {
         Self {
             songbird,
@@ -171,8 +159,6 @@ impl PlayerRegistry {
             cookies_file,
             db,
             youtube,
-            oauth_client,
-            token_key,
             guilds: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -641,11 +627,10 @@ impl PlayerRegistry {
     /// starts with an empty queue) — worst case two tracks land instead of
     /// one, which is harmless and not worth guarding against.
     ///
-    /// On any failure (no linked account, yt-dlp/mix-listing failure,
-    /// hydration failure, or an exhausted mix with no unplayed candidates
-    /// left), logs a warning and does nothing further — `advance()`'s
-    /// existing idle-disconnect path remains the safety net if the queue
-    /// stays empty.
+    /// On any failure (yt-dlp/mix-listing failure, hydration failure, or an
+    /// exhausted mix with no unplayed candidates left), logs a warning and
+    /// does nothing further — `advance()`'s existing idle-disconnect path
+    /// remains the safety net if the queue stays empty.
     fn maybe_spawn_radio_refill(&self, guild_id: GuildId) {
         let registry = self.clone();
         tokio::spawn(async move {
@@ -663,22 +648,6 @@ impl PlayerRegistry {
             };
             let (true, Some(seed), Some(requested_by)) = (enabled, seed, requested_by) else {
                 return;
-            };
-
-            let access_token = match oauth::get_valid_access_token(
-                &registry.oauth_client,
-                &registry.http,
-                &registry.db,
-                &requested_by.to_string(),
-                &registry.token_key,
-            )
-            .await
-            {
-                Ok(token) => token,
-                Err(err) => {
-                    tracing::warn!(%guild_id, %err, "radio refill: no valid access token, skipping");
-                    return;
-                }
             };
 
             let mix_ids =
@@ -704,11 +673,7 @@ impl PlayerRegistry {
                 return;
             }
 
-            let hydrated = match registry
-                .youtube
-                .hydrate_videos(&access_token, &candidates)
-                .await
-            {
+            let hydrated = match registry.youtube.hydrate_videos(&candidates).await {
                 Ok(tracks) => tracks,
                 Err(err) => {
                     tracing::warn!(%guild_id, %err, "radio refill: failed to hydrate mix candidates");
@@ -859,4 +824,3 @@ impl SongbirdEventHandler for TrackEndHandler {
         None
     }
 }
-

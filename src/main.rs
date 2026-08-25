@@ -1,6 +1,5 @@
 mod commands;
 mod config;
-mod crypto;
 mod db;
 mod voice;
 mod youtube;
@@ -45,13 +44,6 @@ async fn main() -> anyhow::Result<()> {
     let guild_id = config.discord_guild_id;
 
     let db_pool = db::connect(&config.database_url).await?;
-    db::verify_token_key(&db_pool, &config.token_encryption_key).await?;
-    let oauth_client = youtube::oauth::build_oauth_client(&config)?;
-    let oauth_http = youtube::oauth::build_http_client()?;
-    let pending_links = youtube::oauth::PendingLinks::default();
-
-    let (callback_port, callback_path) =
-        youtube::server::parse_redirect_uri(&config.google_oauth_redirect_uri)?;
 
     // Built here (rather than left to `.register_songbird()`) so the same
     // `Arc<Songbird>` can back both the serenity client and `Data::player`.
@@ -61,39 +53,20 @@ async fn main() -> anyhow::Result<()> {
     // contexts that aren't already handling a Discord interaction, e.g. the
     // track-end handler that drives auto-advance.
     let discord_http = std::sync::Arc::new(serenity::Http::new(&config.discord_token));
-    let youtube_client = youtube::api::YouTubeClient::new(oauth2::reqwest::Client::new());
+    let youtube_client = youtube::api::YouTubeClient::new(config.yt_dlp_cookies_file.clone());
     let player = voice::PlayerRegistry::new(
         songbird.clone(),
-        oauth2::reqwest::Client::new(),
+        reqwest::Client::new(),
         discord_http,
         config.yt_dlp_cookies_file.clone(),
-        db_pool.clone(),
+        db_pool,
         youtube_client.clone(),
-        oauth_client.clone(),
-        config.token_encryption_key,
     );
 
     let data = Data {
-        db: db_pool,
-        token_key: config.token_encryption_key,
-        oauth_client,
-        oauth_http,
-        pending_links,
         youtube: youtube_client,
         player,
     };
-
-    // Loopback-only: this endpoint only ever needs to catch the redirect
-    // from the linking user's own browser, never traffic from elsewhere.
-    // Bound eagerly (before spawning) so a port conflict is a startup
-    // error, not a silently-dead background task.
-    let callback_listener = tokio::net::TcpListener::bind(("127.0.0.1", callback_port)).await?;
-    let oauth_app = youtube::server::app(data.clone(), &callback_path);
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(callback_listener, oauth_app).await {
-            tracing::error!(error = %err, "OAuth2 callback server stopped");
-        }
-    });
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {

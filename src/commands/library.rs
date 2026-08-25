@@ -1,54 +1,23 @@
-//! `/add_to_queue`, `/playlists`, `/playlist_play`: browsing a linked
-//! account's `YouTube` library and queuing tracks from it.
+//! `/add_to_queue`, `/playlist_play`: searching `YouTube` and queuing tracks
+//! from a search result or a playlist URL/ID.
 //!
-//! Every listing (search results, playlists, a playlist's tracks) pairs its
-//! numbered text with a select-menu/button picker, so the common path is one
-//! click rather than noting a number and re-running a command with it. The
-//! numbered form still works too, for anyone who'd rather type it directly.
-//! Picker clicks never need cross-invocation state — each option's value is
-//! a stable id (a video id, a playlist id) that's cheap to re-look-up when
+//! `/add_to_queue` pairs its numbered text with a select-menu picker, so the
+//! common path is one click rather than noting a number and re-running a
+//! command with it. The numbered form still works too, for anyone who'd
+//! rather type it directly. A picker click never needs cross-invocation
+//! state — its value is a stable video id, cheap to re-look-up when
 //! clicked, rather than a "last results" cache keyed per-user that would
 //! need its own expiry/cleanup.
 
 use poise::serenity_prelude as serenity;
 
-use super::playback::access_token_error_message;
 use super::{Context, Data, Error};
 use crate::voice::QueuedTrack;
 use crate::voice::panel::{format_duration, truncate_label};
-use crate::youtube::api::{Playlist, Track, YouTubeClient};
-use crate::youtube::oauth::get_valid_access_token;
+use crate::youtube::api::Track;
 
 /// Max results shown by `/add_to_queue` when browsing (no `number` given).
 const ADD_TO_QUEUE_DISPLAY_LIMIT: usize = 5;
-/// Max results shown by `/playlists` and when browsing one's tracks.
-const LIST_DISPLAY_LIMIT: usize = 10;
-
-/// Fetches a valid access token for the invoking user, or replies
-/// ephemerally with a `/link` prompt and returns `Ok(None)` if there isn't
-/// one — the expected case of an unlinked account, not a real error.
-async fn require_access_token(ctx: Context<'_>) -> Result<Option<String>, Error> {
-    match get_valid_access_token(
-        &ctx.data().oauth_client,
-        &ctx.data().oauth_http,
-        &ctx.data().db,
-        &ctx.author().id.to_string(),
-        &ctx.data().token_key,
-    )
-    .await
-    {
-        Ok(token) => Ok(Some(token)),
-        Err(err) => {
-            ctx.send(
-                poise::CreateReply::default()
-                    .content(access_token_error_message(&err))
-                    .ephemeral(true),
-            )
-            .await?;
-            Ok(None)
-        }
-    }
-}
 
 /// Formats one line of a numbered track listing: `N. Title — Channel (mm:ss)`
 /// (or `h:mm:ss` past an hour), omitting the duration parens entirely when
@@ -82,61 +51,6 @@ fn format_track_list(tracks: &[Track], limit: usize) -> String {
     lines.join("\n")
 }
 
-/// Renders a numbered, length-capped playlist listing with a trailing
-/// truncation note if there were more results than [`LIST_DISPLAY_LIMIT`].
-fn format_playlist_list(playlists: &[crate::youtube::api::Playlist]) -> String {
-    let mut lines: Vec<String> = playlists
-        .iter()
-        .take(LIST_DISPLAY_LIMIT)
-        .enumerate()
-        .map(|(i, playlist)| {
-            let count_suffix = playlist
-                .item_count
-                .map(|c| format!(" ({c} items)"))
-                .unwrap_or_default();
-            format!("{}. {}{count_suffix}", i + 1, playlist.title)
-        })
-        .collect();
-
-    if playlists.len() > LIST_DISPLAY_LIMIT {
-        lines.push(format!(
-            "...and {} more not shown",
-            playlists.len() - LIST_DISPLAY_LIMIT
-        ));
-    }
-
-    lines.join("\n")
-}
-
-/// Fetches the linked account's playlists and renders the listing: display
-/// text plus (when non-empty) a [`playlist_select_menu`] row. `Err` carries
-/// a ready-to-show failure message rather than a raw error, since every
-/// caller just displays it directly. Shared by `/playlists` and the
-/// `/player` panel's Playlists button.
-async fn playlists_listing(
-    youtube: &YouTubeClient,
-    token: &str,
-) -> Result<(String, Vec<serenity::CreateActionRow>), String> {
-    let playlists = youtube
-        .list_playlists(token)
-        .await
-        .map_err(|err| format!("Failed to list playlists: {err}"))?;
-
-    if playlists.is_empty() {
-        return Ok(("You don't have any playlists.".to_string(), Vec::new()));
-    }
-
-    let listing = format_playlist_list(&playlists);
-    let content = format!(
-        "Your playlists:\n{listing}\n\nSelect one below to browse its tracks, \
-         or run `/playlist_play <number>` to queue the whole thing."
-    );
-    Ok((
-        content,
-        vec![playlist_select_menu(&playlists, LIST_DISPLAY_LIMIT)],
-    ))
-}
-
 /// Builds a `library:queue` select menu offering up to `limit` (and never
 /// more than Discord's 25-option cap) of `tracks`, so a result can be
 /// queued with one click instead of noting its number and re-running the
@@ -161,32 +75,6 @@ fn track_select_menu(tracks: &[Track], limit: usize) -> serenity::CreateActionRo
             serenity::CreateSelectMenuKind::String { options },
         )
         .placeholder("Queue a track..."),
-    )
-}
-
-/// Builds a `library:browse_playlist` select menu offering up to `limit`
-/// (and never more than Discord's 25-option cap) of `playlists`, so one can
-/// be browsed with a click instead of noting its number and running a
-/// separate browse command.
-fn playlist_select_menu(playlists: &[Playlist], limit: usize) -> serenity::CreateActionRow {
-    let options = playlists
-        .iter()
-        .take(limit.min(25))
-        .map(|playlist| {
-            let label = match playlist.item_count {
-                Some(count) => format!("{} ({count} items)", playlist.title),
-                None => playlist.title.clone(),
-            };
-            serenity::CreateSelectMenuOption::new(truncate_label(&label), playlist.id.clone())
-        })
-        .collect();
-
-    serenity::CreateActionRow::SelectMenu(
-        serenity::CreateSelectMenu::new(
-            "library:browse_playlist",
-            serenity::CreateSelectMenuKind::String { options },
-        )
-        .placeholder("Browse a playlist..."),
     )
 }
 
@@ -228,17 +116,15 @@ async fn update_picker(
     Ok(())
 }
 
-/// Routes a `library:*` component interaction to its handler:
-/// `library:queue` (queue one track), `library:browse_playlist` (show a
-/// playlist's tracks), or `library:playlist_play:<id>` (queue a whole
-/// playlist). Any other custom id is ignored.
+/// Routes a `library:*` component interaction to its handler: currently
+/// just `library:queue` (queue one track). Any other custom id is ignored.
 ///
-/// Defers immediately (before any of the handlers' `YouTube` API calls, voice
-/// joins, or track resolution) rather than letting each handler send its
-/// own first response: Discord invalidates a component interaction if
-/// nothing acknowledges it within 3 seconds, and those steps routinely take
-/// longer than that — deferring buys the standard 15-minute follow-up
-/// window instead, which each handler then fulfils with an edit.
+/// Defers immediately (before the `YouTube` lookup, voice join, or track
+/// resolution) rather than letting the handler send its own first response:
+/// Discord invalidates a component interaction if nothing acknowledges it
+/// within 3 seconds, and those steps routinely take longer than that —
+/// deferring buys the standard 15-minute follow-up window instead, which
+/// the handler then fulfils with an edit.
 pub async fn handle_component(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -248,14 +134,6 @@ pub async fn handle_component(
     if custom_id == "library:queue" {
         component.defer(&ctx.http).await?;
         return handle_queue_track(ctx, component, data).await;
-    }
-    if custom_id == "library:browse_playlist" {
-        component.defer(&ctx.http).await?;
-        return handle_browse_playlist(ctx, component, data).await;
-    }
-    if let Some(playlist_id) = custom_id.strip_prefix("library:playlist_play:") {
-        component.defer(&ctx.http).await?;
-        return handle_playlist_play_button(ctx, component, data, playlist_id).await;
     }
     Ok(())
 }
@@ -277,20 +155,7 @@ async fn handle_queue_track(
         return update_picker(ctx, component, "Something went wrong with that selection.").await;
     };
 
-    let token = match get_valid_access_token(
-        &data.oauth_client,
-        &data.oauth_http,
-        &data.db,
-        &component.user.id.to_string(),
-        &data.token_key,
-    )
-    .await
-    {
-        Ok(token) => token,
-        Err(err) => return update_picker(ctx, component, access_token_error_message(&err)).await,
-    };
-
-    let track = match data.youtube.get_video(&token, video_id).await {
+    let track = match data.youtube.get_video(video_id).await {
         Ok(track) => track,
         Err(err) => {
             return update_picker(ctx, component, format!("Failed to queue track: {err}")).await;
@@ -329,115 +194,6 @@ async fn handle_queue_track(
     }
 }
 
-/// Handles a `library:browse_playlist` select-menu click from
-/// [`playlist_select_menu`]: looks up the chosen playlist's tracks and
-/// replaces the picker message with a track listing, a [`track_select_menu`]
-/// to queue one, and a button to queue the whole playlist — folding what
-/// used to be a separate `/playlist_browse` command into this one click.
-async fn handle_browse_playlist(
-    ctx: &serenity::Context,
-    component: &serenity::ComponentInteraction,
-    data: &Data,
-) -> Result<(), Error> {
-    let serenity::ComponentInteractionDataKind::StringSelect { values } = &component.data.kind
-    else {
-        return update_picker(ctx, component, "Something went wrong with that selection.").await;
-    };
-    let Some(playlist_id) = values.first() else {
-        return update_picker(ctx, component, "Something went wrong with that selection.").await;
-    };
-
-    let token = match get_valid_access_token(
-        &data.oauth_client,
-        &data.oauth_http,
-        &data.db,
-        &component.user.id.to_string(),
-        &data.token_key,
-    )
-    .await
-    {
-        Ok(token) => token,
-        Err(err) => return update_picker(ctx, component, access_token_error_message(&err)).await,
-    };
-
-    let tracks = match data.youtube.list_playlist_items(&token, playlist_id).await {
-        Ok(tracks) => tracks,
-        Err(err) => {
-            return update_picker(
-                ctx,
-                component,
-                format!("Failed to list playlist items: {err}"),
-            )
-            .await;
-        }
-    };
-
-    if tracks.is_empty() {
-        return update_picker(ctx, component, "That playlist is empty.").await;
-    }
-
-    let listing = format_track_list(&tracks, LIST_DISPLAY_LIMIT);
-    let track_count = tracks.len();
-    let components = vec![
-        track_select_menu(&tracks, LIST_DISPLAY_LIMIT),
-        serenity::CreateActionRow::Buttons(vec![
-            serenity::CreateButton::new(format!("library:playlist_play:{playlist_id}"))
-                .label(format!("Queue all {track_count} tracks"))
-                .style(serenity::ButtonStyle::Primary),
-        ]),
-    ];
-
-    component
-        .edit_response(
-            &ctx.http,
-            serenity::EditInteractionResponse::new()
-                .content(format!(
-                    "Tracks:\n{listing}\n\nSelect one below to queue it, or queue the whole playlist."
-                ))
-                .components(components),
-        )
-        .await?;
-    Ok(())
-}
-
-/// Handles the `/player` panel's Playlists button: same content as
-/// `/playlists`, as an ephemeral edit to the already-deferred component
-/// interaction (the caller — [`super::playback::handle_component`] — defers
-/// before calling this, same as every `library:*` handler does for itself).
-pub(super) async fn handle_playlists_button(
-    ctx: &serenity::Context,
-    component: &serenity::ComponentInteraction,
-    data: &Data,
-) -> Result<(), Error> {
-    let token = match get_valid_access_token(
-        &data.oauth_client,
-        &data.oauth_http,
-        &data.db,
-        &component.user.id.to_string(),
-        &data.token_key,
-    )
-    .await
-    {
-        Ok(token) => token,
-        Err(err) => return update_picker(ctx, component, access_token_error_message(&err)).await,
-    };
-
-    let (content, components) = match playlists_listing(&data.youtube, &token).await {
-        Ok(listing) => listing,
-        Err(message) => return update_picker(ctx, component, message).await,
-    };
-
-    component
-        .edit_response(
-            &ctx.http,
-            serenity::EditInteractionResponse::new()
-                .content(content)
-                .components(components),
-        )
-        .await?;
-    Ok(())
-}
-
 /// Extracts the submitted `query` field's value from a modal submission
 /// built by [`super::playback::handle_search_button`], or `None` if it was
 /// left empty.
@@ -473,29 +229,7 @@ pub(super) async fn handle_search_modal_submit(
         return Ok(());
     };
 
-    let token = match get_valid_access_token(
-        &data.oauth_client,
-        &data.oauth_http,
-        &data.db,
-        &modal.user.id.to_string(),
-        &data.token_key,
-    )
-    .await
-    {
-        Ok(token) => token,
-        Err(err) => {
-            modal
-                .edit_response(
-                    &ctx.http,
-                    serenity::EditInteractionResponse::new()
-                        .content(access_token_error_message(&err)),
-                )
-                .await?;
-            return Ok(());
-        }
-    };
-
-    let results = match data.youtube.search(&token, &query).await {
+    let results = match data.youtube.search(&query).await {
         Ok(results) => results,
         Err(err) => {
             modal
@@ -535,92 +269,6 @@ pub(super) async fn handle_search_modal_submit(
         )
         .await?;
     Ok(())
-}
-
-/// Handles a `library:playlist_play:<playlist id>` button click from
-/// [`handle_browse_playlist`]'s track view: queues every track in that
-/// playlist for the clicking user, auto-joining their voice channel first
-/// if the bot isn't already connected — the button counterpart to
-/// `/playlist_play`.
-async fn handle_playlist_play_button(
-    ctx: &serenity::Context,
-    component: &serenity::ComponentInteraction,
-    data: &Data,
-    playlist_id: &str,
-) -> Result<(), Error> {
-    let Some(guild_id) = component.guild_id else {
-        return update_picker(ctx, component, "Something went wrong with that selection.").await;
-    };
-
-    let token = match get_valid_access_token(
-        &data.oauth_client,
-        &data.oauth_http,
-        &data.db,
-        &component.user.id.to_string(),
-        &data.token_key,
-    )
-    .await
-    {
-        Ok(token) => token,
-        Err(err) => return update_picker(ctx, component, access_token_error_message(&err)).await,
-    };
-
-    let tracks = match data.youtube.list_playlist_items(&token, playlist_id).await {
-        Ok(tracks) => tracks,
-        Err(err) => {
-            return update_picker(
-                ctx,
-                component,
-                format!("Failed to list playlist items: {err}"),
-            )
-            .await;
-        }
-    };
-
-    if tracks.is_empty() {
-        return update_picker(ctx, component, "That playlist is empty.").await;
-    }
-
-    if !data.player.is_connected(guild_id) {
-        let Some(channel_id) = voice_channel_of(ctx, guild_id, component.user.id) else {
-            return update_picker(
-                ctx,
-                component,
-                "Join a voice channel first, or use `/join`.",
-            )
-            .await;
-        };
-        if let Err(err) = data.player.join(guild_id, channel_id).await {
-            return update_picker(
-                ctx,
-                component,
-                format!("Failed to join voice channel: {err}"),
-            )
-            .await;
-        }
-    }
-
-    let total = tracks.len();
-    let mut queued_count = 0usize;
-    for track in tracks {
-        let queued = QueuedTrack {
-            track,
-            requested_by: component.user.id,
-        };
-        if data.player.enqueue(guild_id, queued).await.is_ok() {
-            queued_count += 1;
-        }
-    }
-
-    let content = if queued_count == total {
-        format!("Queued {queued_count} track(s).")
-    } else {
-        format!(
-            "Queued {queued_count}/{total} track(s) ({} failed).",
-            total - queued_count
-        )
-    };
-    update_picker(ctx, component, content).await
 }
 
 /// Determines the voice channel to auto-join into, if the bot isn't already
@@ -757,11 +405,7 @@ pub async fn add_to_queue(
         u8,
     >,
 ) -> Result<(), Error> {
-    let Some(token) = require_access_token(ctx).await? else {
-        return Ok(());
-    };
-
-    let results = match ctx.data().youtube.search(&token, &query).await {
+    let results = match ctx.data().youtube.search(&query).await {
         Ok(results) => results,
         Err(err) => {
             ctx.send(
@@ -815,76 +459,13 @@ pub async fn add_to_queue(
     join_and_enqueue(ctx, track).await
 }
 
-/// Lists the linked account's playlists. Select one to browse it.
-#[poise::command(slash_command, guild_only)]
-pub async fn playlists(ctx: Context<'_>) -> Result<(), Error> {
-    let Some(token) = require_access_token(ctx).await? else {
-        return Ok(());
-    };
-
-    let (content, components) = match playlists_listing(&ctx.data().youtube, &token).await {
-        Ok(listing) => listing,
-        Err(message) => {
-            ctx.send(
-                poise::CreateReply::default()
-                    .content(message)
-                    .ephemeral(true),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    ctx.send(
-        poise::CreateReply::default()
-            .content(content)
-            .components(components)
-            .ephemeral(true),
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// Queues every track in playlist `playlist_number`, in playlist order.
+/// Queues every track in a `YouTube` playlist (URL or bare playlist ID), in order.
 #[poise::command(slash_command, guild_only)]
 pub async fn playlist_play(
     ctx: Context<'_>,
-    #[description = "Playlist number from /playlists"] playlist_number: u8,
+    #[description = "Playlist URL or ID"] playlist: String,
 ) -> Result<(), Error> {
-    let Some(token) = require_access_token(ctx).await? else {
-        return Ok(());
-    };
-
-    let playlists = match ctx.data().youtube.list_playlists(&token).await {
-        Ok(playlists) => playlists,
-        Err(err) => {
-            ctx.send(
-                poise::CreateReply::default()
-                    .content(format!("Failed to list playlists: {err}"))
-                    .ephemeral(true),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    let Some(playlist) = select_by_number(&playlists, playlist_number) else {
-        ctx.send(
-            poise::CreateReply::default()
-                .content("Invalid selection.")
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    };
-
-    let tracks = match ctx
-        .data()
-        .youtube
-        .list_playlist_items(&token, &playlist.id)
-        .await
-    {
+    let tracks = match ctx.data().youtube.list_playlist_items(&playlist).await {
         Ok(tracks) => tracks,
         Err(err) => {
             ctx.send(
@@ -900,14 +481,14 @@ pub async fn playlist_play(
     if tracks.is_empty() {
         ctx.send(
             poise::CreateReply::default()
-                .content(format!("**{}** is empty.", playlist.title))
+                .content("That playlist is empty (or couldn't be found).")
                 .ephemeral(true),
         )
         .await?;
         return Ok(());
     }
 
-    join_and_enqueue_all(ctx, &playlist.title, tracks).await
+    join_and_enqueue_all(ctx, &playlist, tracks).await
 }
 
 /// 1-indexes into `items` by a `u8` selection, returning a clone. `None` for
@@ -1027,36 +608,5 @@ mod tests {
             .collect();
         let options = select_options_json(&many_tracks, 30);
         assert_eq!(options.as_array().unwrap().len(), 25);
-    }
-
-    // ---- playlist_select_menu ----
-
-    fn playlist(id: &str, title: &str, item_count: Option<u32>) -> Playlist {
-        Playlist {
-            id: id.to_string(),
-            title: title.to_string(),
-            item_count,
-        }
-    }
-
-    fn playlist_select_options_json(playlists: &[Playlist], limit: usize) -> serde_json::Value {
-        let row = playlist_select_menu(playlists, limit);
-        let json = serde_json::to_value(&row).expect("action row should serialize");
-        json["components"][0]["options"].clone()
-    }
-
-    #[test]
-    fn playlist_select_menu_option_values_are_playlist_ids() {
-        let playlists = vec![playlist("PL123", "My Mix", Some(12))];
-        let options = playlist_select_options_json(&playlists, 5);
-        assert_eq!(options[0]["value"], "PL123");
-        assert_eq!(options[0]["label"], "My Mix (12 items)");
-    }
-
-    #[test]
-    fn playlist_select_menu_omits_item_count_when_unknown() {
-        let playlists = vec![playlist("PL123", "My Mix", None)];
-        let options = playlist_select_options_json(&playlists, 5);
-        assert_eq!(options[0]["label"], "My Mix");
     }
 }

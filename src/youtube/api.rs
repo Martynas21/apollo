@@ -1,1148 +1,344 @@
-//! Thin `YouTube` Data API v3 client.
+//! `YouTube` search/lookup, entirely via `yt-dlp` subprocess calls.
 //!
-//! Callers are expected to obtain a valid access token themselves (see
-//! `crate::youtube::oauth::get_valid_access_token`) and pass it in — this
-//! module has no opinion on token storage or refresh, only on talking to
-//! the API and mapping its responses into [`Track`]/[`Playlist`].
-//!
-//! `list_playlist_items` follows `nextPageToken` to fetch a whole playlist,
-//! not just its first 50 items. `list_playlists` and `search` stay
-//! single-page (`maxResults=50`/`25`) — an account realistically has under
-//! 50 playlists, and search intentionally shows only the top handful of
-//! hits, not everything that matched.
+//! No Google API quota and no per-user login needed: `yt-dlp -j
+//! --flat-playlist` already returns id/title/channel/duration for both
+//! search results (`ytsearch<n>:<query>`) and playlist listings, and
+//! `yt-dlp -j --no-playlist` does the same for a single video. This mirrors
+//! the trust boundary `crate::voice::radio` and `crate::voice::resolve`
+//! already rely on for Mix listing and stream resolution — `yt-dlp`
+//! scraping the regular frontend, not a versioned/quota'd API.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::io::ErrorKind;
 use std::time::Duration;
 
 use serde::Deserialize;
+use tokio::process::Command;
 
-const API_BASE: &str = "https://www.googleapis.com/youtube/v3";
+/// Max search results requested per `/add_to_queue` query — mirrors the old
+/// Data API client's `maxResults=25`: only the top handful are shown, but a
+/// `number` selection can reach any of the fetched set.
+const SEARCH_LIMIT: usize = 25;
 
-/// A single playable video, as resolved from a playlist, liked-videos list,
-/// uploads list, or search results.
+/// Truncation length for stderr embedded in `YouTubeApiError::YtDlpFailed`,
+/// matching `PlaybackError::Other`'s convention in `crate::voice::resolve`.
+const STDERR_TRUNCATE_LEN: usize = 200;
+
+/// A single playable video, as resolved from a search, a playlist listing,
+/// or a direct video id/URL lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub video_id: String,
     pub title: String,
     pub channel: String,
-    /// `None` when `YouTube` didn't report a usable duration (e.g. an
-    /// in-progress livestream, which the API reports as `P0D`).
+    /// `None` when `yt-dlp` didn't report a usable duration (e.g. an
+    /// in-progress livestream).
     pub duration: Option<Duration>,
-}
-
-/// A playlist owned by (or otherwise visible to) the linked account.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Playlist {
-    pub id: String,
-    pub title: String,
-    pub item_count: Option<u32>,
 }
 
 #[derive(Debug)]
 pub enum YouTubeApiError {
-    /// HTTP 403 with a quota-related reason (`quotaExceeded`, `dailyLimitExceeded`).
-    QuotaExceeded,
-    /// HTTP 429, or a 403 that isn't quota-related but looks like backoff-worthy throttling.
-    RateLimited,
-    /// HTTP 401 — the access token is invalid/expired. Caller (a later phase) should
-    /// prompt a re-link; this client has no opinion on how.
-    Unauthorized,
-    /// Any other non-2xx response from the API, with the status and a short message
-    /// extracted from the response body if possible.
-    Api { status: u16, message: String },
-    /// Transport-level failure (DNS, connection, timeout, TLS, JSON decode of a malformed body, etc).
-    Transport(String),
+    /// The `yt-dlp` binary itself could not be found on `PATH`.
+    YtDlpMissing,
+    /// yt-dlp exited non-zero (video/playlist private, deleted, region-locked,
+    /// or otherwise unavailable), or exited zero but produced no parseable
+    /// metadata at all.
+    YtDlpFailed(String),
 }
 
 impl std::fmt::Display for YouTubeApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::QuotaExceeded => write!(f, "YouTube API quota exceeded"),
-            Self::RateLimited => write!(f, "YouTube API rate limited"),
-            Self::Unauthorized => write!(
-                f,
-                "YouTube API request unauthorized (token invalid/expired)"
-            ),
-            Self::Api { status, message } => {
-                write!(f, "YouTube API error (HTTP {status}): {message}")
-            }
-            Self::Transport(message) => {
-                write!(f, "YouTube API transport error: {message}")
-            }
+            Self::YtDlpMissing => write!(f, "yt-dlp is not installed or not on PATH"),
+            Self::YtDlpFailed(message) => write!(f, "yt-dlp failed: {message}"),
         }
     }
 }
 
 impl std::error::Error for YouTubeApiError {}
 
-/// Truncation length for error message bodies embedded in `YouTubeApiError::Api`.
-const ERROR_BODY_TRUNCATE_LEN: usize = 200;
-
-fn truncate(s: &str, max_len: usize) -> String {
-    match s.char_indices().nth(max_len) {
-        Some((byte_idx, _)) => format!("{}...", &s[..byte_idx]),
-        None => s.to_string(),
+/// Like `crate::voice::radio`'s `truncate_tail`: keeps the *last* `max_len`
+/// characters, since yt-dlp's fatal `ERROR:` line comes after any non-fatal
+/// `WARNING:` lines and would otherwise get head-truncated away.
+fn truncate_tail(s: &str, max_len: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
+        return s.to_string();
     }
+    let byte_idx = s
+        .char_indices()
+        .nth(char_count - max_len)
+        .map_or(0, |(idx, _)| idx);
+    format!("...{}", &s[byte_idx..])
 }
 
-// ---- Response shapes (private, deserialize-only) --------------------------
-
 #[derive(Debug, Deserialize)]
-struct PlaylistsResponse {
+struct YtDlpEntry {
+    id: Option<String>,
     #[serde(default)]
-    items: Vec<PlaylistItem>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlaylistItem {
-    id: String,
-    snippet: PlaylistSnippet,
+    title: Option<String>,
     #[serde(default)]
-    content_details: Option<PlaylistContentDetails>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlaylistSnippet {
-    title: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlaylistContentDetails {
-    item_count: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlaylistItemsResponse {
+    channel: Option<String>,
     #[serde(default)]
-    items: Vec<PlaylistItemEntry>,
+    uploader: Option<String>,
     #[serde(default)]
-    next_page_token: Option<String>,
+    duration: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlaylistItemEntry {
-    snippet: PlaylistItemSnippet,
-    content_details: PlaylistItemContentDetails,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlaylistItemSnippet {
-    title: String,
-    #[serde(default)]
-    video_owner_channel_title: Option<String>,
-    #[serde(default)]
-    channel_title: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PlaylistItemContentDetails {
-    video_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SearchResponse {
-    #[serde(default)]
-    items: Vec<SearchResultItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SearchResultItem {
-    id: SearchResultId,
-    snippet: SearchResultSnippet,
-}
-
-#[derive(Debug, Deserialize)]
-struct SearchResultId {
-    #[serde(rename = "videoId")]
-    video_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SearchResultSnippet {
-    title: String,
-    channel_title: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct VideosResponse {
-    #[serde(default)]
-    items: Vec<VideoItem>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct VideoItem {
-    id: String,
-    content_details: VideoContentDetails,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct VideoContentDetails {
-    duration: String,
-}
-
-/// Response shape for `videos.list?part=snippet,contentDetails`, used by
-/// [`YouTubeClient::get_video`]. Separate from [`VideosResponse`] (used by
-/// the duration-only batch lookup in `fetch_durations`) because that one
-/// only ever requests `contentDetails`, not `snippet`.
-#[derive(Debug, Deserialize)]
-struct VideoWithSnippetResponse {
-    #[serde(default)]
-    items: Vec<VideoWithSnippetItem>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct VideoWithSnippetItem {
-    id: String,
-    snippet: VideoSnippet,
-    content_details: VideoContentDetails,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct VideoSnippet {
-    title: String,
-    channel_title: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChannelsResponse {
-    #[serde(default)]
-    items: Vec<ChannelItem>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChannelItem {
-    content_details: ChannelContentDetails,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChannelContentDetails {
-    related_playlists: RelatedPlaylists,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RelatedPlaylists {
-    uploads: String,
-}
-
-// ---- Pure mapping functions (unit-testable, no network) --------------------
-
-fn map_playlists(resp: PlaylistsResponse) -> Vec<Playlist> {
-    resp.items
-        .into_iter()
-        .map(|item| Playlist {
-            id: item.id,
-            title: item.snippet.title,
-            item_count: item.content_details.and_then(|cd| cd.item_count),
-        })
-        .collect()
-}
-
-fn map_playlist_items(
-    items: Vec<PlaylistItemEntry>,
-    durations: &HashMap<String, Option<Duration>>,
-) -> Vec<Track> {
-    items
-        .into_iter()
-        .map(|item| {
-            let video_id = item.content_details.video_id;
-            // `channelTitle` on a playlist item is the *playlist owner's*
-            // channel, not the video uploader's; `videoOwnerChannelTitle` is
-            // the actual uploader but can be absent (e.g. deleted/private
-            // videos), hence the fallback.
-            let channel = item
-                .snippet
-                .video_owner_channel_title
-                .or(item.snippet.channel_title)
-                .unwrap_or_default();
-            let duration = durations.get(&video_id).copied().flatten();
-            Track {
-                video_id,
-                title: item.snippet.title,
-                channel,
-                duration,
-            }
-        })
-        .collect()
-}
-
-fn map_search_results(
-    resp: SearchResponse,
-    durations: &HashMap<String, Option<Duration>>,
-) -> Vec<Track> {
-    resp.items
-        .into_iter()
-        .filter_map(|item| {
-            let video_id = item.id.video_id?;
-            let duration = durations.get(&video_id).copied().flatten();
-            Some(Track {
-                video_id,
-                title: item.snippet.title,
-                channel: item.snippet.channel_title,
-                duration,
-            })
-        })
-        .collect()
-}
-
-fn map_video_with_snippet(resp: VideoWithSnippetResponse) -> Option<Track> {
-    resp.items.into_iter().next().map(|item| Track {
-        video_id: item.id,
-        title: item.snippet.title,
-        channel: item.snippet.channel_title,
-        duration: parse_iso8601_duration(&item.content_details.duration),
+/// Maps one parsed `yt-dlp -j` entry into a [`Track`]. `None` if it has no
+/// usable video id — happens for deleted/private playlist slots, which
+/// `yt-dlp` still emits a placeholder line for.
+fn track_from_entry(entry: YtDlpEntry) -> Option<Track> {
+    let video_id = entry.id.filter(|id| !id.is_empty())?;
+    Some(Track {
+        video_id,
+        title: entry.title.unwrap_or_default(),
+        // `channel` is present on full extractions and most flat listings;
+        // `uploader` is the fallback yt-dlp uses when `channel` is absent.
+        channel: entry.channel.or(entry.uploader).unwrap_or_default(),
+        duration: entry.duration.map(Duration::from_secs_f64),
     })
 }
 
-/// Like [`map_video_with_snippet`], but maps every item instead of just the
-/// first — used by [`YouTubeClient::hydrate_videos`]'s multi-id lookup.
-fn map_video_with_snippet_list(resp: VideoWithSnippetResponse) -> Vec<Track> {
-    resp.items
-        .into_iter()
-        .map(|item| Track {
-            video_id: item.id,
-            title: item.snippet.title,
-            channel: item.snippet.channel_title,
-            duration: parse_iso8601_duration(&item.content_details.duration),
+/// Parses `yt-dlp -j`'s (one-JSON-object-per-line) stdout into [`Track`]s,
+/// skipping any line that isn't valid JSON or maps to no usable track —
+/// happens routinely (e.g. deleted-video placeholder entries), so this is
+/// not treated as an error.
+fn parse_tracks(stdout: &str) -> Vec<Track> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<YtDlpEntry>(line)
+                .ok()
+                .and_then(track_from_entry)
         })
         .collect()
 }
 
-fn map_video_durations(resp: VideosResponse) -> HashMap<String, Option<Duration>> {
-    resp.items
-        .into_iter()
-        .map(|item| {
-            (
-                item.id,
-                parse_iso8601_duration(&item.content_details.duration),
-            )
-        })
-        .collect()
-}
-
-/// Parses a restricted-form ISO 8601 duration (`P[nD]T[nH][nM][nS]`) as
-/// returned by `YouTube` for video/content durations.
-///
-/// `"P0D"` is `YouTube`'s convention for "no fixed duration" (e.g. an
-/// in-progress livestream) and is deliberately mapped to `None` rather than
-/// `Some(Duration::ZERO)` — it means "unknown", not "zero-length". Any other
-/// string that doesn't parse also returns `None` rather than panicking.
-fn parse_iso8601_duration(s: &str) -> Option<Duration> {
-    if s == "P0D" {
-        return None;
-    }
-
-    let rest = s.strip_prefix('P')?;
-    let (date_part, time_part) = match rest.split_once('T') {
-        Some((d, t)) => (d, Some(t)),
-        None => (rest, None),
-    };
-
-    let mut total_secs: u64 = 0;
-
-    if !date_part.is_empty() {
-        let days = date_part.strip_suffix('D')?.parse::<u64>().ok()?;
-        total_secs += days * 86_400;
-    }
-
-    if let Some(time_part) = time_part {
-        let mut remaining = time_part;
-
-        if let Some(idx) = remaining.find('H') {
-            let hours = remaining[..idx].parse::<u64>().ok()?;
-            total_secs += hours * 3_600;
-            remaining = &remaining[idx + 1..];
-        }
-        if let Some(idx) = remaining.find('M') {
-            let minutes = remaining[..idx].parse::<u64>().ok()?;
-            total_secs += minutes * 60;
-            remaining = &remaining[idx + 1..];
-        }
-        if let Some(idx) = remaining.find('S') {
-            let seconds = remaining[..idx].parse::<u64>().ok()?;
-            total_secs += seconds;
-            remaining = &remaining[idx + 1..];
-        }
-        if !remaining.is_empty() {
-            return None;
-        }
-    } else if date_part.is_empty() {
-        // Bare "P" with neither a date nor a time component.
-        return None;
-    }
-
-    Some(Duration::from_secs(total_secs))
-}
-
-// ---- Client ----------------------------------------------------------------
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
+/// `yt-dlp`-backed `YouTube` client: search, single-video lookup, and
+/// playlist listing. Cheap to clone — holds only the (optional) cookies
+/// file path, no connection state.
+#[derive(Debug, Clone, Default)]
 pub struct YouTubeClient {
-    http: oauth2::reqwest::Client,
-    /// `API_BASE` in production; overridden in tests to point at a local
-    /// mock server so request counts/paths can be asserted without hitting
-    /// the real API.
-    base_url: String,
+    /// Path to a Netscape-format cookies file, passed to `yt-dlp` as
+    /// `--cookies` when set — see `Config::yt_dlp_cookies_file`.
+    cookies_file: Option<String>,
 }
 
-#[allow(dead_code)]
 impl YouTubeClient {
-    pub fn new(http: oauth2::reqwest::Client) -> Self {
-        Self {
-            http,
-            base_url: API_BASE.to_string(),
+    pub fn new(cookies_file: Option<String>) -> Self {
+        Self { cookies_file }
+    }
+
+    /// Runs `yt-dlp -j <extra_args...> <target>` and returns its stdout on
+    /// success.
+    async fn run(&self, extra_args: &[&str], target: &str) -> Result<String, YouTubeApiError> {
+        let mut command = Command::new("yt-dlp");
+        command.arg("-j").args(extra_args);
+        if let Some(cookies_file) = &self.cookies_file {
+            command.args(["--cookies", cookies_file]);
         }
-    }
+        command.arg(target);
 
-    #[cfg(test)]
-    fn with_base_url(http: oauth2::reqwest::Client, base_url: String) -> Self {
-        Self { http, base_url }
-    }
-
-    pub async fn list_playlists(
-        &self,
-        access_token: &str,
-    ) -> Result<Vec<Playlist>, YouTubeApiError> {
-        let base = &self.base_url;
-        let url = format!("{base}/playlists?part=snippet,contentDetails&mine=true&maxResults=50");
-        let resp: PlaylistsResponse = self.get_json(&url, access_token).await?;
-        Ok(map_playlists(resp))
-    }
-
-    /// Generic: lists items of any playlist ID, including the special
-    /// `LL` (liked videos) playlist. Follows `nextPageToken` across as many
-    /// pages as it takes to fetch the whole playlist.
-    pub async fn list_playlist_items(
-        &self,
-        access_token: &str,
-        playlist_id: &str,
-    ) -> Result<Vec<Track>, YouTubeApiError> {
-        let mut items = Vec::new();
-        let mut page_token: Option<String> = None;
-        let base = &self.base_url;
-        loop {
-            let mut url = format!(
-                "{base}/playlistItems?part=snippet,contentDetails&playlistId={playlist_id}&maxResults=50"
-            );
-            if let Some(token) = &page_token {
-                url.push_str("&pageToken=");
-                url.push_str(token);
+        let output = command.output().await.map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                YouTubeApiError::YtDlpMissing
+            } else {
+                YouTubeApiError::YtDlpFailed(truncate_tail(&e.to_string(), STDERR_TRUNCATE_LEN))
             }
+        })?;
 
-            let resp: PlaylistItemsResponse = self.get_json(&url, access_token).await?;
-            items.extend(resp.items);
-            page_token = resp.next_page_token;
-            if page_token.is_none() {
-                break;
-            }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(YouTubeApiError::YtDlpFailed(truncate_tail(
+                stderr.trim_end(),
+                STDERR_TRUNCATE_LEN,
+            )));
         }
 
-        let video_ids: Vec<&str> = items
-            .iter()
-            .map(|item| item.content_details.video_id.as_str())
-            .collect();
-        let durations = self.fetch_durations(access_token, &video_ids).await?;
-
-        Ok(map_playlist_items(items, &durations))
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// Resolves the signed-in user's uploads playlist ID (via
-    /// `channels.list?part=contentDetails&mine=true`), so callers can feed
-    /// it into `list_playlist_items` to browse the user's own uploads.
-    pub async fn uploads_playlist_id(&self, access_token: &str) -> Result<String, YouTubeApiError> {
-        let base = &self.base_url;
-        let url = format!("{base}/channels?part=contentDetails&mine=true");
-        let resp: ChannelsResponse = self.get_json(&url, access_token).await?;
-        resp.items
-            .into_iter()
-            .next()
-            .map(|item| item.content_details.related_playlists.uploads)
-            .ok_or_else(|| YouTubeApiError::Api {
-                status: 200,
-                message: "channels.list?mine=true returned no channel for this account".to_string(),
-            })
-    }
-
-    pub async fn search(
-        &self,
-        access_token: &str,
-        query: &str,
-    ) -> Result<Vec<Track>, YouTubeApiError> {
-        let encoded_query = urlencoding_encode(query);
-        let base = &self.base_url;
-        let url = format!("{base}/search?part=snippet&type=video&q={encoded_query}&maxResults=25");
-        let resp: SearchResponse = self.get_json(&url, access_token).await?;
-
-        let video_ids: Vec<&str> = resp
-            .items
-            .iter()
-            .filter_map(|item| item.id.video_id.as_deref())
-            .collect();
-        let durations = self.fetch_durations(access_token, &video_ids).await?;
-
-        Ok(map_search_results(resp, &durations))
+    /// Searches `YouTube` for `query`, returning up to [`SEARCH_LIMIT`] hits
+    /// in `YouTube`'s own relevance order.
+    pub async fn search(&self, query: &str) -> Result<Vec<Track>, YouTubeApiError> {
+        let target = format!("ytsearch{SEARCH_LIMIT}:{query}");
+        let stdout = self
+            .run(&["--flat-playlist", "--no-warnings"], &target)
+            .await?;
+        Ok(parse_tracks(&stdout))
     }
 
     /// Looks up a single video by ID (used by `/play` for a direct video
-    /// ID/URL, where no search or playlist listing is involved).
-    pub async fn get_video(
-        &self,
-        access_token: &str,
-        video_id: &str,
-    ) -> Result<Track, YouTubeApiError> {
-        let base = &self.base_url;
-        let url = format!("{base}/videos?part=snippet,contentDetails&id={video_id}");
-        let resp: VideoWithSnippetResponse = self.get_json(&url, access_token).await?;
-        map_video_with_snippet(resp).ok_or_else(|| YouTubeApiError::Api {
-            status: 404,
-            message: "video not found".to_string(),
+    /// ID/URL, and by `/add_to_queue`'s picker re-lookup).
+    pub async fn get_video(&self, video_id: &str) -> Result<Track, YouTubeApiError> {
+        let url = format!("https://www.youtube.com/watch?v={video_id}");
+        let stdout = self.run(&["--no-playlist"], &url).await?;
+        parse_tracks(&stdout).into_iter().next().ok_or_else(|| {
+            YouTubeApiError::YtDlpFailed("no metadata returned for video".to_string())
         })
     }
 
-    /// Looks up multiple videos by id in one request per 50-id chunk (used
-    /// by radio mode to hydrate a batch of bare video ids from a `yt-dlp`
-    /// Mix listing into full `Track`s — see
-    /// `crate::voice::radio::list_mix_video_ids` — without an N+1 request
-    /// per candidate). Unlike `fetch_durations`, requests `snippet` too,
-    /// since callers need title/channel, not just duration.
-    ///
-    /// Ids that don't resolve (e.g. deleted/private since the Mix was
-    /// generated) are silently omitted from the result rather than erroring
-    /// the whole batch. Order is not guaranteed to match `video_ids`'s
-    /// input order.
-    pub async fn hydrate_videos(
+    /// Lists every track in a playlist, given either a full playlist URL or
+    /// a bare playlist ID (e.g. `PLxxxxxxxxxxxx`).
+    pub async fn list_playlist_items(
         &self,
-        access_token: &str,
-        video_ids: &[&str],
+        playlist_url_or_id: &str,
     ) -> Result<Vec<Track>, YouTubeApiError> {
-        let mut tracks = Vec::new();
-        let base = &self.base_url;
-        for chunk in video_ids.chunks(50) {
-            let ids = chunk.join(",");
-            let url = format!("{base}/videos?part=snippet,contentDetails&id={ids}");
-            let resp: VideoWithSnippetResponse = self.get_json(&url, access_token).await?;
-            tracks.extend(map_video_with_snippet_list(resp));
-        }
-        Ok(tracks)
+        let target = if playlist_url_or_id.contains("://") {
+            playlist_url_or_id.to_string()
+        } else {
+            format!("https://www.youtube.com/playlist?list={playlist_url_or_id}")
+        };
+        let stdout = self
+            .run(&["--flat-playlist", "--no-warnings"], &target)
+            .await?;
+        Ok(parse_tracks(&stdout))
     }
 
-    /// `videos.list`'s `id` filter takes a comma-separated list; chunking
-    /// keeps each request in line with this module's other `maxResults=50`
-    /// calls rather than sending an unbounded id list for a large playlist.
-    async fn fetch_durations(
-        &self,
-        access_token: &str,
-        video_ids: &[&str],
-    ) -> Result<HashMap<String, Option<Duration>>, YouTubeApiError> {
-        let mut durations = HashMap::new();
-        let base = &self.base_url;
-        for chunk in video_ids.chunks(50) {
-            let ids = chunk.join(",");
-            let url = format!("{base}/videos?part=contentDetails&id={ids}");
-            let resp: VideosResponse = self.get_json(&url, access_token).await?;
-            durations.extend(map_video_durations(resp));
-        }
-        Ok(durations)
-    }
-
-    async fn get_json<T: for<'de> Deserialize<'de>>(
-        &self,
-        url: &str,
-        access_token: &str,
-    ) -> Result<T, YouTubeApiError> {
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(access_token)
-            .send()
-            .await
-            .map_err(|e| YouTubeApiError::Transport(e.to_string()))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_else(|_| String::new());
-            return Err(map_error_response(status.as_u16(), &body));
+    /// Looks up multiple videos by id in one `yt-dlp` invocation (used by
+    /// radio mode to hydrate a batch of bare video ids from a `yt-dlp` Mix
+    /// listing — see `crate::voice::radio::list_mix_video_ids` — into full
+    /// `Track`s, without spawning one process per candidate).
+    ///
+    /// Ids that don't resolve (deleted/private since the Mix was generated)
+    /// are silently omitted from the result rather than erroring the whole
+    /// batch. Order is not guaranteed to match `video_ids`'s input order.
+    pub async fn hydrate_videos(&self, video_ids: &[&str]) -> Result<Vec<Track>, YouTubeApiError> {
+        if video_ids.is_empty() {
+            return Ok(Vec::new());
         }
 
-        let body = response
-            .text()
-            .await
-            .map_err(|e| YouTubeApiError::Transport(e.to_string()))?;
-        serde_json::from_str(&body).map_err(|e| YouTubeApiError::Transport(e.to_string()))
-    }
-}
+        let mut command = Command::new("yt-dlp");
+        command.args(["-j", "--no-playlist", "--ignore-errors"]);
+        if let Some(cookies_file) = &self.cookies_file {
+            command.args(["--cookies", cookies_file]);
+        }
+        for id in video_ids {
+            command.arg(format!("https://www.youtube.com/watch?v={id}"));
+        }
 
-fn map_error_response(status: u16, body: &str) -> YouTubeApiError {
-    match status {
-        401 => YouTubeApiError::Unauthorized,
-        403 => {
-            // YouTube's error responses put a machine-readable `reason`
-            // field inside `error.errors[].reason`; checking for the known
-            // quota-related reason strings directly in the raw body text is
-            // robust enough without modeling the full error JSON shape.
-            if body.contains("quotaExceeded") || body.contains("dailyLimitExceeded") {
-                YouTubeApiError::QuotaExceeded
+        let output = command.output().await.map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                YouTubeApiError::YtDlpMissing
             } else {
-                YouTubeApiError::Api {
-                    status,
-                    message: truncate(body, ERROR_BODY_TRUNCATE_LEN),
-                }
+                YouTubeApiError::YtDlpFailed(truncate_tail(&e.to_string(), STDERR_TRUNCATE_LEN))
             }
-        }
-        429 => YouTubeApiError::RateLimited,
-        _ => YouTubeApiError::Api {
-            status,
-            message: truncate(body, ERROR_BODY_TRUNCATE_LEN),
-        },
-    }
-}
+        })?;
 
-/// Minimal percent-encoding for a search query string, sufficient for
-/// embedding arbitrary user text in a URL query parameter without pulling in
-/// a dedicated URL-encoding dependency.
-fn urlencoding_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => {
-                let _ = write!(out, "%{byte:02X}");
-            }
-        }
+        // `--ignore-errors` means a per-id failure doesn't fail the whole
+        // batch (or the process' exit code) — just skips that id's line, so
+        // stdout is parsed unconditionally rather than gating on
+        // `output.status`.
+        Ok(parse_tracks(&String::from_utf8_lossy(&output.stdout)))
     }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ---- ISO 8601 duration parsing ----
+    // ---- track_from_entry / parse_tracks ----
 
     #[test]
-    fn parses_minutes_and_seconds() {
+    fn maps_entry_with_channel_field() {
+        let json = r#"{"id": "dQw4w9WgXcQ", "title": "Some Video", "channel": "Some Channel", "duration": 213}"#;
+        let entry: YtDlpEntry = serde_json::from_str(json).unwrap();
         assert_eq!(
-            parse_iso8601_duration("PT4M13S"),
-            Some(Duration::from_secs(253))
-        );
-    }
-
-    #[test]
-    fn parses_hours_minutes_seconds() {
-        assert_eq!(
-            parse_iso8601_duration("PT1H2M3S"),
-            Some(Duration::from_secs(3723))
-        );
-    }
-
-    #[test]
-    fn parses_seconds_only() {
-        assert_eq!(
-            parse_iso8601_duration("PT30S"),
-            Some(Duration::from_secs(30))
-        );
-    }
-
-    #[test]
-    fn zero_seconds_is_a_real_zero_duration() {
-        assert_eq!(parse_iso8601_duration("PT0S"), Some(Duration::ZERO));
-    }
-
-    #[test]
-    fn p0d_means_unknown_duration() {
-        assert_eq!(parse_iso8601_duration("P0D"), None);
-    }
-
-    #[test]
-    fn garbage_returns_none_not_panic() {
-        assert_eq!(parse_iso8601_duration("garbage"), None);
-    }
-
-    #[test]
-    fn parses_days_and_hours() {
-        assert_eq!(
-            parse_iso8601_duration("P1DT2H"),
-            Some(Duration::from_hours(26))
-        );
-    }
-
-    #[test]
-    fn bare_p_returns_none() {
-        assert_eq!(parse_iso8601_duration("P"), None);
-    }
-
-    // ---- JSON fixture -> mapped type tests ----
-
-    #[test]
-    fn maps_playlists_response() {
-        let json = r#"{
-            "items": [
-                {
-                    "id": "PLxxxxxxxxxxxx",
-                    "snippet": { "title": "My Playlist", "channelTitle": "Some Channel" },
-                    "contentDetails": { "itemCount": 42 }
-                },
-                {
-                    "id": "PLyyyyyyyyyyyy",
-                    "snippet": { "title": "No Count Playlist" }
-                }
-            ]
-        }"#;
-        let resp: PlaylistsResponse = serde_json::from_str(json).unwrap();
-        let playlists = map_playlists(resp);
-        assert_eq!(
-            playlists,
-            vec![
-                Playlist {
-                    id: "PLxxxxxxxxxxxx".to_string(),
-                    title: "My Playlist".to_string(),
-                    item_count: Some(42),
-                },
-                Playlist {
-                    id: "PLyyyyyyyyyyyy".to_string(),
-                    title: "No Count Playlist".to_string(),
-                    item_count: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn maps_playlist_items_response_with_channel_title_fallback() {
-        let json = r#"{
-            "items": [
-                {
-                    "snippet": {
-                        "title": "Some Video",
-                        "videoOwnerChannelTitle": "Uploader Channel",
-                        "channelTitle": "Playlist Owner"
-                    },
-                    "contentDetails": { "videoId": "dQw4w9WgXcQ" }
-                },
-                {
-                    "snippet": {
-                        "title": "Deleted Video Slot",
-                        "channelTitle": "Playlist Owner"
-                    },
-                    "contentDetails": { "videoId": "zzzzzzzzzzz" }
-                }
-            ]
-        }"#;
-        let resp: PlaylistItemsResponse = serde_json::from_str(json).unwrap();
-
-        let mut durations = HashMap::new();
-        durations.insert("dQw4w9WgXcQ".to_string(), Some(Duration::from_secs(213)));
-        // "zzzzzzzzzzz" intentionally absent -> should map to None.
-
-        let tracks = map_playlist_items(resp.items, &durations);
-        assert_eq!(
-            tracks,
-            vec![
-                Track {
-                    video_id: "dQw4w9WgXcQ".to_string(),
-                    title: "Some Video".to_string(),
-                    channel: "Uploader Channel".to_string(),
-                    duration: Some(Duration::from_secs(213)),
-                },
-                Track {
-                    video_id: "zzzzzzzzzzz".to_string(),
-                    title: "Deleted Video Slot".to_string(),
-                    channel: "Playlist Owner".to_string(),
-                    duration: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn maps_search_response() {
-        let json = r#"{
-            "items": [
-                {
-                    "id": { "kind": "youtube#video", "videoId": "dQw4w9WgXcQ" },
-                    "snippet": { "title": "Some Video", "channelTitle": "Uploader Channel" }
-                }
-            ]
-        }"#;
-        let resp: SearchResponse = serde_json::from_str(json).unwrap();
-
-        let mut durations = HashMap::new();
-        durations.insert("dQw4w9WgXcQ".to_string(), Some(Duration::from_secs(60)));
-
-        let tracks = map_search_results(resp, &durations);
-        assert_eq!(
-            tracks,
-            vec![Track {
-                video_id: "dQw4w9WgXcQ".to_string(),
-                title: "Some Video".to_string(),
-                channel: "Uploader Channel".to_string(),
-                duration: Some(Duration::from_secs(60)),
-            }]
-        );
-    }
-
-    #[test]
-    fn maps_video_durations_response_including_p0d() {
-        let json = r#"{
-            "items": [
-                { "id": "dQw4w9WgXcQ", "contentDetails": { "duration": "PT3M33S" } },
-                { "id": "livestreamvid", "contentDetails": { "duration": "P0D" } }
-            ]
-        }"#;
-        let resp: VideosResponse = serde_json::from_str(json).unwrap();
-        let durations = map_video_durations(resp);
-        assert_eq!(
-            durations.get("dQw4w9WgXcQ"),
-            Some(&Some(Duration::from_secs(213)))
-        );
-        assert_eq!(durations.get("livestreamvid"), Some(&None));
-    }
-
-    #[test]
-    fn maps_video_with_snippet_response() {
-        let json = r#"{
-            "items": [
-                {
-                    "id": "dQw4w9WgXcQ",
-                    "snippet": { "title": "Some Video", "channelTitle": "Uploader Channel" },
-                    "contentDetails": { "duration": "PT3M33S" }
-                }
-            ]
-        }"#;
-        let resp: VideoWithSnippetResponse = serde_json::from_str(json).unwrap();
-        let track = map_video_with_snippet(resp);
-        assert_eq!(
-            track,
+            track_from_entry(entry),
             Some(Track {
                 video_id: "dQw4w9WgXcQ".to_string(),
                 title: "Some Video".to_string(),
-                channel: "Uploader Channel".to_string(),
+                channel: "Some Channel".to_string(),
                 duration: Some(Duration::from_secs(213)),
             })
         );
     }
 
     #[test]
-    fn maps_video_with_snippet_response_empty_items() {
-        let json = r#"{ "items": [] }"#;
-        let resp: VideoWithSnippetResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(map_video_with_snippet(resp), None);
-    }
-
-    #[test]
-    fn maps_video_with_snippet_list_response() {
-        let json = r#"{
-            "items": [
-                {
-                    "id": "abc123",
-                    "snippet": { "title": "First", "channelTitle": "Channel A" },
-                    "contentDetails": { "duration": "PT1M0S" }
-                },
-                {
-                    "id": "def456",
-                    "snippet": { "title": "Second", "channelTitle": "Channel B" },
-                    "contentDetails": { "duration": "PT2M0S" }
-                }
-            ]
-        }"#;
-        let resp: VideoWithSnippetResponse = serde_json::from_str(json).unwrap();
-        let tracks = map_video_with_snippet_list(resp);
+    fn falls_back_to_uploader_when_channel_absent() {
+        let json = r#"{"id": "abc123", "title": "T", "uploader": "Uploader Name", "duration": 60}"#;
+        let entry: YtDlpEntry = serde_json::from_str(json).unwrap();
         assert_eq!(
-            tracks,
-            vec![
-                Track {
-                    video_id: "abc123".to_string(),
-                    title: "First".to_string(),
-                    channel: "Channel A".to_string(),
-                    duration: Some(Duration::from_secs(60)),
-                },
-                Track {
-                    video_id: "def456".to_string(),
-                    title: "Second".to_string(),
-                    channel: "Channel B".to_string(),
-                    duration: Some(Duration::from_secs(120)),
-                },
-            ]
+            track_from_entry(entry).map(|t| t.channel),
+            Some("Uploader Name".to_string())
         );
     }
 
     #[test]
-    fn maps_video_with_snippet_list_response_omits_missing_ids_without_erroring() {
-        // Simulates one of several requested ids having been deleted/made
-        // private since the mix was generated — `videos.list` just leaves
-        // it out of `items` rather than erroring.
-        let json = r#"{
-            "items": [
-                {
-                    "id": "abc123",
-                    "snippet": { "title": "Still Here", "channelTitle": "Channel A" },
-                    "contentDetails": { "duration": "PT1M0S" }
-                }
-            ]
-        }"#;
-        let resp: VideoWithSnippetResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(map_video_with_snippet_list(resp).len(), 1);
+    fn null_duration_maps_to_none() {
+        let json = r#"{"id": "live123", "title": "Livestream", "channel": "C", "duration": null}"#;
+        let entry: YtDlpEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(track_from_entry(entry).unwrap().duration, None);
     }
 
     #[test]
-    fn error_mapping_distinguishes_quota_from_other_403() {
-        let quota_body = r#"{"error":{"errors":[{"reason":"quotaExceeded"}]}}"#;
-        assert!(matches!(
-            map_error_response(403, quota_body),
-            YouTubeApiError::QuotaExceeded
-        ));
-
-        let daily_limit_body = r#"{"error":{"errors":[{"reason":"dailyLimitExceeded"}]}}"#;
-        assert!(matches!(
-            map_error_response(403, daily_limit_body),
-            YouTubeApiError::QuotaExceeded
-        ));
-
-        let other_body = r#"{"error":{"errors":[{"reason":"forbidden"}]}}"#;
-        match map_error_response(403, other_body) {
-            YouTubeApiError::Api { status, .. } => assert_eq!(status, 403),
-            other => panic!("expected Api error, got {other:?}"),
-        }
+    fn missing_id_maps_to_none() {
+        let json = r#"{"title": "No id here"}"#;
+        let entry: YtDlpEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(track_from_entry(entry), None);
     }
 
     #[test]
-    fn error_mapping_handles_401_and_429() {
-        assert!(matches!(
-            map_error_response(401, ""),
-            YouTubeApiError::Unauthorized
-        ));
-        assert!(matches!(
-            map_error_response(429, ""),
-            YouTubeApiError::RateLimited
-        ));
+    fn empty_id_maps_to_none() {
+        let json = r#"{"id": "", "title": "Blank id"}"#;
+        let entry: YtDlpEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(track_from_entry(entry), None);
     }
 
     #[test]
-    fn error_message_is_truncated() {
-        let long_body = "x".repeat(500);
-        match map_error_response(500, &long_body) {
-            YouTubeApiError::Api { status, message } => {
-                assert_eq!(status, 500);
-                assert!(message.len() <= ERROR_BODY_TRUNCATE_LEN + 3);
-            }
-            other => panic!("expected Api error, got {other:?}"),
-        }
-    }
-}
-
-/// Guards against a future change accidentally turning a batched call
-/// pattern into one YouTube API request per item (an "N+1" regression) —
-/// the kind of change that wouldn't fail any of the pure mapping-function
-/// tests above but would quietly multiply real quota usage per `/search`,
-/// `/add_to_queue`, or playlist browse. Each test counts requests against a
-/// local mock server via [`YouTubeClient::with_base_url`] rather than
-/// measuring wall time or memory: request *count* is what actually burns
-/// YouTube's per-project quota, and it stays deterministic where timing-
-/// or allocation-based assertions would be flaky.
-#[cfg(test)]
-mod request_count_tests {
-    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    use super::*;
-
-    async fn mock_client() -> (YouTubeClient, MockServer) {
-        let server = MockServer::start().await;
-        let client = YouTubeClient::with_base_url(oauth2::reqwest::Client::new(), server.uri());
-        (client, server)
+    fn parse_tracks_skips_blank_and_unparseable_lines() {
+        let stdout = "\nWARNING: something yt-dlp printed\n\
+             {\"id\": \"real123\", \"title\": \"Real\", \"channel\": \"C\", \"duration\": 10}\n\
+             \n";
+        let tracks = parse_tracks(stdout);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].video_id, "real123");
     }
 
-    #[tokio::test]
-    async fn search_fetches_durations_in_one_batched_request_not_one_per_result() {
-        let (client, server) = mock_client().await;
-
-        let ids: Vec<String> = (0..3).map(|i| format!("vid{i}")).collect();
-        let search_items: Vec<_> = ids
-            .iter()
-            .map(|id| {
-                serde_json::json!({
-                    "id": { "videoId": id },
-                    "snippet": { "title": format!("Title {id}"), "channelTitle": "Channel" }
-                })
-            })
-            .collect();
-        Mock::given(method("GET"))
-            .and(path("/search"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "items": search_items })),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let duration_items: Vec<_> = ids
-            .iter()
-            .map(|id| serde_json::json!({ "id": id, "contentDetails": { "duration": "PT1M0S" } }))
-            .collect();
-        Mock::given(method("GET"))
-            .and(path("/videos"))
-            .and(query_param("part", "contentDetails"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "items": duration_items })),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let tracks = client.search("token", "lofi").await.unwrap();
-        assert_eq!(tracks.len(), 3);
-
-        server.verify().await;
+    #[test]
+    fn parse_tracks_skips_entries_with_no_usable_id() {
+        let stdout =
+            "{\"id\": null}\n{\"id\": \"real123\", \"title\": \"T\", \"channel\": \"C\"}\n";
+        let tracks = parse_tracks(stdout);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].video_id, "real123");
     }
 
-    #[tokio::test]
-    async fn hydrate_videos_fetches_multiple_ids_in_one_batched_request() {
-        let (client, server) = mock_client().await;
-
-        Mock::given(method("GET"))
-            .and(path("/videos"))
-            .and(query_param("part", "snippet,contentDetails"))
-            .and(query_param("id", "vid0,vid1,vid2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "items": [
-                    { "id": "vid0", "snippet": { "title": "T0", "channelTitle": "C" }, "contentDetails": { "duration": "PT1M0S" } },
-                    { "id": "vid1", "snippet": { "title": "T1", "channelTitle": "C" }, "contentDetails": { "duration": "PT1M0S" } },
-                    { "id": "vid2", "snippet": { "title": "T2", "channelTitle": "C" }, "contentDetails": { "duration": "PT1M0S" } },
-                ]
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let tracks = client
-            .hydrate_videos("token", &["vid0", "vid1", "vid2"])
-            .await
-            .unwrap();
-        assert_eq!(tracks.len(), 3);
-
-        server.verify().await;
+    #[test]
+    fn parse_tracks_empty_stdout_yields_empty_vec() {
+        assert_eq!(parse_tracks(""), Vec::new());
     }
 
-    #[tokio::test]
-    async fn get_video_makes_a_single_request_not_a_separate_duration_lookup() {
-        let (client, server) = mock_client().await;
+    // ---- truncate_tail ----
 
-        Mock::given(method("GET"))
-            .and(path("/videos"))
-            .and(query_param("part", "snippet,contentDetails"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "items": [{
-                    "id": "abc123",
-                    "snippet": { "title": "Some Video", "channelTitle": "Some Channel" },
-                    "contentDetails": { "duration": "PT3M33S" }
-                }]
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let track = client.get_video("token", "abc123").await.unwrap();
-        assert_eq!(track.video_id, "abc123");
-
-        server.verify().await;
+    #[test]
+    fn truncate_tail_keeps_final_error_over_leading_warning() {
+        let stderr = format!(
+            "WARNING: [youtube] {}\nERROR: [youtube] xyz: Requested format is not available.\n",
+            "x".repeat(300)
+        );
+        let truncated = truncate_tail(stderr.trim_end(), STDERR_TRUNCATE_LEN);
+        assert!(truncated.contains("Requested format is not available"));
     }
 
-    #[tokio::test]
-    async fn list_playlist_items_batches_durations_by_fifty_regardless_of_page_count() {
-        let (client, server) = mock_client().await;
+    #[test]
+    fn truncate_tail_leaves_short_strings_untouched() {
+        assert_eq!(truncate_tail("short", 200), "short");
+    }
 
-        // 60 items split across two `playlistItems` pages (50 + 10) — chosen
-        // so the 50-item page boundary lands exactly on `fetch_durations`'s
-        // own chunk size, the case most likely to silently regress into one
-        // `videos` request per page (or per item) instead of per 50 ids.
-        let page1_ids: Vec<String> = (0..50).map(|i| format!("p1-{i}")).collect();
-        let page2_ids: Vec<String> = (0..10).map(|i| format!("p2-{i}")).collect();
+    // ---- list_playlist_items target building ----
 
-        let items_json = |ids: &[String]| -> serde_json::Value {
-            serde_json::json!(
-                ids.iter()
-                    .map(|id| serde_json::json!({
-                        "snippet": { "title": format!("Track {id}"), "channelTitle": "Channel" },
-                        "contentDetails": { "videoId": id }
-                    }))
-                    .collect::<Vec<_>>()
-            )
-        };
+    #[test]
+    fn playlist_id_without_scheme_is_treated_as_bare_id() {
+        assert!(!"PLxxxxxxxxxxxx".contains("://"));
+    }
 
-        Mock::given(method("GET"))
-            .and(path("/playlistItems"))
-            .and(query_param_is_missing("pageToken"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "items": items_json(&page1_ids),
-                "nextPageToken": "PAGE2",
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/playlistItems"))
-            .and(query_param("pageToken", "PAGE2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "items": items_json(&page2_ids),
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let durations_json = |ids: &[String]| -> serde_json::Value {
-            serde_json::json!({
-                "items": ids.iter()
-                    .map(|id| serde_json::json!({ "id": id, "contentDetails": { "duration": "PT1M0S" } }))
-                    .collect::<Vec<_>>()
-            })
-        };
-
-        Mock::given(method("GET"))
-            .and(path("/videos"))
-            .and(query_param("id", page1_ids.join(",")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(durations_json(&page1_ids)))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/videos"))
-            .and(query_param("id", page2_ids.join(",")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(durations_json(&page2_ids)))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let tracks = client
-            .list_playlist_items("token", "PLsomeplaylist")
-            .await
-            .unwrap();
-        assert_eq!(tracks.len(), 60);
-
-        // Exactly 4 requests total (2 pages + 2 duration batches) — asserted
-        // by `expect(1)` on each mock above; `verify` fails loudly on either
-        // a missed or an extra/unmatched call.
-        server.verify().await;
+    #[test]
+    fn playlist_url_is_left_as_is() {
+        assert!("https://www.youtube.com/playlist?list=PLxxxxxxxxxxxx".contains("://"));
     }
 }

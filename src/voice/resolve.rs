@@ -146,11 +146,7 @@ pub async fn preflight_check(
 /// `cookies_file`, if set, is forwarded to `yt-dlp` via
 /// [`YoutubeDl::user_args`] — see `Config::yt_dlp_cookies_file`.
 #[allow(dead_code)]
-pub fn track_input(
-    http: oauth2::reqwest::Client,
-    video_id: &str,
-    cookies_file: Option<&str>,
-) -> Input {
+pub fn track_input(http: reqwest::Client, video_id: &str, cookies_file: Option<&str>) -> Input {
     let url = format!("https://www.youtube.com/watch?v={video_id}");
     let mut ytdl = YoutubeDl::new(http, url);
     if let Some(cookies_file) = cookies_file {
@@ -173,7 +169,7 @@ pub fn track_input(
 /// [`track_input`]'s live-streaming behavior and remain exposed to the
 /// original bug.
 pub async fn cached_track_input(
-    http: oauth2::reqwest::Client,
+    http: reqwest::Client,
     video_id: &str,
     duration: Option<Duration>,
     cookies_file: Option<&str>,

@@ -10,26 +10,6 @@ use super::{Context, Data, Error};
 use crate::voice::panel::format_duration;
 use crate::voice::player::{PlayerError, QueuedTrack};
 use crate::youtube::api::Track;
-use crate::youtube::oauth::{AccessTokenError, get_valid_access_token};
-
-/// User-facing message for a failed [`get_valid_access_token`] call,
-/// distinguishing "never linked" from "linked but broken" so the prompt
-/// tells the user the right thing to do.
-pub(super) fn access_token_error_message(err: &AccessTokenError) -> String {
-    match err {
-        AccessTokenError::NotLinked => {
-            "you need to link your Google account first — run `/link`".to_string()
-        }
-        AccessTokenError::RefreshFailed { revoked: true, .. } => {
-            "your Google account link was revoked or expired — run `/link` again to reconnect it"
-                .to_string()
-        }
-        AccessTokenError::RefreshFailed { revoked: false, .. } => {
-            "couldn't refresh your Google account link right now — try again in a moment"
-                .to_string()
-        }
-    }
-}
 
 /// Max `upcoming` entries shown in `/queue` before truncating with a
 /// "...and N more" trailer, to stay well under Discord's ~2000 char message
@@ -49,7 +29,7 @@ const VOLUME_MODAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// anything that isn't a URL at all (treated by callers as a search query)
 /// or a recognized host with an unrecognized path.
 fn extract_video_id(input: &str) -> Option<String> {
-    let url = oauth2::url::Url::parse(input).ok()?;
+    let url = url::Url::parse(input).ok()?;
     let host = url.host_str()?;
 
     if host == "youtu.be" {
@@ -114,10 +94,6 @@ pub async fn handle_component(
 
     if custom_id == "search" {
         return handle_search_button(ctx, component, data).await;
-    }
-    if custom_id == "playlists" {
-        component.defer_ephemeral(&ctx.http).await?;
-        return library::handle_playlists_button(ctx, component, data).await;
     }
     if custom_id == "volume" {
         return handle_volume_button(ctx, component, data).await;
@@ -369,22 +345,6 @@ pub async fn play(
         .guild_id()
         .expect("guild_only commands always have a guild");
 
-    let access_token = match get_valid_access_token(
-        &ctx.data().oauth_client,
-        &ctx.data().oauth_http,
-        &ctx.data().db,
-        &ctx.author().id.to_string(),
-        &ctx.data().token_key,
-    )
-    .await
-    {
-        Ok(token) => token,
-        Err(err) => {
-            reply_error(ctx, access_token_error_message(&err)).await?;
-            return Ok(());
-        }
-    };
-
     if !ctx.data().player.is_connected(guild_id) {
         if let Some(channel_id) = voice_channel_of(ctx) {
             if let Err(err) = ctx.data().player.join(guild_id, channel_id).await {
@@ -398,7 +358,7 @@ pub async fn play(
     }
 
     let track = if let Some(video_id) = extract_video_id(&query) {
-        match ctx.data().youtube.get_video(&access_token, &video_id).await {
+        match ctx.data().youtube.get_video(&video_id).await {
             Ok(track) => track,
             Err(err) => {
                 reply_error(ctx, err.to_string()).await?;
@@ -407,9 +367,9 @@ pub async fn play(
         }
     } else {
         // `/play` with free text takes only the top hit for convenience —
-        // unlike `/search` (the other Phase 6 command), which shows an
-        // interactive multi-result picker.
-        match ctx.data().youtube.search(&access_token, &query).await {
+        // unlike `/add_to_queue`, which shows an interactive multi-result
+        // picker.
+        match ctx.data().youtube.search(&query).await {
             Ok(results) if results.is_empty() => {
                 reply_error(ctx, format!("no results found for '{query}'")).await?;
                 return Ok(());
@@ -676,35 +636,6 @@ mod tests {
     #[test]
     fn unrelated_url_returns_none() {
         assert_eq!(extract_video_id("https://example.com/foo"), None);
-    }
-
-    // ---- access_token_error_message ----
-
-    #[test]
-    fn not_linked_message_prompts_link() {
-        assert!(access_token_error_message(&AccessTokenError::NotLinked).contains("/link"));
-    }
-
-    #[test]
-    fn revoked_message_differs_from_not_linked() {
-        let revoked = access_token_error_message(&AccessTokenError::RefreshFailed {
-            revoked: true,
-            message: "refresh token invalid_grant".to_string(),
-        });
-        assert!(revoked.contains("revoked") || revoked.contains("expired"));
-        assert_ne!(
-            revoked,
-            access_token_error_message(&AccessTokenError::NotLinked)
-        );
-    }
-
-    #[test]
-    fn transient_refresh_failure_suggests_retry_not_relink() {
-        let message = access_token_error_message(&AccessTokenError::RefreshFailed {
-            revoked: false,
-            message: "network error".to_string(),
-        });
-        assert!(!message.contains("/link"));
     }
 
     // ---- format_track ----

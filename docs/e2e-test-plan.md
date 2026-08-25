@@ -1,20 +1,19 @@
 # Manual end-to-end test plan
 
 Everything in this repo is unit-tested where that's possible without a
-live Discord gateway connection, a real Google OAuth2 client, or working
-`yt-dlp`/`ffmpeg` binaries. This plan covers what's left: the parts that
-can only be verified by actually running the bot against a real Discord
-server and a real linked Google account. Run through it once after setup
-(`README.md`), and again after any change that touches `src/commands/`,
-`src/voice/`, or `src/youtube/`.
+live Discord gateway connection or working `yt-dlp`/`ffmpeg` binaries.
+This plan covers what's left: the parts that can only be verified by
+actually running the bot against a real Discord server. Run through it
+once after setup (`README.md`), and again after any change that touches
+`src/commands/`, `src/voice/`, or `src/youtube/`.
 
 Use a private test/staging Discord server for this, not a real one you
 share with other people — some steps involve deliberately breaking things
-(revoking access, disconnecting mid-playback).
+(disconnecting mid-playback).
 
 ## 0. Prerequisites
 
-- [x] `.env` filled in per README's Discord/Google Cloud setup sections.
+- [x] `.env` filled in per README's Discord application setup section.
 - [x] `which yt-dlp ffmpeg` both resolve; `cargo run` gets past the
       startup dependency check without erroring.
 - [x] The bot's invite URL (README) has been used to add it to your test
@@ -22,35 +21,22 @@ share with other people — some steps involve deliberately breaking things
 - [x] `/ping` replies "Pong!" — confirms slash command registration
       actually worked before testing anything more complex.
 
-## 1. Linking
+## 1. Browsing
 
-- [x] `/link` replies ephemerally with a Google auth URL.
-- [x] Opening it in a browser shows Google's consent screen for the
-      correct app name, requesting only the `youtube.readonly` scope (not
-      more).
-- [x] Completing consent shows a "Linked!" page from the bot's local
-      callback server, and the browser tab can be closed.
-- [ ] Running `/link` again (already linked) still works, and the reply
-      mentions it replaces the existing link.
-- [ ] **CSRF/replay check**: reload the callback URL from step above a
-      second time (browser back button + refresh, or copy/paste the exact
-      URL again) — it should be rejected ("unrecognized or already-used
-      link attempt"), not silently re-processed.
+- [ ] `/add_to_queue <query>` returns up to 5 results for a query you know
+      has results (e.g. an artist name), with a select menu to queue one.
+- [ ] `/add_to_queue <query> <number>` queues that result directly, without
+      the menu.
+- [ ] `/add_to_queue <query> 0` (or any out-of-range number) replies
+      "Invalid selection" rather than panicking or hanging.
+- [ ] `/playlist_play <a public playlist URL>` queues every track in it and
+      reports the count; `/queue` shows them all in order.
+- [ ] `/playlist_play <the same playlist's bare ID>` (no URL) works the same
+      way.
+- [ ] `/playlist_play <an empty or nonexistent playlist>` replies "That
+      playlist is empty (or couldn't be found)" rather than erroring.
 
-## 2. Browsing
-
-- [ ] `/playlists` lists your account's playlists (or "you don't have any
-      playlists" if there genuinely aren't any).
-- [ ] `/playlist_play <n>` on a non-empty playlist lists its tracks.
-- [ ] `/playlist_queue_all <n>` on a non-empty playlist queues every track
-      in it and reports the count; `/queue` shows them all in order.
-- [ ] `/liked` lists liked videos (or the empty-state message).
-- [ ] `/search <query>` returns up to 5 results for a query you know has
-      results (e.g. an artist name).
-- [ ] Invalid selections (`/playlist_play 99`, `/search_play <query> 0`)
-      reply "Invalid selection" rather than panicking or hanging.
-
-## 3. Playback
+## 2. Playback
 
 - [ ] Join a voice channel yourself, then `/play <a known YouTube URL>` —
       the bot joins your channel and audio plays.
@@ -63,39 +49,33 @@ share with other people — some steps involve deliberately breaking things
 - [ ] `/pause` then `/resume` — audio actually stops and restarts, not
       just the command replying successfully.
 - [ ] `/skip` — the queued track starts playing next automatically (no
-      manual `/play` needed), and `/now_playing` reflects the new track.
-- [ ] `/stop` — audio stops and `/queue`/`/now_playing` both show nothing
-      playing.
-- [ ] `/leave` while connected — bot leaves the channel; `/queue` shows
-      nothing (state was cleared).
+      manual `/play` needed).
+- [ ] `/stop` — audio stops and `/queue` shows nothing playing.
 - [ ] **Auto-disconnect**: queue a track, let it finish with nothing else
-      queued, and wait out the idle timeout (5 minutes) — the bot should
+      queued, and wait out the idle timeout (~2.5 minutes) — the bot should
       leave the voice channel on its own. (Long wait — worth doing once,
       not on every test pass.)
+- [ ] `/radio` toggles radio mode on; once the queue drains, it keeps
+      queuing similar tracks on its own (seeded from whatever last played)
+      rather than going idle.
 
-## 4. Player panel
+## 3. Player panel
 
-`/player` replaces the old `/now_playing` with a single persistent,
-self-updating panel per guild. This is the one area with no live-Discord
-substitute for manual testing — everything here depends on real message
-edits landing in real time.
+`/player` posts a single persistent, self-updating panel per guild. This
+is the one area with no live-Discord substitute for manual testing —
+everything here depends on real message edits landing in real time.
 
 - [ ] `/player` with nothing playing posts a panel: an informational
-      "search or browse a playlist to get started" message, playback
-      buttons (Pause/Skip/Stop/Shuffle, volume +/-) all disabled, and
-      Search/Playlists buttons enabled.
+      "search, `/play`, or `/playlist_play` to get started" message,
+      playback buttons (Pause/Skip/Stop/Shuffle) disabled, and
+      Search/Volume/Radio buttons enabled.
 - [ ] Panel's **Search** button opens a modal; submitting a query shows an
       ephemeral result picker (only visible to you); picking a result
       starts playback (auto-joining your voice channel) and the panel
       updates in place to show it — title, thumbnail, channel, requester,
       progress.
-- [ ] Panel's **Playlists** button shows an ephemeral playlist listing;
-      picking one, then queuing a track or the whole playlist, is reflected
-      in the panel (now-playing and/or queue) without touching the panel
-      itself.
-- [ ] Panel's own Pause/Resume/Skip/Stop/Shuffle/volume buttons work and
-      update the panel in place immediately (same as the old `/now_playing`
-      panel did).
+- [ ] Panel's own Pause/Resume/Skip/Stop/Shuffle/Volume/Radio buttons work
+      and update the panel in place immediately.
 - [ ] Run `/skip`, `/pause`, `/stop`, `/shuffle`, or `/volume` as **slash
       commands** (not panel buttons) while a panel is live — the panel
       message updates on its own within a second or two, with nobody
@@ -113,48 +93,23 @@ edits landing in real time.
       change (e.g. `/play` something) — the bot doesn't error or hang; it
       just has no panel to update until `/player` is run again.
 
-## 5. Failure modes
+## 4. Failure modes
 
 - [ ] `/play` an age-restricted video — replies with a clear
       "age-restricted" message, not a raw error dump or a hang.
 - [ ] `/play` a deleted/private video ID — replies "unavailable", same
       standard.
-- [ ] `/play` (or any browsing command) from an account that has never
-      run `/link` — replies telling them to `/link` first.
-- [ ] Run any command that hits the YouTube API while **not** in a voice
-      channel and the bot isn't already connected — replies "join a voice
-      channel first, or use `/join`", doesn't silently fail.
+- [ ] Run any command that queues a track while **not** in a voice channel
+      and the bot isn't already connected — replies "join a voice channel
+      first, or use `/join`", doesn't silently fail.
+- [ ] If `YT_DLP_COOKIES_FILE` is unset (or stale) and requests start
+      failing with "Sign in to confirm you're not a bot" — set it to a
+      fresh `cookies.txt` and confirm search/playback recover.
 
-## 6. Re-link handling
-
-This is the one that needs deliberate setup: it exercises the
-`AccessTokenError::RefreshFailed { revoked: true, .. }` path from
-`src/youtube/oauth.rs`.
-
-- [ ] With an account already linked, go to
-      [Google Account → Third-party access](https://myaccount.google.com/connections)
-      and revoke Apollo's access there (not via `/unlink` — this simulates
-      the user revoking it externally, which `/unlink` can't reach).
-- [ ] Run any command that needs a fresh access token (wait past the
-      current token's ~1hr expiry, or just try a command right after
-      revoking if the access token has already expired). It should reply
-      with the "revoked or expired — run `/link` again" message, not the
-      generic "you need to link" message a never-linked user would see.
-- [ ] `/link` again afterward — should work cleanly (the stale row was
-      deleted automatically per the `invalid_grant` handling).
-
-## 7. Unlinking
-
-- [ ] `/unlink` on a linked account — confirms unlinked, and a subsequent
-      `/play` correctly says "you need to link your Google account
-      first."
-- [ ] `/unlink` when nothing is linked — replies "you don't have a linked
-      Google account" rather than erroring.
-- [ ] Restart the bot process entirely (`Ctrl+C`, `cargo run` again) after
-      linking — the link should still be there afterward (SQLite
-      persistence surviving a restart, Phase 3's actual "done when").
-
-## 8. Multi-guild sanity (skip if you only have one test server)
+## 5. Multi-guild sanity (skip if you only have one test server)
 
 - [ ] Playing in two different guilds at once doesn't cross-contaminate
       queues — `/queue` in guild A never shows guild B's tracks.
+- [ ] `/volume` set in guild A doesn't affect guild B's volume, and
+      persists across a bot restart (`Ctrl+C`, `cargo run` again) for
+      whichever guild it was set in.

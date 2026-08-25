@@ -67,9 +67,11 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
     );
 
     let progress = match (position, queued.track.duration) {
-        (Some(pos), Some(dur)) => {
-            Some(format!("{} / {}", format_duration(pos), format_duration(dur)))
-        }
+        (Some(pos), Some(dur)) => Some(format!(
+            "{} / {}",
+            format_duration(pos),
+            format_duration(dur)
+        )),
         (Some(pos), None) => Some(format_duration(pos)),
         (None, _) => None,
     };
@@ -92,14 +94,14 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
 
 /// Builds the panel's button/select-menu rows: play/pause toggle, skip,
 /// stop, shuffle, and radio toggle on one row; a volume button (opens a
-/// type-in modal) alongside the Search/Playlists entry points into the
-/// library on another; and — when the queue isn't empty — a select menu to
-/// jump straight to an upcoming track.
+/// type-in modal) alongside the Search entry point into the library on
+/// another; and — when the queue isn't empty — a select menu to jump
+/// straight to an upcoming track.
 ///
-/// The playback row disables itself when nothing is playing; volume,
-/// Search, and Playlists stay enabled always, since volume applies to
-/// future tracks too and `/player` is meant to be usable as a cold-start
-/// entry point into the whole app.
+/// The playback row disables itself when nothing is playing; volume and
+/// Search stay enabled always, since volume applies to future tracks too
+/// and `/player` is meant to be usable as a cold-start entry point into the
+/// whole app.
 fn panel_components(
     snapshot: &QueueSnapshot,
     paused: Option<bool>,
@@ -152,7 +154,7 @@ fn panel_components(
 
     // Volume (a single button, rather than the old step +/- pair, so the
     // exact level is one tap — opening a type-in modal — away instead of
-    // several) alongside the library entry points, all on one row.
+    // several) alongside the library entry point, both on one row.
     let controls_row = serenity::CreateActionRow::Buttons(vec![
         serenity::CreateButton::new("player:volume")
             .label(format!("{} {volume}%", volume_glyph(volume)))
@@ -160,9 +162,6 @@ fn panel_components(
         serenity::CreateButton::new("player:search")
             .label("🔍 Search")
             .style(serenity::ButtonStyle::Primary),
-        serenity::CreateButton::new("player:playlists")
-            .label("📃 Playlists")
-            .style(serenity::ButtonStyle::Secondary),
     ]);
 
     let mut rows = vec![playback_row, controls_row];
@@ -223,7 +222,7 @@ pub(crate) async fn render(
             )
         }
         None => (
-            "Nothing is playing — search or browse a playlist to get started.".to_string(),
+            "Nothing is playing — search, `/play`, or `/playlist_play` to get started.".to_string(),
             None,
             components,
         ),
@@ -393,12 +392,11 @@ mod tests {
     }
 
     #[test]
-    fn search_and_playlists_buttons_stay_enabled_when_nothing_playing() {
+    fn search_button_stays_enabled_when_nothing_playing() {
         let snapshot = sample_queue_snapshot(false, 0);
         let json = components_json(&panel_components(&snapshot, None, 50, false));
-        for button in &json[1]["components"].as_array().unwrap()[1..] {
-            assert_eq!(button["disabled"], false, "{button:?} should stay enabled");
-        }
+        let search_button = &json[1]["components"][1];
+        assert_eq!(search_button["disabled"], false);
     }
 
     #[test]
