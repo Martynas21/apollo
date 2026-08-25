@@ -529,16 +529,18 @@ async fn handle_playlist_play_button(
     }
 
     let total = tracks.len();
-    let mut queued_count = 0usize;
-    for track in tracks {
-        let queued = QueuedTrack {
+    let queued: Vec<QueuedTrack> = tracks
+        .into_iter()
+        .map(|track| QueuedTrack {
             track,
             requested_by: component.user.id,
-        };
-        if data.player.enqueue(guild_id, queued).await.is_ok() {
-            queued_count += 1;
-        }
-    }
+        })
+        .collect();
+    let queued_count = data
+        .player
+        .enqueue_many(guild_id, queued)
+        .await
+        .unwrap_or(0);
 
     let content = if queued_count == total {
         format!("Queued {queued_count} track(s) from **{}**.", playlist.name)
@@ -1116,16 +1118,19 @@ async fn join_and_enqueue_all(
     }
 
     let total = tracks.len();
-    let mut queued_count = 0usize;
-    for track in tracks {
-        let queued = QueuedTrack {
+    let queued: Vec<QueuedTrack> = tracks
+        .into_iter()
+        .map(|track| QueuedTrack {
             track,
             requested_by: ctx.author().id,
-        };
-        if ctx.data().player.enqueue(guild_id, queued).await.is_ok() {
-            queued_count += 1;
-        }
-    }
+        })
+        .collect();
+    let queued_count = ctx
+        .data()
+        .player
+        .enqueue_many(guild_id, queued)
+        .await
+        .unwrap_or(0);
 
     let content = if queued_count == total {
         format!("Queued {queued_count} track(s) from **{label}**.")

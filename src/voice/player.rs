@@ -258,6 +258,77 @@ impl PlayerRegistry {
         Ok(())
     }
 
+    /// Enqueues many tracks at once — for `/playlist_play`, queuing a whole
+    /// saved playlist in one go. Equivalent to calling [`Self::enqueue`]
+    /// once per track, but under a single lock and with a single panel
+    /// refresh at the end, instead of one Discord API call *per track*:
+    /// looping the single-track `enqueue` over a playlist of hundreds (or
+    /// thousands) of tracks turns "queue a playlist" into that many
+    /// sequential, rate-limited HTTP round-trips — slow enough to look
+    /// hung. Returns how many tracks ended up queued (fewer than
+    /// `tracks.len()` only if the tracks tried as the starting track all
+    /// failed to play).
+    pub async fn enqueue_many(
+        &self,
+        guild_id: GuildId,
+        tracks: Vec<QueuedTrack>,
+    ) -> Result<usize, PlayerError> {
+        let call = self
+            .songbird
+            .get(guild_id)
+            .ok_or(PlayerError::NotConnected)?;
+        if tracks.is_empty() {
+            return Ok(0);
+        }
+        let total = tracks.len();
+
+        let needs_start = {
+            let mut guilds = self.guilds.lock().await;
+            let state = guilds.entry(guild_id).or_default();
+            let needs_start = state.now_playing.is_none();
+            state.queue.extend(tracks);
+            if needs_start {
+                state.now_playing = state.queue.pop_front();
+            }
+            needs_start
+        };
+
+        let mut failed = 0;
+        if needs_start {
+            // Keep trying front-of-queue tracks until one starts or the
+            // queue runs dry — same rollback-and-retry `enqueue` relies on
+            // to avoid orphaning everything behind a track that fails to
+            // start, just looped here since the whole playlist is already
+            // sitting in the queue rather than trickling in one call at a
+            // time.
+            loop {
+                let candidate = {
+                    let guilds = self.guilds.lock().await;
+                    guilds.get(&guild_id).and_then(|s| s.now_playing.clone())
+                };
+                let Some(candidate) = candidate else { break };
+
+                match self
+                    .start_playback(guild_id, call.clone(), candidate, None)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(err) => {
+                        tracing::warn!(%err, "failed to start a playlist track, trying the next one");
+                        failed += 1;
+                        let mut guilds = self.guilds.lock().await;
+                        if let Some(state) = guilds.get_mut(&guild_id) {
+                            state.now_playing = state.queue.pop_front();
+                        }
+                    }
+                }
+            }
+        }
+
+        self.refresh_panel(guild_id).await;
+        Ok(total - failed)
+    }
+
     /// Resolves a prefetch handle into a playable input, falling back to
     /// building fresh (rather than propagating a stale prefetch failure) if
     /// the background download errored.
