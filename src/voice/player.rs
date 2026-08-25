@@ -193,8 +193,13 @@ impl PlayerRegistry {
     /// common case of the idle-timeout auto-disconnect in
     /// [`Self::schedule_idle_disconnect`]).
     pub async fn leave(&self, guild_id: GuildId) -> Result<(), PlayerError> {
+        // `remove`, not `leave` — `Songbird::leave` only clears the voice
+        // connection, leaving the (now-disconnected) `Call` registered in
+        // songbird's manager map. `is_connected` would then keep reporting
+        // this guild as connected, so `/play` would skip rejoining voice
+        // and play into a `Call` with nothing on the other end.
         self.songbird
-            .leave(guild_id)
+            .remove(guild_id)
             .await
             .map_err(|e| PlayerError::Join(e.to_string()))?;
 
