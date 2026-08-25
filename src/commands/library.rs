@@ -536,11 +536,12 @@ async fn handle_playlist_play_button(
             requested_by: component.user.id,
         })
         .collect();
-    let queued_count = data
-        .player
-        .enqueue_many(guild_id, queued)
-        .await
-        .unwrap_or(0);
+    let queued_count = match data.player.enqueue_many(guild_id, queued).await {
+        Ok(count) => count,
+        Err(err) => {
+            return update_picker(ctx, component, format!("Failed to queue tracks: {err}")).await;
+        }
+    };
 
     let content = if queued_count == total {
         format!("Queued {queued_count} track(s) from **{}**.", playlist.name)
@@ -647,14 +648,18 @@ async fn handle_playlist_remove_confirm_button(
     Ok(())
 }
 
-/// Extracts a submitted modal field's value by its input custom id, or
-/// `None` if it was left empty (or isn't present at all).
+/// Extracts a submitted modal field's value by its input custom id, trimmed,
+/// or `None` if it was left empty/whitespace-only (or isn't present at all)
+/// — matches `playback::parse_volume_input`'s trim-before-checking.
 fn modal_field(data: &serenity::ModalInteractionData, custom_id: &str) -> Option<String> {
     data.components.iter().find_map(|row| {
         row.components.iter().find_map(|component| match component {
-            serenity::ActionRowComponent::InputText(input) if input.custom_id == custom_id => {
-                input.value.clone().filter(|v| !v.is_empty())
-            }
+            serenity::ActionRowComponent::InputText(input) if input.custom_id == custom_id => input
+                .value
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
             _ => None,
         })
     })
@@ -1094,10 +1099,7 @@ async fn join_and_enqueue(ctx: Context<'_>, track: Track) -> Result<(), Error> {
         return Ok(());
     }
 
-    ctx.send(poise::CreateReply::default().content(format!("Queued: **{title}** — {channel}")))
-        .await?;
-
-    Ok(())
+    super::playback::reply_public(ctx, format!("Queued: **{title}** — {channel}")).await
 }
 
 /// Auto-joins if needed, enqueues every track in `tracks` in order, and
@@ -1125,12 +1127,18 @@ async fn join_and_enqueue_all(
             requested_by: ctx.author().id,
         })
         .collect();
-    let queued_count = ctx
-        .data()
-        .player
-        .enqueue_many(guild_id, queued)
-        .await
-        .unwrap_or(0);
+    let queued_count = match ctx.data().player.enqueue_many(guild_id, queued).await {
+        Ok(count) => count,
+        Err(err) => {
+            ctx.send(
+                poise::CreateReply::default()
+                    .content(format!("Failed to queue tracks: {err}"))
+                    .ephemeral(true),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     let content = if queued_count == total {
         format!("Queued {queued_count} track(s) from **{label}**.")
@@ -1140,10 +1148,7 @@ async fn join_and_enqueue_all(
             total - queued_count
         )
     };
-    ctx.send(poise::CreateReply::default().content(content))
-        .await?;
-
-    Ok(())
+    super::playback::reply_public(ctx, content).await
 }
 
 /// Searches `YouTube` for `query` and shows the top 5 matches, or queues one.
@@ -1158,6 +1163,14 @@ pub async fn add_to_queue(
         u8,
     >,
 ) -> Result<(), Error> {
+    // `youtube.search` shells out to yt-dlp and can easily exceed Discord's
+    // 3-second ack deadline (cold-start especially) — deferred before it so
+    // a slow response doesn't drop the interaction. Ephemeral to match the
+    // no-`number` browsing branch below, the common entry point into this
+    // command; the `number`-given success path replies publicly regardless
+    // (see `join_and_enqueue`), which works fine as its own followup.
+    ctx.defer_ephemeral().await?;
+
     let results = match ctx.data().youtube.search(&query).await {
         Ok(results) => results,
         Err(err) => {
@@ -1218,6 +1231,12 @@ pub async fn playlist_play(
     ctx: Context<'_>,
     #[description = "Playlist URL or ID"] playlist: String,
 ) -> Result<(), Error> {
+    // `list_playlist_items` shells out to yt-dlp and, for a large playlist,
+    // can easily take longer than Discord's 3-second ack deadline —
+    // deferred before it so a slow response doesn't drop the interaction.
+    // Public to match this command's success reply (`join_and_enqueue_all`).
+    ctx.defer().await?;
+
     let tracks = match ctx.data().youtube.list_playlist_items(&playlist).await {
         Ok(listing) => listing.tracks,
         Err(err) => {
@@ -1493,5 +1512,53 @@ mod tests {
             "library:playlist_remove_confirm:42"
         );
         assert_eq!(buttons[1]["custom_id"], "library:playlist_view:42");
+    }
+
+    // ---- modal_field ----
+
+    /// Builds a single-field submitted modal, round-tripped through JSON the
+    /// same way `panel.rs`'s tests round-trip `CreateEmbed` — `serenity`'s
+    /// receive-side modal types implement `Deserialize` but have no public
+    /// constructor.
+    fn modal_data_with_field(custom_id: &str, value: &str) -> serenity::ModalInteractionData {
+        serde_json::from_value(serde_json::json!({
+            "custom_id": "test_modal",
+            "components": [{
+                "type": 1,
+                "components": [{
+                    "type": 4,
+                    "custom_id": custom_id,
+                    "value": value
+                }]
+            }]
+        }))
+        .expect("modal data should deserialize")
+    }
+
+    #[test]
+    fn modal_field_trims_surrounding_whitespace() {
+        let data = modal_data_with_field("url", "  https://example.com  ");
+        assert_eq!(
+            modal_field(&data, "url"),
+            Some("https://example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn modal_field_treats_whitespace_only_value_as_empty() {
+        let data = modal_data_with_field("url", "   ");
+        assert_eq!(modal_field(&data, "url"), None);
+    }
+
+    #[test]
+    fn modal_field_treats_truly_empty_value_as_empty() {
+        let data = modal_data_with_field("url", "");
+        assert_eq!(modal_field(&data, "url"), None);
+    }
+
+    #[test]
+    fn modal_field_none_when_custom_id_not_present() {
+        let data = modal_data_with_field("url", "https://example.com");
+        assert_eq!(modal_field(&data, "name"), None);
     }
 }

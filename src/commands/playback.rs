@@ -8,7 +8,7 @@ use poise::serenity_prelude as serenity;
 use super::library;
 use super::{Context, Data, Error};
 use crate::voice::panel::format_duration;
-use crate::voice::player::{PlayerError, QueuedTrack};
+use crate::voice::player::{PanelClaim, PlayerError, QueuedTrack};
 use crate::youtube::api::Track;
 
 /// Max `upcoming` entries shown in `/queue` before truncating with a
@@ -55,6 +55,29 @@ fn extract_video_id(input: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Whether `input` looks like a `YouTube` playlist link — a recognized host
+/// with a `list=` query parameter — regardless of whether
+/// [`extract_video_id`] could also pull a video id out of it (a
+/// `/watch?v=...&list=...` link is both; that case is already handled fine
+/// by playing the video, so this is only consulted when `extract_video_id`
+/// came back empty).
+///
+/// Used by `/play` to catch a pasted playlist URL and point at
+/// `/playlist_play` instead of silently falling through to a free-text
+/// search for the raw URL string, which would queue an unrelated top search
+/// result with no indication anything went wrong.
+fn looks_like_playlist_url(input: &str) -> bool {
+    let Ok(url) = url::Url::parse(input) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let recognized_host =
+        host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com");
+    recognized_host && url.query_pairs().any(|(key, _)| key == "list")
 }
 
 /// Formats a track as `**title** — channel (mm:ss)`, omitting the duration
@@ -318,12 +341,24 @@ fn voice_channel_of(ctx: Context<'_>) -> Option<serenity::ChannelId> {
     })
 }
 
+/// Sends a public (non-ephemeral) reply. Explicitly parses no mentions:
+/// several callers interpolate `YouTube`-supplied track/playlist text (title,
+/// channel, playlist name) into `content` here, and that text is fully
+/// attacker-controlled — without this, a track titled e.g. `@everyone ...`
+/// would ping the channel (or a `<@id>`-titled track would ping that user)
+/// whenever it's queued. Poise's own framework-level default
+/// (`all_users(true)`) still allows arbitrary user pings through, so it's
+/// not enough on its own here.
 pub(super) async fn reply_public(
     ctx: Context<'_>,
     content: impl Into<String>,
 ) -> Result<(), Error> {
-    ctx.send(poise::CreateReply::default().content(content.into()))
-        .await?;
+    ctx.send(
+        poise::CreateReply::default()
+            .content(content.into())
+            .allowed_mentions(serenity::CreateAllowedMentions::new()),
+    )
+    .await?;
     Ok(())
 }
 
@@ -348,6 +383,23 @@ pub async fn play(
         .guild_id()
         .expect("guild_only commands always have a guild");
 
+    // The video/playlist lookup below and `join`'s voice-gateway handshake
+    // can both easily exceed Discord's 3-second ack deadline (cold-start
+    // yt-dlp, a slow guild join) — deferred here, before either, so a slow
+    // response doesn't drop the interaction. `/play`'s success reply is
+    // public, so a matching (non-ephemeral) defer.
+    ctx.defer().await?;
+
+    let video_id = extract_video_id(&query);
+    if video_id.is_none() && looks_like_playlist_url(&query) {
+        reply_error(
+            ctx,
+            "that looks like a playlist link — use `/playlist_play` to queue the whole thing.",
+        )
+        .await?;
+        return Ok(());
+    }
+
     if !ctx.data().player.is_connected(guild_id) {
         if let Some(channel_id) = voice_channel_of(ctx) {
             if let Err(err) = ctx.data().player.join(guild_id, channel_id).await {
@@ -360,7 +412,7 @@ pub async fn play(
         }
     }
 
-    let track = if let Some(video_id) = extract_video_id(&query) {
+    let track = if let Some(video_id) = video_id {
         match ctx.data().youtube.get_video(&video_id).await {
             Ok(track) => track,
             Err(err) => {
@@ -499,33 +551,64 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
         .guild_id()
         .expect("guild_only commands always have a guild");
 
-    if let Some((channel_id, message_id)) = ctx.data().player.existing_panel(guild_id).await {
-        let link = message_id.link(channel_id, Some(guild_id));
-        ctx.send(
-            poise::CreateReply::default()
-                .content(format!("The player panel is already active: {link}"))
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    }
+    // `claim_panel_slot` makes the "does a panel already exist" check and
+    // the "reserve the right to post one" decision atomic under the
+    // registry's per-guild lock — without that, two `/player`s landing
+    // together could both see no panel, both post one, and leave the first
+    // live and un-refreshed forever (see the invariant documented above).
+    let (channel_id, message_id) = match ctx.data().player.claim_panel_slot(guild_id).await {
+        PanelClaim::Existing(panel) => panel,
+        PanelClaim::InProgress => {
+            ctx.send(
+                poise::CreateReply::default()
+                    .content("The player panel is already being created — try again in a moment.")
+                    .ephemeral(true),
+            )
+            .await?;
+            return Ok(());
+        }
+        PanelClaim::Reserved => {
+            let (content, embed, components) =
+                crate::voice::panel::render(&ctx.data().player, guild_id).await;
+            let mut reply = poise::CreateReply::default()
+                .content(content)
+                .components(components);
+            if let Some(embed) = embed {
+                reply = reply.embed(embed);
+            }
 
-    let (content, embed, components) =
-        crate::voice::panel::render(&ctx.data().player, guild_id).await;
-    let mut reply = poise::CreateReply::default()
-        .content(content)
-        .components(components);
-    if let Some(embed) = embed {
-        reply = reply.embed(embed);
-    }
+            // Release the reservation on any failure to post, so a wedged
+            // `/player` doesn't block every future `/player` in this guild.
+            let posted: Result<_, Error> = async {
+                let handle = ctx.send(reply).await?;
+                let message = handle.message().await?;
+                Ok((message.channel_id, message.id))
+            }
+            .await;
 
-    let handle = ctx.send(reply).await?;
-    let message = handle.message().await?;
-    ctx.data()
-        .player
-        .replace_panel(guild_id, message.channel_id, message.id)
-        .await;
+            match posted {
+                Ok((channel_id, message_id)) => {
+                    ctx.data()
+                        .player
+                        .set_panel(guild_id, channel_id, message_id)
+                        .await;
+                    return Ok(());
+                }
+                Err(err) => {
+                    ctx.data().player.release_panel_slot(guild_id).await;
+                    return Err(err);
+                }
+            }
+        }
+    };
 
+    let link = message_id.link(channel_id, Some(guild_id));
+    ctx.send(
+        poise::CreateReply::default()
+            .content(format!("The player panel is already active: {link}"))
+            .ephemeral(true),
+    )
+    .await?;
     Ok(())
 }
 
@@ -652,6 +735,50 @@ mod tests {
     #[test]
     fn unrelated_url_returns_none() {
         assert_eq!(extract_video_id("https://example.com/foo"), None);
+    }
+
+    // ---- looks_like_playlist_url ----
+
+    #[test]
+    fn recognizes_a_bare_playlist_url() {
+        assert!(looks_like_playlist_url(
+            "https://www.youtube.com/playlist?list=PLxxxx"
+        ));
+    }
+
+    #[test]
+    fn recognizes_a_list_param_on_youtu_be() {
+        assert!(looks_like_playlist_url(
+            "https://youtu.be/dQw4w9WgXcQ?list=PLxxxx"
+        ));
+    }
+
+    #[test]
+    fn recognizes_a_list_param_on_a_watch_url_too() {
+        // `extract_video_id` already handles this case fine (it plays the
+        // video), but `looks_like_playlist_url` doesn't need to know that —
+        // callers only consult it once `extract_video_id` has already come
+        // back empty.
+        assert!(looks_like_playlist_url(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLxxxx"
+        ));
+    }
+
+    #[test]
+    fn a_video_url_with_no_list_param_is_not_a_playlist_url() {
+        assert!(!looks_like_playlist_url(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        ));
+    }
+
+    #[test]
+    fn a_list_param_on_an_unrelated_host_is_not_a_playlist_url() {
+        assert!(!looks_like_playlist_url("https://example.com/foo?list=1"));
+    }
+
+    #[test]
+    fn plain_text_is_not_a_playlist_url() {
+        assert!(!looks_like_playlist_url("never gonna give you up"));
     }
 
     // ---- format_track ----
