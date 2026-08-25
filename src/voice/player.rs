@@ -458,6 +458,24 @@ impl PlayerRegistry {
         Arc::new(self.clone())
     }
 
+    /// Test-only constructor that takes an already-built backend (a
+    /// [`tests::FakeBackend`] in practice) instead of building a
+    /// [`SongbirdBackend`] from a real `Songbird` manager — see the module's
+    /// doc comment for why the seam exists. `db` still needs to be a real
+    /// pool (`sqlite::memory:` works) since `start_playback`/`set_volume` go
+    /// through it.
+    #[cfg(test)]
+    fn new_for_test(voice: Arc<dyn VoiceBackend>, db: sqlx::SqlitePool) -> Self {
+        Self {
+            voice,
+            discord_http: Arc::new(serenity::Http::new("test-token")),
+            cookies_file: None,
+            db,
+            youtube: YouTubeClient::default(),
+            guilds: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     pub async fn join(
         &self,
         guild_id: GuildId,
@@ -1641,6 +1659,8 @@ impl SongbirdEventHandler for DriverDisconnectHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
+
     use super::*;
 
     fn queued(video_id: &str) -> QueuedTrack {
@@ -1792,4 +1812,648 @@ mod tests {
         // The slot is claimable again after a released reservation.
         assert!(matches!(state.claim_panel(), PanelClaim::Reserved));
     }
+
+    // ---- fake VoiceBackend/VoiceCall/VoiceTrack, for exercising the queue
+    // state machine without a live songbird connection ----
+
+    #[derive(Default)]
+    struct FakeTrackState {
+        stopped: bool,
+        paused: bool,
+        volume: Option<f32>,
+        /// Set by [`FakeTrack::fail_stop`] to make the next `stop()` call
+        /// return an error instead of succeeding — used to check that
+        /// callers don't commit a state mutation whose preceding `stop()`
+        /// failed (see `jump_to_does_not_drain_the_queue_if_stop_fails`).
+        stop_error: Option<String>,
+    }
+
+    /// Fake [`VoiceTrack`]: records what was called on it instead of
+    /// actually controlling any audio.
+    struct FakeTrack {
+        uuid: Uuid,
+        state: StdMutex<FakeTrackState>,
+    }
+
+    impl FakeTrack {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                uuid: Uuid::new_v4(),
+                state: StdMutex::new(FakeTrackState::default()),
+            })
+        }
+
+        fn was_stopped(&self) -> bool {
+            self.state.lock().unwrap().stopped
+        }
+
+        fn is_paused(&self) -> bool {
+            self.state.lock().unwrap().paused
+        }
+
+        fn volume(&self) -> Option<f32> {
+            self.state.lock().unwrap().volume
+        }
+
+        /// Makes the next `stop()` call on this track fail with `message`.
+        fn fail_stop(&self, message: &str) {
+            self.state.lock().unwrap().stop_error = Some(message.to_string());
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceTrack for FakeTrack {
+        fn uuid(&self) -> Uuid {
+            self.uuid
+        }
+
+        fn set_volume(&self, multiplier: f32) -> Result<(), String> {
+            self.state.lock().unwrap().volume = Some(multiplier);
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(message) = state.stop_error.take() {
+                return Err(message);
+            }
+            state.stopped = true;
+            Ok(())
+        }
+
+        fn pause(&self) -> Result<(), String> {
+            self.state.lock().unwrap().paused = true;
+            Ok(())
+        }
+
+        fn resume(&self) -> Result<(), String> {
+            self.state.lock().unwrap().paused = false;
+            Ok(())
+        }
+
+        fn notify_when_finished(&self, _guild_id: GuildId, _events: Arc<dyn VoiceEvents>) {
+            // No-op: real songbird would register a per-track End/Error
+            // handler here, but tests drive `advance`/`connection_lost`
+            // directly through the `events` handle `FakeBackend::join`
+            // captured (see `FakeBackend::finish_track`/`disconnect`)
+            // instead of reproducing songbird's event plumbing.
+        }
+
+        async fn status(&self) -> Option<TrackStatus> {
+            let state = self.state.lock().unwrap();
+            Some(TrackStatus {
+                position: Duration::ZERO,
+                paused: state.paused,
+            })
+        }
+    }
+
+    /// One play() call recorded by [`FakeCall`].
+    struct PlayedTrack {
+        video_id: String,
+        handle: Arc<FakeTrack>,
+    }
+
+    /// Fake [`VoiceCall`]: records every `play()` call instead of touching
+    /// songbird's mixer.
+    #[derive(Default)]
+    struct FakeCall {
+        played: StdMutex<Vec<PlayedTrack>>,
+    }
+
+    impl FakeCall {
+        fn play_count(&self) -> usize {
+            self.played.lock().unwrap().len()
+        }
+
+        fn played_video_ids(&self) -> Vec<String> {
+            self.played
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| p.video_id.clone())
+                .collect()
+        }
+
+        fn last_track(&self) -> Arc<FakeTrack> {
+            self.played
+                .lock()
+                .unwrap()
+                .last()
+                .expect("play() was never called")
+                .handle
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceCall for FakeCall {
+        async fn play(&self, source: AudioSource) -> Arc<dyn VoiceTrack> {
+            let track = FakeTrack::new();
+            self.played.lock().unwrap().push(PlayedTrack {
+                video_id: source.video_id,
+                handle: track.clone(),
+            });
+            track
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeBackendState {
+        calls: HashMap<GuildId, Arc<FakeCall>>,
+        /// The `events` sink handed to the most recent successful `join()`
+        /// per guild — stands in for songbird's `DriverDisconnectHandler`/
+        /// `TrackEndHandler`, which forward to this same sink in production.
+        events: HashMap<GuildId, Arc<dyn VoiceEvents>>,
+        /// Consumed (taken) by the next `join()` call, so a test can make
+        /// exactly one join fail without affecting a later rejoin attempt.
+        next_join_failure: Option<String>,
+    }
+
+    /// Fake [`VoiceBackend`]: an in-memory stand-in for songbird, with no
+    /// real voice connection. `join`/`remove`/`call` behave like a map of
+    /// guild -> [`FakeCall`]; `buffered_source`/`streaming_source` hand back
+    /// an [`AudioSource`] wrapping an empty in-memory [`Input`] since nothing
+    /// here ever actually decodes it.
+    #[derive(Default)]
+    struct FakeBackend {
+        state: StdMutex<FakeBackendState>,
+    }
+
+    impl FakeBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        /// Makes the *next* `join()` call fail with `message` instead of
+        /// succeeding.
+        fn fail_next_join(&self, message: &str) {
+            self.state.lock().unwrap().next_join_failure = Some(message.to_string());
+        }
+
+        fn call_for(&self, guild_id: GuildId) -> Option<Arc<FakeCall>> {
+            self.state.lock().unwrap().calls.get(&guild_id).cloned()
+        }
+
+        /// Simulates songbird reporting that `track_id` ended (or errored),
+        /// driving [`PlayerRegistry::advance`] exactly as a real
+        /// `TrackEndHandler` would. No-op if `guild_id` was never joined.
+        async fn finish_track(&self, guild_id: GuildId, track_id: Uuid) {
+            let events = self.state.lock().unwrap().events.get(&guild_id).cloned();
+            if let Some(events) = events {
+                events.track_finished(guild_id, track_id).await;
+            }
+        }
+
+        /// Simulates the voice connection being lost, driving
+        /// [`PlayerRegistry::connection_lost`] exactly as a real
+        /// `DriverDisconnectHandler` would. No-op if `guild_id` was never
+        /// joined.
+        async fn disconnect(&self, guild_id: GuildId) {
+            let events = self.state.lock().unwrap().events.get(&guild_id).cloned();
+            if let Some(events) = events {
+                events.connection_lost(guild_id).await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceBackend for FakeBackend {
+        async fn join(
+            &self,
+            guild_id: GuildId,
+            _channel_id: ChannelId,
+            events: Arc<dyn VoiceEvents>,
+        ) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            if let Some(message) = state.next_join_failure.take() {
+                return Err(message);
+            }
+            state.calls.insert(guild_id, Arc::new(FakeCall::default()));
+            state.events.insert(guild_id, events);
+            Ok(())
+        }
+
+        async fn remove(&self, guild_id: GuildId) -> Result<(), String> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.remove(&guild_id);
+            state.events.remove(&guild_id);
+            Ok(())
+        }
+
+        fn call(&self, guild_id: GuildId) -> Option<Arc<dyn VoiceCall>> {
+            self.state
+                .lock()
+                .unwrap()
+                .calls
+                .get(&guild_id)
+                .cloned()
+                .map(|call| call as Arc<dyn VoiceCall>)
+        }
+
+        async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError> {
+            Ok(AudioSource {
+                video_id: track.video_id.clone(),
+                input: Input::from(Vec::<u8>::new()),
+            })
+        }
+
+        fn streaming_source(&self, track: &Track) -> AudioSource {
+            AudioSource {
+                video_id: track.video_id.clone(),
+                input: Input::from(Vec::<u8>::new()),
+            }
+        }
+    }
+
+    /// An in-memory-DB-backed [`PlayerRegistry`] wired to a fresh
+    /// [`FakeBackend`], already `join`ed into `guild_id`'s voice channel —
+    /// the common setup for the state-machine tests below.
+    async fn joined_registry() -> (PlayerRegistry, Arc<FakeBackend>, GuildId) {
+        let db = db::connect("sqlite::memory:").await.expect("in-memory db");
+        let backend = FakeBackend::new();
+        let registry = PlayerRegistry::new_for_test(backend.clone(), db);
+        let guild_id = GuildId::new(1);
+        registry
+            .join(guild_id, ChannelId::new(2))
+            .await
+            .expect("fake join always succeeds unless primed to fail");
+        (registry, backend, guild_id)
+    }
+
+    async fn current_track_id(registry: &PlayerRegistry, guild_id: GuildId) -> Uuid {
+        registry
+            .guilds
+            .lock()
+            .await
+            .get(&guild_id)
+            .and_then(|state| state.current_track_id)
+            .expect("a track should be current")
+    }
+
+    // ---- enqueue / enqueue_many ----
+
+    #[tokio::test]
+    async fn enqueue_starts_playback_immediately_on_an_empty_queue() {
+        let (registry, backend, guild_id) = joined_registry().await;
+
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+        assert!(snapshot.upcoming.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enqueue_appends_behind_a_track_already_playing() {
+        let (registry, backend, guild_id) = joined_registry().await;
+
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.enqueue(guild_id, queued("b")).await.unwrap();
+
+        let call = backend.call_for(guild_id).unwrap();
+        // Only "a" was ever handed to the backend — "b" sits in the queue.
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+        assert_eq!(snapshot.upcoming.len(), 1);
+        assert_eq!(snapshot.upcoming[0].track.video_id, "b");
+    }
+
+    #[tokio::test]
+    async fn enqueue_many_starts_the_first_track_on_an_empty_queue() {
+        let (registry, backend, guild_id) = joined_registry().await;
+
+        let queued_count = registry
+            .enqueue_many(guild_id, vec![queued("a"), queued("b"), queued("c")])
+            .await
+            .unwrap();
+
+        assert_eq!(queued_count, 3);
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+        let upcoming: Vec<_> = snapshot
+            .upcoming
+            .iter()
+            .map(|t| t.track.video_id.clone())
+            .collect();
+        assert_eq!(upcoming, vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn enqueue_many_only_appends_when_something_is_already_playing() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+
+        let queued_count = registry
+            .enqueue_many(guild_id, vec![queued("b"), queued("c")])
+            .await
+            .unwrap();
+
+        assert_eq!(queued_count, 2);
+        let call = backend.call_for(guild_id).unwrap();
+        // Nothing new started — "a" is still the only track ever played.
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+        let upcoming: Vec<_> = snapshot
+            .upcoming
+            .iter()
+            .map(|t| t.track.video_id.clone())
+            .collect();
+        assert_eq!(upcoming, vec!["b", "c"]);
+    }
+
+    // ---- advance() ----
+
+    #[tokio::test]
+    async fn advance_starts_the_next_queued_track_when_one_ends() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.enqueue(guild_id, queued("b")).await.unwrap();
+        let a_id = current_track_id(&registry, guild_id).await;
+
+        backend.finish_track(guild_id, a_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a", "b"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "b");
+        assert!(snapshot.upcoming.is_empty());
+    }
+
+    #[tokio::test]
+    async fn advance_goes_idle_when_the_queue_is_empty() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        let a_id = current_track_id(&registry, guild_id).await;
+
+        backend.finish_track(guild_id, a_id).await;
+
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert!(snapshot.now_playing.is_none());
+        assert!(snapshot.upcoming.is_empty());
+        let guilds = registry.guilds.lock().await;
+        assert!(guilds.get(&guild_id).unwrap().is_idle());
+    }
+
+    #[tokio::test]
+    async fn advance_ignores_a_stale_track_finished_event() {
+        // An End/Error event for a track that's already been superseded
+        // (stopped/skipped/replaced) must not advance the queue a second
+        // time — see `advance`'s doc comment.
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.enqueue(guild_id, queued("b")).await.unwrap();
+        let a_id = current_track_id(&registry, guild_id).await;
+
+        // "a" naturally finishes, advancing to "b"...
+        backend.finish_track(guild_id, a_id).await;
+        // ...then a's now-stale End event lands a second time.
+        backend.finish_track(guild_id, a_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a", "b"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "b");
+    }
+
+    // ---- stop() ----
+
+    #[tokio::test]
+    async fn stop_clears_queue_state_stops_playback_and_bumps_the_epoch() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.enqueue(guild_id, queued("b")).await.unwrap();
+        let track = backend.call_for(guild_id).unwrap().last_track();
+        let epoch_before = registry.guilds.lock().await.get(&guild_id).unwrap().epoch;
+
+        registry.stop(guild_id).await.unwrap();
+
+        assert!(track.was_stopped());
+        let guilds = registry.guilds.lock().await;
+        let state = guilds.get(&guild_id).unwrap();
+        assert!(state.now_playing.is_none());
+        assert!(state.queue.is_empty());
+        assert!(state.current_track_id.is_none());
+        assert!(state.current_handle.is_none());
+        assert_eq!(state.epoch, epoch_before.wrapping_add(1));
+    }
+
+    #[tokio::test]
+    async fn stop_with_nothing_playing_reports_nothing_playing() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+
+        let err = registry.stop(guild_id).await.unwrap_err();
+
+        assert!(matches!(err, PlayerError::NothingPlaying));
+    }
+
+    // ---- jump_to() ----
+
+    #[tokio::test]
+    async fn jump_to_stops_the_current_track_and_drops_skipped_entries() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry
+            .enqueue_many(guild_id, vec![queued("b"), queued("c"), queued("d")])
+            .await
+            .unwrap();
+        let a_track = backend.call_for(guild_id).unwrap().last_track();
+        let a_id = current_track_id(&registry, guild_id).await;
+
+        // Jump to upcoming[1] ("c"), dropping "b" ahead of it.
+        registry.jump_to(guild_id, 1).await.unwrap();
+
+        assert!(a_track.was_stopped());
+        let upcoming: Vec<_> = registry
+            .queue_snapshot(guild_id)
+            .await
+            .upcoming
+            .iter()
+            .map(|t| t.track.video_id.clone())
+            .collect();
+        assert_eq!(upcoming, vec!["c", "d"]);
+        // The stopped track's End event fires just as a natural end would,
+        // advancing into the new front of the queue.
+        backend.finish_track(guild_id, a_id).await;
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "c");
+        let upcoming: Vec<_> = snapshot
+            .upcoming
+            .iter()
+            .map(|t| t.track.video_id.clone())
+            .collect();
+        assert_eq!(upcoming, vec!["d"]);
+    }
+
+    /// The bug `jump_to` fixed: the queue must only be drained *after*
+    /// `stop()` on the current track succeeds — never on a failed stop,
+    /// which would drop entries out from under a track that's still
+    /// actually playing.
+    #[tokio::test]
+    async fn jump_to_does_not_drain_the_queue_if_stop_fails() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry
+            .enqueue_many(guild_id, vec![queued("b"), queued("c")])
+            .await
+            .unwrap();
+        let a_track = backend.call_for(guild_id).unwrap().last_track();
+        a_track.fail_stop("mixer gone");
+
+        let err = registry.jump_to(guild_id, 1).await.unwrap_err();
+
+        assert!(matches!(err, PlayerError::Playback(_)));
+        let upcoming: Vec<_> = registry
+            .queue_snapshot(guild_id)
+            .await
+            .upcoming
+            .iter()
+            .map(|t| t.track.video_id.clone())
+            .collect();
+        // Unchanged — the drain never ran.
+        assert_eq!(upcoming, vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn jump_to_rejects_an_out_of_range_index() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.enqueue(guild_id, queued("b")).await.unwrap();
+
+        let err = registry.jump_to(guild_id, 5).await.unwrap_err();
+
+        assert!(matches!(err, PlayerError::InvalidSelection));
+    }
+
+    // ---- leave_if_idle / schedule_idle_disconnect ----
+    //
+    // These call `leave_if_idle` directly rather than going through
+    // `schedule_idle_disconnect`'s real 150-second timer — the race it
+    // closes is about lock ordering, not timing, so a deterministic
+    // sequential call is enough to exercise it (see the handoff doc).
+
+    #[tokio::test]
+    async fn leave_if_idle_leaves_voice_when_the_guild_is_idle() {
+        let (registry, backend, guild_id) = joined_registry().await;
+
+        registry.leave_if_idle(guild_id).await;
+
+        assert!(backend.call_for(guild_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn leave_if_idle_does_nothing_if_a_track_is_playing() {
+        // Closes the race with a concurrent `enqueue`: if a track landed
+        // between the idle timer being scheduled and it firing, the guild is
+        // no longer idle and must not be torn down.
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+
+        registry.leave_if_idle(guild_id).await;
+
+        assert!(backend.call_for(guild_id).is_some());
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+    }
+
+    #[tokio::test]
+    async fn leave_if_idle_does_nothing_if_only_the_queue_is_non_empty() {
+        // Mirrors `state_with_only_a_queued_track_is_not_idle`: a queue
+        // entry with nothing playing must not be disconnected out from
+        // under either.
+        let (registry, backend, guild_id) = joined_registry().await;
+        {
+            let mut guilds = registry.guilds.lock().await;
+            guilds
+                .entry(guild_id)
+                .or_default()
+                .queue
+                .push_back(queued("a"));
+        }
+
+        registry.leave_if_idle(guild_id).await;
+
+        assert!(backend.call_for(guild_id).is_some());
+    }
+
+    // ---- join failure ----
+
+    #[tokio::test]
+    async fn join_failure_is_reported_and_leaves_no_call_registered() {
+        let db = db::connect("sqlite::memory:").await.expect("in-memory db");
+        let backend = FakeBackend::new();
+        backend.fail_next_join("no permission to join");
+        let registry = PlayerRegistry::new_for_test(backend.clone(), db);
+        let guild_id = GuildId::new(1);
+
+        let err = registry
+            .join(guild_id, ChannelId::new(2))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, PlayerError::Join(message) if message == "no permission to join"));
+        assert!(backend.call_for(guild_id).is_none());
+    }
+
+    // ---- connection_lost ----
+
+    #[tokio::test]
+    async fn connection_lost_tears_down_playback_state() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+
+        backend.disconnect(guild_id).await;
+
+        assert!(backend.call_for(guild_id).is_none());
+        let guilds = registry.guilds.lock().await;
+        assert!(guilds.get(&guild_id).is_none());
+    }
+
+    // ---- pause / resume / set_volume ----
+    //
+    // Not called out by name in the handoff's test list, but cheap to cover
+    // now that a fake track exists, and they exercise `FakeTrack` state the
+    // fakes above otherwise expose unused.
+
+    #[tokio::test]
+    async fn pause_and_resume_toggle_the_current_track() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        let track = backend.call_for(guild_id).unwrap().last_track();
+
+        registry.pause(guild_id).await.unwrap();
+        assert!(track.is_paused());
+
+        registry.resume(guild_id).await.unwrap();
+        assert!(!track.is_paused());
+    }
+
+    #[tokio::test]
+    async fn set_volume_applies_to_the_current_track() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.play_count(), 1);
+        let track = call.last_track();
+
+        registry.set_volume(guild_id, 50).await.unwrap();
+
+        assert_eq!(track.volume(), Some(0.5));
+    }
+
+    // Note on radio-refill / `epoch`: `maybe_spawn_radio_refill` only
+    // reaches its `epoch` guard after live `yt-dlp`/YouTube network calls
+    // (`radio::list_mix_video_ids`, `YouTubeClient::hydrate_videos`), which
+    // sit outside the `VoiceBackend` seam this refactor introduced — faking
+    // them would mean adding a second, wider trait boundary rather than
+    // testing through the existing one. That's left untested here, per the
+    // handoff's own scope note; `stop_clears_queue_state_stops_playback_and_bumps_the_epoch`
+    // above covers the one piece of that mechanism that *is* reachable
+    // through `VoiceBackend`: that `stop()` bumps `epoch` at all.
 }
