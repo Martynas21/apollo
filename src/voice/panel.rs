@@ -94,14 +94,14 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
 
 /// Builds the panel's button/select-menu rows: play/pause toggle, skip,
 /// stop, shuffle, and radio toggle on one row; a volume button (opens a
-/// type-in modal) alongside the Search entry point into the library on
-/// another; and — when the queue isn't empty — a select menu to jump
-/// straight to an upcoming track.
+/// type-in modal) alongside the Search and Playlists entry points into the
+/// library on another; and — when the queue isn't empty — a select menu to
+/// jump straight to an upcoming track.
 ///
-/// The playback row disables itself when nothing is playing; volume and
-/// Search stay enabled always, since volume applies to future tracks too
-/// and `/player` is meant to be usable as a cold-start entry point into the
-/// whole app.
+/// The playback row disables itself when nothing is playing; volume, Search,
+/// and Playlists stay enabled always, since volume applies to future tracks
+/// too and `/player` is meant to be usable as a cold-start entry point into
+/// the whole app.
 fn panel_components(
     snapshot: &QueueSnapshot,
     paused: Option<bool>,
@@ -162,6 +162,9 @@ fn panel_components(
         serenity::CreateButton::new("player:search")
             .label("🔍 Search")
             .style(serenity::ButtonStyle::Primary),
+        serenity::CreateButton::new("player:playlists")
+            .label("🎵 Playlists")
+            .style(serenity::ButtonStyle::Secondary),
     ]);
 
     let mut rows = vec![playback_row, controls_row];
@@ -397,6 +400,15 @@ mod tests {
         let json = components_json(&panel_components(&snapshot, None, 50, false));
         let search_button = &json[1]["components"][1];
         assert_eq!(search_button["disabled"], false);
+    }
+
+    #[test]
+    fn playlists_button_present_and_stays_enabled_when_nothing_playing() {
+        let snapshot = sample_queue_snapshot(false, 0);
+        let json = components_json(&panel_components(&snapshot, None, 50, false));
+        let playlists_button = &json[1]["components"][2];
+        assert_eq!(playlists_button["custom_id"], "player:playlists");
+        assert_eq!(playlists_button["disabled"], false);
     }
 
     #[test]

@@ -59,13 +59,14 @@ async fn main() -> anyhow::Result<()> {
         reqwest::Client::new(),
         discord_http,
         config.yt_dlp_cookies_file.clone(),
-        db_pool,
+        db_pool.clone(),
         youtube_client.clone(),
     );
 
     let data = Data {
         youtube: youtube_client,
         player,
+        db: db_pool,
     };
 
     let framework = poise::Framework::builder()

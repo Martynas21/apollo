@@ -95,6 +95,9 @@ pub async fn handle_component(
     if custom_id == "search" {
         return handle_search_button(ctx, component, data).await;
     }
+    if custom_id == "playlists" {
+        return library::handle_playlists_button(ctx, component, data).await;
+    }
     if custom_id == "volume" {
         return handle_volume_button(ctx, component, data).await;
     }

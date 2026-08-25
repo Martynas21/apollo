@@ -16,6 +16,10 @@ pub struct Data {
     pub youtube: crate::youtube::api::YouTubeClient,
     /// Per-guild playback queues and the shared songbird manager handle.
     pub player: crate::voice::PlayerRegistry,
+    /// Connection pool for saved playlists and other guild settings —
+    /// separate from `player`, which holds its own clone of the same pool
+    /// for its own persisted state (volume).
+    pub db: sqlx::SqlitePool,
 }
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

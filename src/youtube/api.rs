@@ -82,6 +82,11 @@ struct YtDlpEntry {
     uploader: Option<String>,
     #[serde(default)]
     duration: Option<f64>,
+    /// Present on every entry of a `--flat-playlist` listing (not a search),
+    /// carrying the *playlist's* title rather than this entry's own — see
+    /// [`first_playlist_title`].
+    #[serde(default)]
+    playlist_title: Option<String>,
 }
 
 /// Maps one parsed `yt-dlp -j` entry into a [`Track`]. `None` if it has no
@@ -116,6 +121,32 @@ fn parse_tracks(stdout: &str) -> Vec<Track> {
                 .and_then(track_from_entry)
         })
         .collect()
+}
+
+/// Pulls the playlist's own title out of a `--flat-playlist` listing's
+/// stdout — every entry carries it under `playlist_title`, so the first
+/// entry that has one (usually the first line) settles it. `None` for a
+/// search listing (no such field at all) or an empty/unparseable playlist.
+fn first_playlist_title(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() {
+            return None;
+        }
+        serde_json::from_str::<YtDlpEntry>(line)
+            .ok()
+            .and_then(|entry| entry.playlist_title)
+            .filter(|title| !title.is_empty())
+    })
+}
+
+/// A playlist listing: its tracks, plus its own title if `yt-dlp` reported
+/// one — used by the saved-playlists picker to default an import's name to
+/// the real playlist title instead of the raw URL when the user leaves the
+/// name field blank.
+pub struct PlaylistListing {
+    pub title: Option<String>,
+    pub tracks: Vec<Track>,
 }
 
 /// `yt-dlp`-backed `YouTube` client: search, single-video lookup, and
@@ -183,11 +214,12 @@ impl YouTubeClient {
     }
 
     /// Lists every track in a playlist, given either a full playlist URL or
-    /// a bare playlist ID (e.g. `PLxxxxxxxxxxxx`).
+    /// a bare playlist ID (e.g. `PLxxxxxxxxxxxx`), alongside the playlist's
+    /// own title if `yt-dlp` reported one.
     pub async fn list_playlist_items(
         &self,
         playlist_url_or_id: &str,
-    ) -> Result<Vec<Track>, YouTubeApiError> {
+    ) -> Result<PlaylistListing, YouTubeApiError> {
         let target = if playlist_url_or_id.contains("://") {
             playlist_url_or_id.to_string()
         } else {
@@ -196,7 +228,10 @@ impl YouTubeClient {
         let stdout = self
             .run(&["--flat-playlist", "--no-warnings"], &target)
             .await?;
-        Ok(parse_tracks(&stdout))
+        Ok(PlaylistListing {
+            title: first_playlist_title(&stdout),
+            tracks: parse_tracks(&stdout),
+        })
     }
 
     /// Looks up multiple videos by id in one `yt-dlp` invocation (used by
@@ -311,6 +346,34 @@ mod tests {
     #[test]
     fn parse_tracks_empty_stdout_yields_empty_vec() {
         assert_eq!(parse_tracks(""), Vec::new());
+    }
+
+    // ---- first_playlist_title ----
+
+    #[test]
+    fn first_playlist_title_reads_it_from_any_entry() {
+        let stdout = "{\"id\": \"a\", \"playlist_title\": \"Chill Mix\"}\n\
+             {\"id\": \"b\", \"playlist_title\": \"Chill Mix\"}\n";
+        assert_eq!(first_playlist_title(stdout), Some("Chill Mix".to_string()));
+    }
+
+    #[test]
+    fn first_playlist_title_none_when_absent() {
+        // e.g. a search listing, which has no playlist_title field at all.
+        let stdout = "{\"id\": \"a\", \"title\": \"Some Video\"}\n";
+        assert_eq!(first_playlist_title(stdout), None);
+    }
+
+    #[test]
+    fn first_playlist_title_none_when_empty_string() {
+        let stdout = "{\"id\": \"a\", \"playlist_title\": \"\"}\n";
+        assert_eq!(first_playlist_title(stdout), None);
+    }
+
+    #[test]
+    fn first_playlist_title_skips_blank_and_unparseable_lines() {
+        let stdout = "\nnot json\n{\"id\": \"a\", \"playlist_title\": \"Chill Mix\"}\n";
+        assert_eq!(first_playlist_title(stdout), Some("Chill Mix".to_string()));
     }
 
     // ---- truncate_tail ----
