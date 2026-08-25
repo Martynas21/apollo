@@ -59,6 +59,22 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+/// Like [`truncate`], but keeps the *last* `max_len` characters. yt-dlp
+/// prints non-fatal `WARNING:` lines before the fatal `ERROR:` line that
+/// actually explains a non-zero exit, so head-truncating stderr tends to
+/// surface a warning while hiding the real cause.
+fn truncate_tail(s: &str, max_len: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
+        return s.to_string();
+    }
+    let byte_idx = s
+        .char_indices()
+        .nth(char_count - max_len)
+        .map_or(0, |(idx, _)| idx);
+    format!("...{}", &s[byte_idx..])
+}
+
 /// Classifies a failed `yt-dlp` run's stderr into a [`PlaybackError`].
 /// Matching is case-insensitive and substring-based since yt-dlp's exact
 /// wording shifts across versions.
@@ -77,7 +93,7 @@ pub fn classify_ytdlp_stderr(stderr: &str) -> PlaybackError {
     {
         PlaybackError::Unavailable
     } else {
-        PlaybackError::Other(truncate(stderr, STDERR_TRUNCATE_LEN))
+        PlaybackError::Other(truncate_tail(stderr.trim_end(), STDERR_TRUNCATE_LEN))
     }
 }
 
@@ -266,6 +282,23 @@ mod tests {
         match classify_ytdlp_stderr(stderr) {
             PlaybackError::Other(message) => {
                 assert!(message.contains("novel yt-dlp failure mode"));
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_message_keeps_final_error_over_leading_warning() {
+        // Mirrors a real yt-dlp failure: a long non-fatal warning first,
+        // then the short `ERROR:` line that actually explains the
+        // non-zero exit. Head-truncation would show only the warning.
+        let stderr = format!(
+            "WARNING: [youtube] {}\nERROR: [youtube] NgsWGfUlwJI: Requested format is not available.\n",
+            "x".repeat(300)
+        );
+        match classify_ytdlp_stderr(&stderr) {
+            PlaybackError::Other(message) => {
+                assert!(message.contains("Requested format is not available"));
             }
             other => panic!("expected Other, got {other:?}"),
         }
