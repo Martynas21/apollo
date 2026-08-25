@@ -103,12 +103,16 @@ pub fn classify_ytdlp_stderr(stderr: &str) -> PlaybackError {
 /// instead of a silent/late playback failure once already connected to
 /// voice.
 ///
+/// Used by `player`'s `classify_playback_failure` on the failure path: the
+/// real resolution goes through songbird's lazy `YoutubeDl` input, whose
+/// errors arrive as opaque text, so this re-run is what turns them into a
+/// named cause worth showing a user.
+///
 /// `cookies_file`, if set, is passed through as `--cookies` — increasingly
 /// required for `yt-dlp` to get `YouTube` to serve a stream at all (see
 /// `Config::yt_dlp_cookies_file`), so the preflight check needs the same
 /// credential the real resolution in [`track_input`] will use, or it'll
 /// reject videos that would actually have played.
-#[allow(dead_code)]
 pub async fn preflight_check(
     video_id: &str,
     cookies_file: Option<&str>,
