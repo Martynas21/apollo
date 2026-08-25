@@ -7,6 +7,8 @@
 # Local SQLite database files (per-user OAuth token storage)
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 
 # cargo-llvm-cov output
 lcov.info
