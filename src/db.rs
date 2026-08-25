@@ -5,23 +5,45 @@
 //! automatically on startup.
 
 use anyhow::{Context, Result};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use sqlx::{QueryBuilder, Sqlite};
 use std::str::FromStr;
 use std::time::Duration;
 
 use crate::youtube::api::Track;
 
+/// How many rows [`replace_playlist_tracks`] inserts per multi-row
+/// `INSERT`, to stay comfortably under SQLite's bound-parameter limit
+/// (default 32766) while still batching real-world playlists (YouTube caps
+/// a single playlist at 5000 videos) in a small, fixed number of round
+/// trips instead of one `INSERT` per track.
+const TRACK_INSERT_BATCH_SIZE: usize = 500;
+
 /// Opens a connection pool for `database_url`, creating the SQLite file if
 /// it doesn't exist and running any pending migrations.
 pub async fn connect(database_url: &str) -> Result<SqlitePool> {
+    // Deliberately don't include `database_url` in these error messages: if
+    // it was misconfigured with a full connection string copy-pasted from
+    // elsewhere, it could carry credentials, and these errors get logged.
     let options = SqliteConnectOptions::from_str(database_url)
-        .with_context(|| format!("invalid DATABASE_URL: {database_url}"))?
-        .create_if_missing(true);
+        .context("invalid DATABASE_URL")?
+        .create_if_missing(true)
+        // Defense in depth alongside the `ON DELETE CASCADE` on
+        // `playlist_tracks.playlist_id`: SQLite has foreign key enforcement
+        // off by default per-connection even when FKs are declared in the
+        // schema, and this applies it to every connection the pool opens.
+        .foreign_keys(true)
+        // WAL lets readers and a writer proceed concurrently instead of a
+        // writer blocking all readers, and the busy timeout below makes a
+        // second concurrent writer (e.g. two guilds' playlist operations
+        // landing around the same time) retry instead of failing outright.
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5));
 
     let pool = SqlitePoolOptions::new()
         .connect_with(options)
         .await
-        .with_context(|| format!("failed to connect to database: {database_url}"))?;
+        .context("failed to connect to database")?;
 
     sqlx::migrate!("./migrations")
         .run(&pool)
@@ -44,9 +66,17 @@ pub async fn get_guild_volume(pool: &SqlitePool, guild_id: &str) -> Result<u8> {
             .await
             .context("failed to fetch guild volume")?;
 
-    Ok(row
-        .and_then(|(volume,)| u8::try_from(volume).ok())
-        .unwrap_or(DEFAULT_VOLUME))
+    Ok(match row {
+        Some((volume,)) => u8::try_from(volume).unwrap_or_else(|_| {
+            tracing::warn!(
+                guild_id,
+                volume,
+                "stored guild volume is out of u8 range; falling back to default"
+            );
+            DEFAULT_VOLUME
+        }),
+        None => DEFAULT_VOLUME,
+    })
 }
 
 /// Persists a guild's playback volume (0-100).
@@ -159,11 +189,21 @@ pub async fn delete_guild_playlist(pool: &SqlitePool, guild_id: &str, id: i64) -
         .await
         .context("failed to start playlist delete transaction")?;
 
-    sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ?1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .context("failed to delete cached playlist tracks")?;
+    // Scoped to the same guild (via the subquery) so this can never touch
+    // another guild's cached tracks — mirrors the ownership check the
+    // `playlists` delete below already enforces. Also backstopped by the
+    // `ON DELETE CASCADE` on `playlist_tracks.playlist_id` (see the
+    // `playlist_tracks_cascade_delete` migration), but that's defense in
+    // depth, not a substitute for scoping this statement correctly.
+    sqlx::query(
+        "DELETE FROM playlist_tracks WHERE playlist_id = \
+         (SELECT id FROM playlists WHERE guild_id = ?1 AND id = ?2)",
+    )
+    .bind(guild_id)
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .context("failed to delete cached playlist tracks")?;
 
     let result = sqlx::query("DELETE FROM playlists WHERE guild_id = ?1 AND id = ?2")
         .bind(guild_id)
@@ -225,21 +265,28 @@ pub async fn replace_playlist_tracks(
         .await
         .context("failed to clear old cached playlist tracks")?;
 
-    for (position, track) in tracks.iter().enumerate() {
-        sqlx::query(
+    // Batched into multi-row `INSERT`s (rather than one statement per
+    // track) so a large playlist holds the write lock for far fewer round
+    // trips.
+    let indexed_tracks = tracks.iter().enumerate().collect::<Vec<_>>();
+    for batch in indexed_tracks.chunks(TRACK_INSERT_BATCH_SIZE) {
+        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "INSERT INTO playlist_tracks \
-             (playlist_id, position, video_id, title, channel, duration_secs) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .bind(playlist_id)
-        .bind(position as i64)
-        .bind(&track.video_id)
-        .bind(&track.title)
-        .bind(&track.channel)
-        .bind(track.duration.map(|d| d.as_secs() as i64))
-        .execute(&mut *tx)
-        .await
-        .context("failed to insert cached playlist track")?;
+             (playlist_id, position, video_id, title, channel, duration_secs) ",
+        );
+        builder.push_values(batch, |mut b, (position, track)| {
+            b.push_bind(playlist_id)
+                .push_bind(*position as i64)
+                .push_bind(&track.video_id)
+                .push_bind(&track.title)
+                .push_bind(&track.channel)
+                .push_bind(track.duration.map(|d| d.as_secs() as i64));
+        });
+        builder
+            .build()
+            .execute(&mut *tx)
+            .await
+            .context("failed to insert cached playlist tracks")?;
     }
 
     sqlx::query("UPDATE playlists SET cached_at = unixepoch() WHERE id = ?1")
@@ -279,6 +326,24 @@ mod tests {
         // Setting again replaces rather than erroring on the existing row.
         set_guild_volume(&pool, "1", 7).await?;
         assert_eq!(get_guild_volume(&pool, "1").await?, 7);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guild_volume_falls_back_to_default_when_stored_value_is_out_of_range() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+
+        // Bypass `set_guild_volume` (which only ever writes valid `u8`
+        // values) to simulate a corrupted row.
+        sqlx::query(
+            "INSERT INTO guild_settings (guild_id, volume) VALUES ('1', 99999)
+             ON CONFLICT(guild_id) DO UPDATE SET volume = excluded.volume",
+        )
+        .execute(&pool)
+        .await?;
+
+        assert_eq!(get_guild_volume(&pool, "1").await?, DEFAULT_VOLUME);
 
         Ok(())
     }
@@ -383,10 +448,45 @@ mod tests {
             "42",
         )
         .await?;
+        replace_playlist_tracks(&pool, id, &[sample_track("a", None)]).await?;
 
         assert!(!delete_guild_playlist(&pool, "2", id).await?);
         assert!(!delete_guild_playlist(&pool, "1", 9999).await?);
         assert!(get_guild_playlist(&pool, "1", id).await?.is_some());
+        // The wrong-guild attempt above must not have touched this
+        // playlist's cached tracks — regression test for a bug where the
+        // `playlist_tracks` delete wasn't scoped to the guild at all.
+        assert_eq!(
+            get_playlist_tracks(&pool, id).await?,
+            vec![sample_track("a", None)]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_playlist_row_directly_cascades_to_its_cached_tracks() -> Result<()> {
+        // Bypasses `delete_guild_playlist` entirely to verify the `ON
+        // DELETE CASCADE` foreign key itself (added in the
+        // `playlist_tracks_cascade_delete` migration) — defense in depth
+        // for any future caller that deletes a `playlists` row directly.
+        let pool = connect("sqlite::memory:").await?;
+        let id = save_guild_playlist(
+            &pool,
+            "1",
+            "Chill Mix",
+            "https://example.com/list=abc",
+            "42",
+        )
+        .await?;
+        replace_playlist_tracks(&pool, id, &[sample_track("a", None)]).await?;
+
+        sqlx::query("DELETE FROM playlists WHERE id = ?1")
+            .bind(id)
+            .execute(&pool)
+            .await?;
+
+        assert_eq!(get_playlist_tracks(&pool, id).await?, Vec::new());
 
         Ok(())
     }
