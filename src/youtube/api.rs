@@ -309,6 +309,20 @@ fn map_video_with_snippet(resp: VideoWithSnippetResponse) -> Option<Track> {
     })
 }
 
+/// Like [`map_video_with_snippet`], but maps every item instead of just the
+/// first — used by [`YouTubeClient::hydrate_videos`]'s multi-id lookup.
+fn map_video_with_snippet_list(resp: VideoWithSnippetResponse) -> Vec<Track> {
+    resp.items
+        .into_iter()
+        .map(|item| Track {
+            video_id: item.id,
+            title: item.snippet.title,
+            channel: item.snippet.channel_title,
+            duration: parse_iso8601_duration(&item.content_details.duration),
+        })
+        .collect()
+}
+
 fn map_video_durations(resp: VideosResponse) -> HashMap<String, Option<Duration>> {
     resp.items
         .into_iter()
@@ -406,8 +420,7 @@ impl YouTubeClient {
         access_token: &str,
     ) -> Result<Vec<Playlist>, YouTubeApiError> {
         let base = &self.base_url;
-        let url =
-            format!("{base}/playlists?part=snippet,contentDetails&mine=true&maxResults=50");
+        let url = format!("{base}/playlists?part=snippet,contentDetails&mine=true&maxResults=50");
         let resp: PlaylistsResponse = self.get_json(&url, access_token).await?;
         Ok(map_playlists(resp))
     }
@@ -473,8 +486,7 @@ impl YouTubeClient {
     ) -> Result<Vec<Track>, YouTubeApiError> {
         let encoded_query = urlencoding_encode(query);
         let base = &self.base_url;
-        let url =
-            format!("{base}/search?part=snippet&type=video&q={encoded_query}&maxResults=25");
+        let url = format!("{base}/search?part=snippet&type=video&q={encoded_query}&maxResults=25");
         let resp: SearchResponse = self.get_json(&url, access_token).await?;
 
         let video_ids: Vec<&str> = resp
@@ -501,6 +513,33 @@ impl YouTubeClient {
             status: 404,
             message: "video not found".to_string(),
         })
+    }
+
+    /// Looks up multiple videos by id in one request per 50-id chunk (used
+    /// by radio mode to hydrate a batch of bare video ids from a `yt-dlp`
+    /// Mix listing into full `Track`s — see
+    /// `crate::voice::radio::list_mix_video_ids` — without an N+1 request
+    /// per candidate). Unlike `fetch_durations`, requests `snippet` too,
+    /// since callers need title/channel, not just duration.
+    ///
+    /// Ids that don't resolve (e.g. deleted/private since the Mix was
+    /// generated) are silently omitted from the result rather than erroring
+    /// the whole batch. Order is not guaranteed to match `video_ids`'s
+    /// input order.
+    pub async fn hydrate_videos(
+        &self,
+        access_token: &str,
+        video_ids: &[&str],
+    ) -> Result<Vec<Track>, YouTubeApiError> {
+        let mut tracks = Vec::new();
+        let base = &self.base_url;
+        for chunk in video_ids.chunks(50) {
+            let ids = chunk.join(",");
+            let url = format!("{base}/videos?part=snippet,contentDetails&id={ids}");
+            let resp: VideoWithSnippetResponse = self.get_json(&url, access_token).await?;
+            tracks.extend(map_video_with_snippet_list(resp));
+        }
+        Ok(tracks)
     }
 
     /// `videos.list`'s `id` filter takes a comma-separated list; chunking
@@ -809,6 +848,61 @@ mod tests {
     }
 
     #[test]
+    fn maps_video_with_snippet_list_response() {
+        let json = r#"{
+            "items": [
+                {
+                    "id": "abc123",
+                    "snippet": { "title": "First", "channelTitle": "Channel A" },
+                    "contentDetails": { "duration": "PT1M0S" }
+                },
+                {
+                    "id": "def456",
+                    "snippet": { "title": "Second", "channelTitle": "Channel B" },
+                    "contentDetails": { "duration": "PT2M0S" }
+                }
+            ]
+        }"#;
+        let resp: VideoWithSnippetResponse = serde_json::from_str(json).unwrap();
+        let tracks = map_video_with_snippet_list(resp);
+        assert_eq!(
+            tracks,
+            vec![
+                Track {
+                    video_id: "abc123".to_string(),
+                    title: "First".to_string(),
+                    channel: "Channel A".to_string(),
+                    duration: Some(Duration::from_secs(60)),
+                },
+                Track {
+                    video_id: "def456".to_string(),
+                    title: "Second".to_string(),
+                    channel: "Channel B".to_string(),
+                    duration: Some(Duration::from_secs(120)),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn maps_video_with_snippet_list_response_omits_missing_ids_without_erroring() {
+        // Simulates one of several requested ids having been deleted/made
+        // private since the mix was generated — `videos.list` just leaves
+        // it out of `items` rather than erroring.
+        let json = r#"{
+            "items": [
+                {
+                    "id": "abc123",
+                    "snippet": { "title": "Still Here", "channelTitle": "Channel A" },
+                    "contentDetails": { "duration": "PT1M0S" }
+                }
+            ]
+        }"#;
+        let resp: VideoWithSnippetResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(map_video_with_snippet_list(resp).len(), 1);
+    }
+
+    #[test]
     fn error_mapping_distinguishes_quota_from_other_403() {
         let quota_body = r#"{"error":{"errors":[{"reason":"quotaExceeded"}]}}"#;
         assert!(matches!(
@@ -893,7 +987,8 @@ mod request_count_tests {
         Mock::given(method("GET"))
             .and(path("/search"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "items": search_items })),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": search_items })),
             )
             .expect(1)
             .mount(&server)
@@ -915,6 +1010,34 @@ mod request_count_tests {
             .await;
 
         let tracks = client.search("token", "lofi").await.unwrap();
+        assert_eq!(tracks.len(), 3);
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn hydrate_videos_fetches_multiple_ids_in_one_batched_request() {
+        let (client, server) = mock_client().await;
+
+        Mock::given(method("GET"))
+            .and(path("/videos"))
+            .and(query_param("part", "snippet,contentDetails"))
+            .and(query_param("id", "vid0,vid1,vid2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [
+                    { "id": "vid0", "snippet": { "title": "T0", "channelTitle": "C" }, "contentDetails": { "duration": "PT1M0S" } },
+                    { "id": "vid1", "snippet": { "title": "T1", "channelTitle": "C" }, "contentDetails": { "duration": "PT1M0S" } },
+                    { "id": "vid2", "snippet": { "title": "T2", "channelTitle": "C" }, "contentDetails": { "duration": "PT1M0S" } },
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tracks = client
+            .hydrate_videos("token", &["vid0", "vid1", "vid2"])
+            .await
+            .unwrap();
         assert_eq!(tracks.len(), 3);
 
         server.verify().await;

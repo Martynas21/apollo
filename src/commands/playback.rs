@@ -132,6 +132,10 @@ pub async fn handle_component(
         "skip" => data.player.skip(guild_id).await,
         "stop" => data.player.stop(guild_id).await,
         "shuffle" => data.player.shuffle(guild_id).await,
+        "radio" => {
+            data.player.toggle_radio(guild_id).await;
+            Ok(())
+        }
         "jump" => match &component.data.kind {
             serenity::ComponentInteractionDataKind::StringSelect { values } => {
                 match values.first().and_then(|v| v.parse::<usize>().ok()) {
@@ -335,7 +339,10 @@ fn voice_channel_of(ctx: Context<'_>) -> Option<serenity::ChannelId> {
     })
 }
 
-async fn reply_public(ctx: Context<'_>, content: impl Into<String>) -> Result<(), Error> {
+pub(super) async fn reply_public(
+    ctx: Context<'_>,
+    content: impl Into<String>,
+) -> Result<(), Error> {
     ctx.send(poise::CreateReply::default().content(content.into()))
         .await?;
     Ok(())

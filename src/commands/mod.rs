@@ -2,6 +2,7 @@
 
 mod library;
 mod playback;
+mod radio;
 mod youtube;
 
 pub use library::handle_component as handle_library_component;
@@ -46,6 +47,7 @@ pub fn commands() -> Vec<poise::Command<Data, Error>> {
         playback::player(),
         playback::shuffle(),
         playback::volume(),
+        radio::radio(),
         library::add_to_queue(),
         library::playlists(),
         library::playlist_play(),

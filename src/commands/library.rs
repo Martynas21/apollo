@@ -961,10 +961,7 @@ mod tests {
         // function computed mm:ss itself instead of using
         // `panel::format_duration`.
         let t = track("Long Mix", "Channel", Some(Duration::from_secs(88_623)));
-        assert_eq!(
-            format_track_line(1, &t),
-            "1. Long Mix — Channel (24:37:03)"
-        );
+        assert_eq!(format_track_line(1, &t), "1. Long Mix — Channel (24:37:03)");
     }
 
     #[test]

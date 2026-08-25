@@ -8,7 +8,7 @@
 //!
 //! Constructed once in `main.rs` and shared via `Data::player`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,9 +23,12 @@ use songbird::{
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::crypto::TokenKey;
 use crate::db;
+use crate::voice::radio;
 use crate::voice::resolve::{self, PlaybackError};
-use crate::youtube::api::Track;
+use crate::youtube::api::{Track, YouTubeClient};
+use crate::youtube::oauth::{self, GoogleOAuthClient};
 
 /// A background pre-buffer for the track that's up next in the queue,
 /// started as soon as the current track begins playing so its download
@@ -97,6 +100,21 @@ struct GuildState {
     /// posted — kept current by [`PlayerRegistry::refresh_panel`] after
     /// every state-changing mutation.
     panel: Option<(ChannelId, MessageId)>,
+    /// Whether radio mode is on for this guild — a pure toggle, not tied to
+    /// any particular seed. See `radio_seed`.
+    radio_enabled: bool,
+    /// Video id of the most recently *started* track (playlist, one-off
+    /// `/play`, search result, or a radio-fetched track alike — every path
+    /// through `start_playback` updates this), used to look up the next
+    /// radio track when the queue runs dry. `None` until something has
+    /// played this session.
+    radio_seed: Option<String>,
+    /// Requester of the track `radio_seed` points at — whose linked
+    /// `YouTube` account's access token backs the background mix fetch.
+    radio_requested_by: Option<UserId>,
+    /// Video ids already surfaced by radio mode this session, so it doesn't
+    /// immediately repeat itself.
+    radio_played: HashSet<String>,
 }
 
 /// A point-in-time view of a guild's queue, for `/queue` and `/now_playing`.
@@ -120,16 +138,31 @@ pub struct PlayerRegistry {
     discord_http: Arc<serenity::Http>,
     cookies_file: Option<String>,
     db: sqlx::SqlitePool,
+    /// `YouTube` Data API client, used by radio mode's background refill to
+    /// hydrate bare video ids (from `crate::voice::radio::list_mix_video_ids`)
+    /// into full `Track`s — see `maybe_spawn_radio_refill`.
+    youtube: YouTubeClient,
+    /// Needed alongside `token_key` and `http` (reused here as the `OAuth2`
+    /// transport too) so radio mode's background refill task — which runs
+    /// from a songbird track-end callback, not a command — can obtain a
+    /// linked user's access token on its own via
+    /// `crate::youtube::oauth::get_valid_access_token`.
+    oauth_client: GoogleOAuthClient,
+    token_key: TokenKey,
     guilds: Arc<Mutex<HashMap<GuildId, GuildState>>>,
 }
 
 impl PlayerRegistry {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         songbird: Arc<Songbird>,
         http: oauth2::reqwest::Client,
         discord_http: Arc<serenity::Http>,
         cookies_file: Option<String>,
         db: sqlx::SqlitePool,
+        youtube: YouTubeClient,
+        oauth_client: GoogleOAuthClient,
+        token_key: TokenKey,
     ) -> Self {
         Self {
             songbird,
@@ -137,6 +170,9 @@ impl PlayerRegistry {
             discord_http,
             cookies_file,
             db,
+            youtube,
+            oauth_client,
+            token_key,
             guilds: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -150,6 +186,7 @@ impl PlayerRegistry {
             .join(guild_id, voice_channel_id)
             .await
             .map_err(|e| PlayerError::Join(e.to_string()))?;
+
         Ok(())
     }
 
@@ -314,8 +351,14 @@ impl PlayerRegistry {
         }
 
         let mut guilds = self.guilds.lock().await;
+        let mut needs_radio_refill = false;
         if let Some(state) = guilds.get_mut(&guild_id) {
             state.current_handle = Some(handle);
+            // Every track start updates the radio seed, regardless of how
+            // the track got here (playlist, one-off `/play`, search, or a
+            // radio-fetched track itself) — see `maybe_spawn_radio_refill`.
+            state.radio_seed = Some(queued.track.video_id.clone());
+            state.radio_requested_by = Some(queued.requested_by);
 
             // Start pre-buffering whatever's next in the queue now, so its
             // download runs in the background while this track plays.
@@ -324,7 +367,19 @@ impl PlayerRegistry {
                 state.prefetch = Some(tokio::spawn(
                     async move { registry.cached_input(&next).await },
                 ));
+            } else {
+                // Nothing queued behind this track — if radio mode is on,
+                // top the queue up in the background so a track is already
+                // waiting by the time this one ends. Deferred until after
+                // `guilds` is dropped below, since `maybe_spawn_radio_refill`
+                // does its own locking.
+                needs_radio_refill = true;
             }
+        }
+        drop(guilds);
+
+        if needs_radio_refill {
+            self.maybe_spawn_radio_refill(guild_id);
         }
 
         Ok(())
@@ -547,6 +602,141 @@ impl PlayerRegistry {
         Ok(())
     }
 
+    /// Flips radio mode for the guild and returns the new state. If it just
+    /// turned on and nothing is currently queued behind whatever's playing
+    /// (or nothing is playing at all), kicks off a refill in the background
+    /// rather than waiting for the next natural track-end.
+    pub async fn toggle_radio(&self, guild_id: GuildId) -> bool {
+        let (enabled, needs_refill) = {
+            let mut guilds = self.guilds.lock().await;
+            let state = guilds.entry(guild_id).or_default();
+            state.radio_enabled = !state.radio_enabled;
+            (state.radio_enabled, state.queue.is_empty())
+        };
+
+        if enabled && needs_refill {
+            self.maybe_spawn_radio_refill(guild_id);
+        }
+
+        self.refresh_panel(guild_id).await;
+        enabled
+    }
+
+    /// Whether radio mode is on for this guild — for the `/player` panel's
+    /// toggle button.
+    pub async fn is_radio_enabled(&self, guild_id: GuildId) -> bool {
+        let guilds = self.guilds.lock().await;
+        guilds
+            .get(&guild_id)
+            .is_some_and(|state| state.radio_enabled)
+    }
+
+    /// Spawns a background task that tops up `guild_id`'s queue with one
+    /// radio-mix track, if radio mode is on and something has already
+    /// played this session (`radio_seed`/`radio_requested_by` set). No-op
+    /// otherwise — called from `start_playback` whenever the queue goes
+    /// empty as a track starts, and from `toggle_radio` when radio is
+    /// switched on mid-session against an already-empty queue. Calling it
+    /// from both places can race (e.g. toggled on the instant a track
+    /// starts with an empty queue) — worst case two tracks land instead of
+    /// one, which is harmless and not worth guarding against.
+    ///
+    /// On any failure (no linked account, yt-dlp/mix-listing failure,
+    /// hydration failure, or an exhausted mix with no unplayed candidates
+    /// left), logs a warning and does nothing further — `advance()`'s
+    /// existing idle-disconnect path remains the safety net if the queue
+    /// stays empty.
+    fn maybe_spawn_radio_refill(&self, guild_id: GuildId) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let (enabled, seed, requested_by, played) = {
+                let guilds = registry.guilds.lock().await;
+                let Some(state) = guilds.get(&guild_id) else {
+                    return;
+                };
+                (
+                    state.radio_enabled,
+                    state.radio_seed.clone(),
+                    state.radio_requested_by,
+                    state.radio_played.clone(),
+                )
+            };
+            let (true, Some(seed), Some(requested_by)) = (enabled, seed, requested_by) else {
+                return;
+            };
+
+            let access_token = match oauth::get_valid_access_token(
+                &registry.oauth_client,
+                &registry.http,
+                &registry.db,
+                &requested_by.to_string(),
+                &registry.token_key,
+            )
+            .await
+            {
+                Ok(token) => token,
+                Err(err) => {
+                    tracing::warn!(%guild_id, %err, "radio refill: no valid access token, skipping");
+                    return;
+                }
+            };
+
+            let mix_ids =
+                match radio::list_mix_video_ids(&seed, registry.cookies_file.as_deref()).await {
+                    Ok(ids) => ids,
+                    Err(err) => {
+                        tracing::warn!(%guild_id, %seed, %err, "radio refill: failed to list mix");
+                        return;
+                    }
+                };
+
+            let candidates: Vec<&str> = mix_ids
+                .iter()
+                .map(String::as_str)
+                .filter(|id| *id != seed.as_str() && !played.contains(*id))
+                .take(5)
+                .collect();
+            if candidates.is_empty() {
+                tracing::warn!(
+                    %guild_id, %seed,
+                    "radio refill: mix exhausted, no unplayed candidates left"
+                );
+                return;
+            }
+
+            let hydrated = match registry
+                .youtube
+                .hydrate_videos(&access_token, &candidates)
+                .await
+            {
+                Ok(tracks) => tracks,
+                Err(err) => {
+                    tracing::warn!(%guild_id, %err, "radio refill: failed to hydrate mix candidates");
+                    return;
+                }
+            };
+            let Some(chosen) = hydrated.into_iter().next() else {
+                tracing::warn!(%guild_id, %seed, "radio refill: hydration returned no tracks");
+                return;
+            };
+
+            {
+                let mut guilds = registry.guilds.lock().await;
+                if let Some(state) = guilds.get_mut(&guild_id)
+                    && state.radio_enabled
+                {
+                    state.radio_played.insert(chosen.video_id.clone());
+                    state.queue.push_back(QueuedTrack {
+                        track: chosen,
+                        requested_by,
+                    });
+                }
+            }
+
+            registry.refresh_panel(guild_id).await;
+        });
+    }
+
     pub async fn queue_snapshot(&self, guild_id: GuildId) -> QueueSnapshot {
         let guilds = self.guilds.lock().await;
         match guilds.get(&guild_id) {
@@ -669,3 +859,4 @@ impl SongbirdEventHandler for TrackEndHandler {
         None
     }
 }
+

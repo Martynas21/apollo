@@ -7,6 +7,7 @@
 
 pub mod panel;
 pub mod player;
+pub mod radio;
 pub mod resolve;
 
 // Not consumed yet — Phase 6 commands wire these into `/play` and friends.

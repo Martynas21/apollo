@@ -20,9 +20,6 @@ const QUEUE_SELECT_LIMIT: usize = 25;
 /// Accent color for the now-playing embed.
 const ACCENT_COLOR: serenity::Colour = serenity::Colour::new(0x008B_5CF6);
 
-/// Number of cells in the rendered progress/volume bars.
-const BAR_LENGTH: usize = 16;
-
 /// Formats a `Duration` as `mm:ss`, or `h:mm:ss` once it reaches an hour.
 pub(crate) fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
@@ -34,20 +31,6 @@ pub(crate) fn format_duration(duration: Duration) -> String {
     } else {
         format!("{minutes}:{seconds:02}")
     }
-}
-
-/// Renders a `position`/`duration` pair as a `▬▬▬🔘▬▬▬` bar, the knob placed
-/// at the elapsed fraction.
-fn progress_bar(position: Duration, duration: Duration) -> String {
-    let ratio = if duration.is_zero() {
-        0.0
-    } else {
-        (position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
-    };
-    let knob = (ratio * (BAR_LENGTH - 1) as f64).round() as usize;
-    (0..BAR_LENGTH)
-        .map(|i| if i == knob { '🔘' } else { '▬' })
-        .collect()
 }
 
 /// Picks a volume glyph for the panel's volume button: muted, low, or full.
@@ -84,12 +67,9 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
     );
 
     let progress = match (position, queued.track.duration) {
-        (Some(pos), Some(dur)) => Some(format!(
-            "{}\n{} / {}",
-            progress_bar(pos, dur),
-            format_duration(pos),
-            format_duration(dur)
-        )),
+        (Some(pos), Some(dur)) => {
+            Some(format!("{} / {}", format_duration(pos), format_duration(dur)))
+        }
         (Some(pos), None) => Some(format_duration(pos)),
         (None, _) => None,
     };
@@ -111,9 +91,10 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
 }
 
 /// Builds the panel's button/select-menu rows: play/pause toggle, skip,
-/// stop, shuffle, a volume button (opens a type-in modal), Search/Playlists
-/// entry points into the library, and — when the queue isn't empty — a
-/// select menu to jump straight to an upcoming track.
+/// stop, shuffle, and radio toggle on one row; a volume button (opens a
+/// type-in modal) alongside the Search/Playlists entry points into the
+/// library on another; and — when the queue isn't empty — a select menu to
+/// jump straight to an upcoming track.
 ///
 /// The playback row disables itself when nothing is playing; volume,
 /// Search, and Playlists stay enabled always, since volume applies to
@@ -123,6 +104,7 @@ fn panel_components(
     snapshot: &QueueSnapshot,
     paused: Option<bool>,
     volume: u8,
+    radio_enabled: bool,
 ) -> Vec<serenity::CreateActionRow> {
     let has_now_playing = snapshot.now_playing.is_some();
 
@@ -136,6 +118,21 @@ fn panel_components(
     }
     .disabled(!has_now_playing);
 
+    // Not gated by `has_now_playing`, unlike the other buttons in this row —
+    // toggling radio mode (or discovering it needs something to play first)
+    // should work with nothing currently playing.
+    let radio_toggle = if radio_enabled {
+        serenity::CreateButton::new("player:radio")
+            .label("📻 Radio: On")
+            .style(serenity::ButtonStyle::Success)
+    } else {
+        serenity::CreateButton::new("player:radio")
+            .label("📻 Radio: Off")
+            .style(serenity::ButtonStyle::Secondary)
+    };
+
+    // At Discord's 5-button-per-row cap with `radio_toggle` included — a
+    // future addition here needs its own row.
     let playback_row = serenity::CreateActionRow::Buttons(vec![
         toggle,
         serenity::CreateButton::new("player:skip")
@@ -150,17 +147,16 @@ fn panel_components(
             .label("🔀 Shuffle")
             .style(serenity::ButtonStyle::Secondary)
             .disabled(snapshot.upcoming.len() < 2),
+        radio_toggle,
     ]);
 
-    // A single button, rather than the old step +/- pair, so the exact level
-    // is one tap (opening a type-in modal) away instead of several.
-    let volume_row = serenity::CreateActionRow::Buttons(vec![
+    // Volume (a single button, rather than the old step +/- pair, so the
+    // exact level is one tap — opening a type-in modal — away instead of
+    // several) alongside the library entry points, all on one row.
+    let controls_row = serenity::CreateActionRow::Buttons(vec![
         serenity::CreateButton::new("player:volume")
             .label(format!("{} {volume}%", volume_glyph(volume)))
             .style(serenity::ButtonStyle::Secondary),
-    ]);
-
-    let library_row = serenity::CreateActionRow::Buttons(vec![
         serenity::CreateButton::new("player:search")
             .label("🔍 Search")
             .style(serenity::ButtonStyle::Primary),
@@ -169,7 +165,7 @@ fn panel_components(
             .style(serenity::ButtonStyle::Secondary),
     ]);
 
-    let mut rows = vec![playback_row, volume_row, library_row];
+    let mut rows = vec![playback_row, controls_row];
 
     if !snapshot.upcoming.is_empty() {
         let options = snapshot
@@ -214,7 +210,8 @@ pub(crate) async fn render(
     let snapshot = registry.queue_snapshot(guild_id).await;
     let paused = registry.is_paused(guild_id).await;
     let volume = registry.get_volume(guild_id).await;
-    let components = panel_components(&snapshot, paused, volume);
+    let radio_enabled = registry.is_radio_enabled(guild_id).await;
+    let components = panel_components(&snapshot, paused, volume, radio_enabled);
 
     match &snapshot.now_playing {
         Some(queued) => {
@@ -353,28 +350,53 @@ mod tests {
     fn toggle_button_shows_resume_when_paused_and_pause_otherwise() {
         let snapshot = sample_queue_snapshot(true, 0);
 
-        let paused_json = components_json(&panel_components(&snapshot, Some(true), 50));
+        let paused_json = components_json(&panel_components(&snapshot, Some(true), 50, false));
         assert_eq!(paused_json[0]["components"][0]["label"], "▶ Resume");
 
-        let playing_json = components_json(&panel_components(&snapshot, Some(false), 50));
+        let playing_json = components_json(&panel_components(&snapshot, Some(false), 50, false));
         assert_eq!(playing_json[0]["components"][0]["label"], "⏸ Pause");
     }
 
     #[test]
     fn playback_buttons_disabled_when_nothing_playing() {
         let snapshot = sample_queue_snapshot(false, 0);
-        let json = components_json(&panel_components(&snapshot, None, 50));
-        // toggle, skip, stop, shuffle
-        for button in json[0]["components"].as_array().unwrap() {
+        let json = components_json(&panel_components(&snapshot, None, 50, false));
+        // toggle, skip, stop, shuffle — the radio toggle (last button) is
+        // deliberately exempt, see `radio_button_stays_enabled_when_nothing_playing`.
+        let buttons = json[0]["components"].as_array().unwrap();
+        for button in &buttons[..buttons.len() - 1] {
             assert_eq!(button["disabled"], true, "{button:?} should be disabled");
         }
     }
 
     #[test]
+    fn radio_button_shows_on_when_enabled_and_off_otherwise() {
+        let snapshot = sample_queue_snapshot(true, 0);
+
+        let on_json = components_json(&panel_components(&snapshot, Some(false), 50, true));
+        let on_buttons = on_json[0]["components"].as_array().unwrap();
+        let on_button = on_buttons.last().unwrap();
+        assert_eq!(on_button["label"], "📻 Radio: On");
+
+        let off_json = components_json(&panel_components(&snapshot, Some(false), 50, false));
+        let off_buttons = off_json[0]["components"].as_array().unwrap();
+        let off_button = off_buttons.last().unwrap();
+        assert_eq!(off_button["label"], "📻 Radio: Off");
+    }
+
+    #[test]
+    fn radio_button_stays_enabled_when_nothing_playing() {
+        let snapshot = sample_queue_snapshot(false, 0);
+        let json = components_json(&panel_components(&snapshot, None, 50, true));
+        let buttons = json[0]["components"].as_array().unwrap();
+        assert_eq!(buttons.last().unwrap()["disabled"], false);
+    }
+
+    #[test]
     fn search_and_playlists_buttons_stay_enabled_when_nothing_playing() {
         let snapshot = sample_queue_snapshot(false, 0);
-        let json = components_json(&panel_components(&snapshot, None, 50));
-        for button in json[2]["components"].as_array().unwrap() {
+        let json = components_json(&panel_components(&snapshot, None, 50, false));
+        for button in &json[1]["components"].as_array().unwrap()[1..] {
             assert_eq!(button["disabled"], false, "{button:?} should stay enabled");
         }
     }
@@ -382,7 +404,7 @@ mod tests {
     #[test]
     fn volume_button_shows_glyph_and_level_and_stays_enabled_when_nothing_playing() {
         let snapshot = sample_queue_snapshot(false, 0);
-        let json = components_json(&panel_components(&snapshot, None, 0));
+        let json = components_json(&panel_components(&snapshot, None, 0, false));
         let button = &json[1]["components"][0];
         assert_eq!(button["label"], "🔇 0%");
         assert_eq!(button["disabled"], false);
@@ -398,33 +420,20 @@ mod tests {
     #[test]
     fn select_menu_omitted_when_queue_empty_and_present_otherwise() {
         let empty = sample_queue_snapshot(true, 0);
-        let empty_json = components_json(&panel_components(&empty, Some(false), 50));
-        assert_eq!(empty_json.as_array().unwrap().len(), 3);
+        let empty_json = components_json(&panel_components(&empty, Some(false), 50, false));
+        assert_eq!(empty_json.as_array().unwrap().len(), 2);
 
         let nonempty = sample_queue_snapshot(true, 3);
-        let nonempty_json = components_json(&panel_components(&nonempty, Some(false), 50));
-        assert_eq!(nonempty_json.as_array().unwrap().len(), 4);
+        let nonempty_json = components_json(&panel_components(&nonempty, Some(false), 50, false));
+        assert_eq!(nonempty_json.as_array().unwrap().len(), 3);
     }
 
     #[test]
     fn select_menu_caps_options_at_25() {
         let snapshot = sample_queue_snapshot(true, 30);
-        let json = components_json(&panel_components(&snapshot, Some(false), 50));
-        let options = json[3]["components"][0]["options"].as_array().unwrap();
+        let json = components_json(&panel_components(&snapshot, Some(false), 50, false));
+        let options = json[2]["components"][0]["options"].as_array().unwrap();
         assert_eq!(options.len(), 25);
-    }
-
-    #[test]
-    fn progress_bar_places_knob_at_start_and_end() {
-        let dur = Duration::from_secs(100);
-        assert_eq!(progress_bar(Duration::ZERO, dur).chars().next(), Some('🔘'));
-        assert_eq!(progress_bar(dur, dur).chars().last(), Some('🔘'));
-    }
-
-    #[test]
-    fn progress_bar_has_fixed_length() {
-        let bar = progress_bar(Duration::from_secs(42), Duration::from_secs(213));
-        assert_eq!(bar.chars().count(), BAR_LENGTH);
     }
 
     #[test]
