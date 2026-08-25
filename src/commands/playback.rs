@@ -36,12 +36,13 @@ pub(super) fn access_token_error_message(err: &AccessTokenError) -> String {
 /// cap on a long queue.
 const QUEUE_DISPLAY_LIMIT: usize = 10;
 
-/// How much each volume button click changes the level by.
-const VOLUME_STEP: u8 = 10;
-
 /// How long the `/player` panel's Search button waits for a modal submission
 /// before giving up.
 const SEARCH_MODAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long the `/player` panel's Volume button waits for a modal submission
+/// before giving up.
+const VOLUME_MODAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Extracts a `YouTube` video ID from a URL, recognizing `youtu.be` short
 /// links, `.../watch?v=...`, and `.../shorts/...`. Returns `None` for
@@ -118,9 +119,10 @@ pub async fn handle_component(
         component.defer_ephemeral(&ctx.http).await?;
         return library::handle_playlists_button(ctx, component, data).await;
     }
+    if custom_id == "volume" {
+        return handle_volume_button(ctx, component, data).await;
+    }
 
-    // The disabled volume-level label is still a real button — it's just
-    // never clickable — so there's no arm for it below.
     let result: Result<(), PlayerError> = match custom_id {
         "toggle" => match data.player.is_paused(guild_id).await {
             Some(true) => data.player.resume(guild_id).await,
@@ -130,15 +132,6 @@ pub async fn handle_component(
         "skip" => data.player.skip(guild_id).await,
         "stop" => data.player.stop(guild_id).await,
         "shuffle" => data.player.shuffle(guild_id).await,
-        "vol_down" | "vol_up" => {
-            let current = data.player.get_volume(guild_id).await;
-            let next = if custom_id == "vol_up" {
-                current.saturating_add(VOLUME_STEP).min(100)
-            } else {
-                current.saturating_sub(VOLUME_STEP)
-            };
-            data.player.set_volume(guild_id, next).await
-        }
         "jump" => match &component.data.kind {
             serenity::ComponentInteractionDataKind::StringSelect { values } => {
                 match values.first().and_then(|v| v.parse::<usize>().ok()) {
@@ -229,6 +222,102 @@ async fn handle_search_button(
     };
 
     library::handle_search_modal_submit(ctx, &modal, data).await
+}
+
+/// Parses a typed volume field's raw text into a level (0-100). `None` if
+/// it isn't a whole number or is out of range.
+fn parse_volume_input(raw: &str) -> Option<u8> {
+    raw.trim().parse::<u8>().ok().filter(|level| *level <= 100)
+}
+
+/// Reads the typed volume level (0-100) out of a submitted volume modal.
+/// `None` if the field is missing or [`parse_volume_input`] rejects it.
+fn modal_volume(data: &serenity::ModalInteractionData) -> Option<u8> {
+    data.components.iter().find_map(|row| {
+        row.components.iter().find_map(|component| match component {
+            serenity::ActionRowComponent::InputText(input) if input.custom_id == "level" => {
+                parse_volume_input(input.value.as_deref()?)
+            }
+            _ => None,
+        })
+    })
+}
+
+/// Handles the panel's `player:volume` button: shows a one-field modal for a
+/// typed volume level, applies it, then acknowledges the modal submission
+/// with no visible change — [`crate::voice::PlayerRegistry::set_volume`]
+/// already refreshes the live panel on its own.
+async fn handle_volume_button(
+    ctx: &serenity::Context,
+    component: &serenity::ComponentInteraction,
+    data: &Data,
+) -> Result<(), Error> {
+    let guild_id = component
+        .guild_id
+        .expect("checked by handle_component before dispatch");
+    let modal_custom_id = format!("player:volume_modal:{}", component.id);
+
+    component
+        .create_response(
+            &ctx.http,
+            serenity::CreateInteractionResponse::Modal(
+                serenity::CreateModal::new(modal_custom_id.clone(), "Set Volume").components(vec![
+                    serenity::CreateActionRow::InputText(
+                        serenity::CreateInputText::new(
+                            serenity::InputTextStyle::Short,
+                            "Volume (0-100)",
+                            "level",
+                        )
+                        .placeholder("e.g. 65"),
+                    ),
+                ]),
+            ),
+        )
+        .await?;
+
+    let user_id = component.user.id;
+    let Some(modal) = serenity::ModalInteractionCollector::new(&ctx.shard)
+        .filter(move |submission| {
+            submission.data.custom_id == modal_custom_id && submission.user.id == user_id
+        })
+        .timeout(VOLUME_MODAL_TIMEOUT)
+        .await
+    else {
+        return Ok(());
+    };
+
+    let Some(level) = modal_volume(&modal.data) else {
+        modal
+            .create_response(
+                &ctx.http,
+                serenity::CreateInteractionResponse::Message(
+                    serenity::CreateInteractionResponseMessage::new()
+                        .content("enter a whole number between 0 and 100.")
+                        .ephemeral(true),
+                ),
+            )
+            .await?;
+        return Ok(());
+    };
+
+    if let Err(err) = data.player.set_volume(guild_id, level).await {
+        modal
+            .create_response(
+                &ctx.http,
+                serenity::CreateInteractionResponse::Message(
+                    serenity::CreateInteractionResponseMessage::new()
+                        .content(err.to_string())
+                        .ephemeral(true),
+                ),
+            )
+            .await?;
+        return Ok(());
+    }
+
+    modal
+        .create_response(&ctx.http, serenity::CreateInteractionResponse::Acknowledge)
+        .await?;
+    Ok(())
 }
 
 /// The invoking user's current voice channel in this guild, if any.
@@ -496,6 +585,39 @@ pub async fn volume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- parse_volume_input ----
+
+    #[test]
+    fn parses_valid_volume() {
+        assert_eq!(parse_volume_input("65"), Some(65));
+    }
+
+    #[test]
+    fn parses_volume_with_surrounding_whitespace() {
+        assert_eq!(parse_volume_input("  42 "), Some(42));
+    }
+
+    #[test]
+    fn accepts_boundary_volumes() {
+        assert_eq!(parse_volume_input("0"), Some(0));
+        assert_eq!(parse_volume_input("100"), Some(100));
+    }
+
+    #[test]
+    fn rejects_out_of_range_volume() {
+        assert_eq!(parse_volume_input("101"), None);
+    }
+
+    #[test]
+    fn rejects_non_numeric_volume() {
+        assert_eq!(parse_volume_input("loud"), None);
+    }
+
+    #[test]
+    fn rejects_fractional_volume() {
+        assert_eq!(parse_volume_input("50.5"), None);
+    }
 
     // ---- extract_video_id ----
 

@@ -17,6 +17,12 @@ use super::player::{PlayerRegistry, QueueSnapshot, QueuedTrack};
 /// Discord select menus cap out at 25 options.
 const QUEUE_SELECT_LIMIT: usize = 25;
 
+/// Accent color for the now-playing embed.
+const ACCENT_COLOR: serenity::Colour = serenity::Colour::new(0x008B_5CF6);
+
+/// Number of cells in the rendered progress/volume bars.
+const BAR_LENGTH: usize = 16;
+
 /// Formats a `Duration` as `mm:ss`, or `h:mm:ss` once it reaches an hour.
 pub(crate) fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
@@ -27,6 +33,29 @@ pub(crate) fn format_duration(duration: Duration) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// Renders a `position`/`duration` pair as a `▬▬▬🔘▬▬▬` bar, the knob placed
+/// at the elapsed fraction.
+fn progress_bar(position: Duration, duration: Duration) -> String {
+    let ratio = if duration.is_zero() {
+        0.0
+    } else {
+        (position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
+    };
+    let knob = (ratio * (BAR_LENGTH - 1) as f64).round() as usize;
+    (0..BAR_LENGTH)
+        .map(|i| if i == knob { '🔘' } else { '▬' })
+        .collect()
+}
+
+/// Picks a volume glyph for the panel's volume button: muted, low, or full.
+fn volume_glyph(volume: u8) -> char {
+    match volume {
+        0 => '🔇',
+        1..=50 => '🔉',
+        _ => '🔊',
     }
 }
 
@@ -56,7 +85,8 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
 
     let progress = match (position, queued.track.duration) {
         (Some(pos), Some(dur)) => Some(format!(
-            "{} / {}",
+            "{}\n{} / {}",
+            progress_bar(pos, dur),
             format_duration(pos),
             format_duration(dur)
         )),
@@ -65,27 +95,30 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
     };
 
     let mut embed = serenity::CreateEmbed::new()
+        .author(serenity::CreateEmbedAuthor::new("▶ Now Playing"))
+        .color(ACCENT_COLOR)
         .title(&queued.track.title)
         .url(video_url)
-        .thumbnail(thumbnail_url)
+        .image(thumbnail_url)
         .field("Channel", &queued.track.channel, true)
         .field("Requested by", format!("<@{}>", queued.requested_by), true);
 
     if let Some(progress) = progress {
-        embed = embed.field("Progress", progress, true);
+        embed = embed.field("Progress", progress, false);
     }
 
     embed
 }
 
 /// Builds the panel's button/select-menu rows: play/pause toggle, skip,
-/// stop, shuffle, volume +/-, Search/Playlists entry points into the
-/// library, and — when the queue isn't empty — a select menu to jump
-/// straight to an upcoming track.
+/// stop, shuffle, a volume button (opens a type-in modal), Search/Playlists
+/// entry points into the library, and — when the queue isn't empty — a
+/// select menu to jump straight to an upcoming track.
 ///
-/// The playback and volume rows disable themselves when nothing is playing;
-/// Search/Playlists stay enabled always, since `/player` is meant to be
-/// usable as a cold-start entry point into the whole app.
+/// The playback row disables itself when nothing is playing; volume,
+/// Search, and Playlists stay enabled always, since volume applies to
+/// future tracks too and `/player` is meant to be usable as a cold-start
+/// entry point into the whole app.
 fn panel_components(
     snapshot: &QueueSnapshot,
     paused: Option<bool>,
@@ -95,10 +128,10 @@ fn panel_components(
 
     let toggle = match paused {
         Some(true) => serenity::CreateButton::new("player:toggle")
-            .label("Resume")
+            .label("▶ Resume")
             .style(serenity::ButtonStyle::Success),
         _ => serenity::CreateButton::new("player:toggle")
-            .label("Pause")
+            .label("⏸ Pause")
             .style(serenity::ButtonStyle::Secondary),
     }
     .disabled(!has_now_playing);
@@ -106,40 +139,33 @@ fn panel_components(
     let playback_row = serenity::CreateActionRow::Buttons(vec![
         toggle,
         serenity::CreateButton::new("player:skip")
-            .label("Skip")
+            .label("⏭ Skip")
             .style(serenity::ButtonStyle::Primary)
             .disabled(!has_now_playing),
         serenity::CreateButton::new("player:stop")
-            .label("Stop")
+            .label("⏹ Stop")
             .style(serenity::ButtonStyle::Danger)
             .disabled(!has_now_playing),
         serenity::CreateButton::new("player:shuffle")
-            .label("Shuffle")
+            .label("🔀 Shuffle")
             .style(serenity::ButtonStyle::Secondary)
             .disabled(snapshot.upcoming.len() < 2),
     ]);
 
+    // A single button, rather than the old step +/- pair, so the exact level
+    // is one tap (opening a type-in modal) away instead of several.
     let volume_row = serenity::CreateActionRow::Buttons(vec![
-        serenity::CreateButton::new("player:vol_down")
-            .label("Vol \u{2212}")
-            .style(serenity::ButtonStyle::Secondary)
-            .disabled(volume == 0),
-        serenity::CreateButton::new("player:vol_label")
-            .label(format!("{volume}%"))
-            .style(serenity::ButtonStyle::Secondary)
-            .disabled(true),
-        serenity::CreateButton::new("player:vol_up")
-            .label("Vol +")
-            .style(serenity::ButtonStyle::Secondary)
-            .disabled(volume >= 100),
+        serenity::CreateButton::new("player:volume")
+            .label(format!("{} {volume}%", volume_glyph(volume)))
+            .style(serenity::ButtonStyle::Secondary),
     ]);
 
     let library_row = serenity::CreateActionRow::Buttons(vec![
         serenity::CreateButton::new("player:search")
-            .label("Search")
+            .label("🔍 Search")
             .style(serenity::ButtonStyle::Primary),
         serenity::CreateButton::new("player:playlists")
-            .label("Playlists")
+            .label("📃 Playlists")
             .style(serenity::ButtonStyle::Secondary),
     ]);
 
@@ -238,7 +264,7 @@ mod tests {
         assert_eq!(json["title"], "Some Video");
         assert_eq!(json["url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
         assert_eq!(
-            json["thumbnail"]["url"],
+            json["image"]["url"],
             "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
         );
 
@@ -256,7 +282,11 @@ mod tests {
             field_value("Requested by"),
             Some("<@123456789012345678>".to_string())
         );
-        assert_eq!(field_value("Progress"), Some("0:30 / 3:33".to_string()));
+        assert!(
+            field_value("Progress")
+                .expect("Progress field should be present")
+                .ends_with("0:30 / 3:33")
+        );
     }
 
     #[test]
@@ -324,10 +354,10 @@ mod tests {
         let snapshot = sample_queue_snapshot(true, 0);
 
         let paused_json = components_json(&panel_components(&snapshot, Some(true), 50));
-        assert_eq!(paused_json[0]["components"][0]["label"], "Resume");
+        assert_eq!(paused_json[0]["components"][0]["label"], "▶ Resume");
 
         let playing_json = components_json(&panel_components(&snapshot, Some(false), 50));
-        assert_eq!(playing_json[0]["components"][0]["label"], "Pause");
+        assert_eq!(playing_json[0]["components"][0]["label"], "⏸ Pause");
     }
 
     #[test]
@@ -350,6 +380,22 @@ mod tests {
     }
 
     #[test]
+    fn volume_button_shows_glyph_and_level_and_stays_enabled_when_nothing_playing() {
+        let snapshot = sample_queue_snapshot(false, 0);
+        let json = components_json(&panel_components(&snapshot, None, 0));
+        let button = &json[1]["components"][0];
+        assert_eq!(button["label"], "🔇 0%");
+        assert_eq!(button["disabled"], false);
+    }
+
+    #[test]
+    fn volume_glyph_reflects_level() {
+        assert_eq!(volume_glyph(0), '🔇');
+        assert_eq!(volume_glyph(50), '🔉');
+        assert_eq!(volume_glyph(100), '🔊');
+    }
+
+    #[test]
     fn select_menu_omitted_when_queue_empty_and_present_otherwise() {
         let empty = sample_queue_snapshot(true, 0);
         let empty_json = components_json(&panel_components(&empty, Some(false), 50));
@@ -366,6 +412,19 @@ mod tests {
         let json = components_json(&panel_components(&snapshot, Some(false), 50));
         let options = json[3]["components"][0]["options"].as_array().unwrap();
         assert_eq!(options.len(), 25);
+    }
+
+    #[test]
+    fn progress_bar_places_knob_at_start_and_end() {
+        let dur = Duration::from_secs(100);
+        assert_eq!(progress_bar(Duration::ZERO, dur).chars().next(), Some('🔘'));
+        assert_eq!(progress_bar(dur, dur).chars().last(), Some('🔘'));
+    }
+
+    #[test]
+    fn progress_bar_has_fixed_length() {
+        let bar = progress_bar(Duration::from_secs(42), Duration::from_secs(213));
+        assert_eq!(bar.chars().count(), BAR_LENGTH);
     }
 
     #[test]
