@@ -2,9 +2,16 @@
 //! track-end event, plus idle auto-disconnect.
 //!
 //! [`PlayerRegistry`] is the single shared entry point commands use — it
-//! owns the songbird manager handle and all per-guild queues, so every
+//! owns the voice backend handle and all per-guild queues, so every
 //! command (`/play`, `/skip`, `/queue`, ...) goes through the same state
 //! rather than each reaching into songbird directly.
+//!
+//! Songbird itself sits behind the [`VoiceBackend`]/[`VoiceCall`]/
+//! [`VoiceTrack`] traits, whose only production implementation
+//! ([`SongbirdBackend`]) forwards straight to it. That seam exists so the
+//! queue state machine below can be unit-tested without a live voice
+//! connection; it is deliberately no wider than the songbird calls this file
+//! already made.
 //!
 //! Constructed once in `main.rs` and shared via `Data::player`.
 
@@ -34,7 +41,7 @@ use crate::youtube::api::{Track, YouTubeClient};
 /// started as soon as the current track begins playing so its download
 /// finishes (or is well underway) by the time it's actually needed. See
 /// `cached_track_input`.
-type Prefetch = JoinHandle<Result<Input, PlaybackError>>;
+type Prefetch = JoinHandle<Result<AudioSource, PlaybackError>>;
 
 /// How long an empty, drained queue waits before the bot leaves the voice
 /// channel on its own. Re-checked when the timer fires (not just scheduled
@@ -147,11 +154,108 @@ impl std::fmt::Display for PlayerError {
 
 impl std::error::Error for PlayerError {}
 
+/// A resolved, playable audio source paired with the video id it was built
+/// from.
+///
+/// Opaque to the state machine — it only ever travels from one of
+/// [`VoiceBackend`]'s two resolve methods into [`VoiceCall::play`] — but the
+/// id rides along because songbird's [`Input`] says nothing about where it
+/// came from, leaving whatever is about to play it no way to name it.
+pub struct AudioSource {
+    video_id: String,
+    input: Input,
+}
+
+/// Live playback state of a track, as [`VoiceTrack::status`] reports it.
+pub struct TrackStatus {
+    pub position: Duration,
+    pub paused: bool,
+}
+
+/// The callbacks a [`VoiceBackend`] makes when songbird reports something
+/// happening on its own rather than in response to a command.
+///
+/// Implemented by [`PlayerRegistry`] and handed to the backend at each
+/// registration point rather than stored on it, so a backend can be built
+/// before the registry that owns it exists.
+#[async_trait::async_trait]
+pub trait VoiceEvents: Send + Sync + 'static {
+    /// A track reached its end, or errored out mid-stream. `track_id` says
+    /// *which* track, since a stale event can land after the track it belongs
+    /// to has already been superseded — see [`PlayerRegistry::advance`].
+    async fn track_finished(&self, guild_id: GuildId, track_id: Uuid);
+
+    /// The voice connection went away underneath us — kicked, disconnected by
+    /// a moderator, or a reconnect that ran out of retries.
+    async fn connection_lost(&self, guild_id: GuildId);
+}
+
+/// The slice of songbird this state machine actually drives: joining and
+/// dropping calls, and turning a [`Track`] into something playable.
+///
+/// Every method here corresponds to a songbird call this file already made;
+/// it is a seam for testing, not a general songbird façade. Errors are
+/// stringified at the boundary because that's all their callers ever do with
+/// them.
+#[async_trait::async_trait]
+pub trait VoiceBackend: Send + Sync + 'static {
+    /// Joins (or moves to) a voice channel, registering `events` to be told
+    /// if the connection later goes away.
+    async fn join(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        events: Arc<dyn VoiceEvents>,
+    ) -> Result<(), String>;
+
+    /// Drops the guild's call entirely, not just its voice connection — see
+    /// [`PlayerRegistry::leave_under_lock`] for why the distinction matters.
+    async fn remove(&self, guild_id: GuildId) -> Result<(), String>;
+
+    /// The guild's live call, if it has one. `None` is exactly the "not
+    /// connected" the commands report.
+    fn call(&self, guild_id: GuildId) -> Option<Arc<dyn VoiceCall>>;
+
+    /// Fully pre-buffers `track` before returning (network-bound) — see
+    /// [`resolve::cached_track_input`].
+    async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError>;
+
+    /// Builds a lazily-streamed source for `track`, the last-resort fallback
+    /// when pre-buffering fails — see [`resolve::track_input`].
+    fn streaming_source(&self, track: &Track) -> AudioSource;
+}
+
+/// One guild's live voice connection.
+#[async_trait::async_trait]
+pub trait VoiceCall: Send + Sync {
+    /// Starts `source` playing, returning a handle to control it.
+    async fn play(&self, source: AudioSource) -> Arc<dyn VoiceTrack>;
+}
+
+/// A control handle for a track that is (or was) playing.
+#[async_trait::async_trait]
+pub trait VoiceTrack: Send + Sync {
+    /// The track's own id, used to recognise stale end events.
+    fn uuid(&self) -> Uuid;
+    fn set_volume(&self, multiplier: f32) -> Result<(), String>;
+    fn stop(&self) -> Result<(), String>;
+    fn pause(&self) -> Result<(), String>;
+    fn resume(&self) -> Result<(), String>;
+    /// Registers `events` to be notified once this track ends *or* errors
+    /// out. Best-effort by design: a registration failure is logged rather
+    /// than returned, since the track still plays — it just won't
+    /// auto-advance the queue.
+    fn notify_when_finished(&self, guild_id: GuildId, events: Arc<dyn VoiceEvents>);
+    /// Live position and pause state, or `None` if songbird couldn't report
+    /// them (e.g. the track just ended in a race with this call).
+    async fn status(&self) -> Option<TrackStatus>;
+}
+
 #[derive(Default)]
 struct GuildState {
     queue: VecDeque<QueuedTrack>,
     now_playing: Option<QueuedTrack>,
-    current_handle: Option<TrackHandle>,
+    current_handle: Option<Arc<dyn VoiceTrack>>,
     /// `current_handle`'s track uuid, captured at the same time it's set.
     /// [`TrackEndHandler`] carries the uuid of the track it was registered
     /// for and `advance` checks it against this before touching state — a
@@ -285,8 +389,9 @@ pub struct QueueSnapshot {
 /// so every command shares the same songbird manager and queues.
 #[derive(Clone)]
 pub struct PlayerRegistry {
-    songbird: Arc<Songbird>,
-    http: reqwest::Client,
+    /// Songbird in production ([`SongbirdBackend`]), a fake in tests — see
+    /// [`VoiceBackend`].
+    voice: Arc<dyn VoiceBackend>,
     /// Used only to edit/delete the live `/player` panel message from
     /// contexts that aren't already handling a Discord interaction (e.g.
     /// [`TrackEndHandler`], or a `/skip` slash command refreshing a panel
@@ -302,6 +407,26 @@ pub struct PlayerRegistry {
     guilds: Arc<Mutex<HashMap<GuildId, GuildState>>>,
 }
 
+/// [`VoiceEvents`] callbacks land here from whichever backend the registry
+/// was built with, in production always [`SongbirdBackend`].
+#[async_trait::async_trait]
+impl VoiceEvents for PlayerRegistry {
+    async fn track_finished(&self, guild_id: GuildId, track_id: Uuid) {
+        self.advance(guild_id, track_id).await;
+    }
+
+    async fn connection_lost(&self, guild_id: GuildId) {
+        // Not spawned here: `DriverDisconnectHandler` already spawns before
+        // calling this, to keep songbird's event task unblocked (see its doc
+        // comment) — spawning again would just add a redundant task.
+        // `leave` is idempotent (see `DriverDisconnectHandler`'s doc comment),
+        // so this is safe even racing a local `/leave`.
+        if let Err(err) = self.leave(guild_id).await {
+            tracing::debug!(%guild_id, %err, "cleanup after voice disconnect");
+        }
+    }
+}
+
 impl PlayerRegistry {
     pub fn new(
         songbird: Arc<Songbird>,
@@ -311,9 +436,13 @@ impl PlayerRegistry {
         db: sqlx::SqlitePool,
         youtube: YouTubeClient,
     ) -> Self {
-        Self {
+        let voice = Arc::new(SongbirdBackend {
             songbird,
             http,
+            cookies_file: cookies_file.clone(),
+        });
+        Self {
+            voice,
             discord_http,
             cookies_file,
             db,
@@ -322,40 +451,31 @@ impl PlayerRegistry {
         }
     }
 
+    /// This registry as the callback sink a backend notifies. Handed out per
+    /// registration rather than stored, so [`VoiceBackend`] implementations
+    /// never need a registry to be constructed.
+    fn events(&self) -> Arc<dyn VoiceEvents> {
+        Arc::new(self.clone())
+    }
+
     pub async fn join(
         &self,
         guild_id: GuildId,
         voice_channel_id: ChannelId,
     ) -> Result<(), PlayerError> {
-        let call = self
-            .songbird
-            .join(guild_id, voice_channel_id)
+        // The backend also registers this registry for connection-loss
+        // notifications. Losing the voice connection (kicked or disconnected
+        // by a moderator, or a reconnect that exhausted its retries) is
+        // reported *only* that way — songbird fires no track End/Error for
+        // the track that was playing at the time. Without it that track's
+        // state would sit in `now_playing`/`current_handle` forever: nothing
+        // to advance the queue, nothing to time out (the idle check would
+        // keep seeing an occupied `now_playing`), and a `/player` panel
+        // frozen mid-progress-bar.
+        self.voice
+            .join(guild_id, voice_channel_id, self.events())
             .await
-            .map_err(|e| PlayerError::Join(e.to_string()))?;
-
-        // Losing the voice connection (kicked or disconnected by a
-        // moderator, or a reconnect that exhausted its retries) is reported
-        // *only* through this core event — songbird fires no track End/Error
-        // for the track that was playing at the time. Without this handler
-        // that track's state would sit in `now_playing`/`current_handle`
-        // forever: nothing to advance the queue, nothing to time out (the
-        // idle check would keep seeing an occupied `now_playing`), and a
-        // `/player` panel frozen mid-progress-bar.
-        {
-            let mut call = call.lock().await;
-            // A rejoin reuses the same `Call`, so clear first rather than
-            // stacking a second handler onto the same connection.
-            call.remove_all_global_events();
-            call.add_global_event(
-                Event::Core(CoreEvent::DriverDisconnect),
-                DriverDisconnectHandler {
-                    registry: self.clone(),
-                    guild_id,
-                },
-            );
-        }
-
-        Ok(())
+            .map_err(PlayerError::Join)
     }
 
     /// Leaves voice and drops all queued/now-playing state for the guild. If
@@ -398,11 +518,7 @@ impl PlayerRegistry {
         // songbird's manager map. `is_connected` would then keep reporting
         // this guild as connected, so `/play` would skip rejoining voice
         // and play into a `Call` with nothing on the other end.
-        let result = self
-            .songbird
-            .remove(guild_id)
-            .await
-            .map_err(|e| PlayerError::Join(e.to_string()));
+        let result = self.voice.remove(guild_id).await.map_err(PlayerError::Join);
 
         (result, removed.and_then(|state| state.panel))
     }
@@ -440,7 +556,7 @@ impl PlayerRegistry {
     }
 
     pub fn is_connected(&self, guild_id: GuildId) -> bool {
-        self.songbird.get(guild_id).is_some()
+        self.voice.call(guild_id).is_some()
     }
 
     /// Enqueues a track. If nothing is currently playing, starts it
@@ -451,10 +567,7 @@ impl PlayerRegistry {
             // Looked up under the guild lock, not before it: that's what
             // makes this mutually exclusive with `leave_if_idle`'s teardown
             // — see its doc comment.
-            let call = self
-                .songbird
-                .get(guild_id)
-                .ok_or(PlayerError::NotConnected)?;
+            let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
             let state = guilds.entry(guild_id).or_default();
             // A hand-queued track means the queue is no longer running on
             // radio fumes; give a previously exhausted mix another chance.
@@ -510,10 +623,7 @@ impl PlayerRegistry {
         let (call, needs_start) = {
             let mut guilds = self.guilds.lock().await;
             // Under the lock, as in `enqueue` — see `leave_if_idle`.
-            let call = self
-                .songbird
-                .get(guild_id)
-                .ok_or(PlayerError::NotConnected)?;
+            let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
             let state = guilds.entry(guild_id).or_default();
             state.radio_exhausted = false;
             let needs_start = state.now_playing.is_none();
@@ -555,35 +665,30 @@ impl PlayerRegistry {
         Ok(total - failed)
     }
 
-    /// Resolves a prefetch handle into a playable input, falling back to
+    /// Resolves a prefetch handle into a playable source, falling back to
     /// building fresh (rather than propagating a stale prefetch failure) if
     /// the background download errored.
-    async fn resolve_prefetched(&self, queued: &QueuedTrack, prefetched: Prefetch) -> Input {
+    async fn resolve_prefetched(&self, queued: &QueuedTrack, prefetched: Prefetch) -> AudioSource {
         match prefetched.await {
-            Ok(Ok(input)) => return input,
+            Ok(Ok(source)) => return source,
             Ok(Err(err)) => tracing::warn!(%err, "prefetch failed, resolving fresh instead"),
             Err(err) => tracing::warn!(%err, "prefetch task panicked, resolving fresh instead"),
         }
-        self.cached_input(queued).await.unwrap_or_else(|_| {
-            // `cached_track_input`'s only fallible steps are the same ones
-            // that already failed above; fall back to the plain live-stream
-            // input so playback can still be attempted rather than giving up.
-            resolve::track_input(
-                self.http.clone(),
-                &queued.track.video_id,
-                self.cookies_file.as_deref(),
-            )
-        })
+        match self.voice.buffered_source(&queued.track).await {
+            Ok(source) => source,
+            // Pre-buffering's only fallible steps are the same ones that
+            // already failed above; fall back to the plain live-stream source
+            // so playback can still be attempted rather than giving up.
+            Err(_) => self.voice.streaming_source(&queued.track),
+        }
     }
 
-    async fn cached_input(&self, queued: &QueuedTrack) -> Result<Input, PlaybackError> {
-        resolve::cached_track_input(
-            self.http.clone(),
-            &queued.track.video_id,
-            queued.track.duration,
-            self.cookies_file.as_deref(),
-        )
-        .await
+    /// Pre-buffers `queued`, for the background prefetch task
+    /// `start_playback`/`restart_prefetch` spawn for whatever's next in the
+    /// queue. Thin wrapper around the backend so that spawned task doesn't
+    /// need to reach past the registry into `self.voice` itself.
+    async fn cached_input(&self, queued: &QueuedTrack) -> Result<AudioSource, PlaybackError> {
+        self.voice.buffered_source(&queued.track).await
     }
 
     /// Turns a raw resolution failure into the clearest user-facing error
@@ -621,14 +726,14 @@ impl PlayerRegistry {
     async fn start_playback(
         &self,
         guild_id: GuildId,
-        call: Arc<Mutex<Call>>,
+        call: Arc<dyn VoiceCall>,
         queued: QueuedTrack,
         prefetched: Option<Prefetch>,
     ) -> Result<(), PlayerError> {
-        let input = match prefetched {
+        let source = match prefetched {
             Some(handle) => self.resolve_prefetched(&queued, handle).await,
-            None => match self.cached_input(&queued).await {
-                Ok(input) => input,
+            None => match self.voice.buffered_source(&queued.track).await {
+                Ok(source) => source,
                 Err(err) => {
                     return Err(self
                         .classify_playback_failure(&queued.track.video_id, err)
@@ -637,10 +742,7 @@ impl PlayerRegistry {
             },
         };
 
-        let handle = {
-            let mut call = call.lock().await;
-            call.play_input(input)
-        };
+        let handle = call.play(source).await;
         let track_id = handle.uuid();
 
         // Best-effort: a missing/unreadable volume setting shouldn't block
@@ -657,39 +759,7 @@ impl PlayerRegistry {
             tracing::warn!(%err, "failed to apply saved volume to new track");
         }
 
-        // Best-effort: if registering these hooks itself fails, the track
-        // still plays, it just won't auto-advance the queue — surfacing
-        // that as a playback failure would be misleading.
-        //
-        // `Error` (not just `End`) is required: a track whose lazy input
-        // fails to resolve/stream/decode after it starts (network drop,
-        // yt-dlp hiccup, a bad remote stream) goes to songbird's
-        // `PlayMode::Errored` without ever firing `End` — see
-        // `driver::tasks::mixer`'s handling of `InputReadyingError`/
-        // `MixStatus::Errored` in songbird 0.6. Without this handler too,
-        // such a track leaves `now_playing` stuck forever: no auto-advance,
-        // no idle-disconnect (since `now_playing` looks occupied), and no
-        // error ever surfaced to Discord — playback just silently stalls.
-        if let Err(err) = handle.add_event(
-            Event::Track(TrackEvent::End),
-            TrackEndHandler {
-                registry: self.clone(),
-                guild_id,
-                track_id,
-            },
-        ) {
-            tracing::warn!(%err, "failed to register track-end handler");
-        }
-        if let Err(err) = handle.add_event(
-            Event::Track(TrackEvent::Error),
-            TrackEndHandler {
-                registry: self.clone(),
-                guild_id,
-                track_id,
-            },
-        ) {
-            tracing::warn!(%err, "failed to register track-error handler");
-        }
+        handle.notify_when_finished(guild_id, self.events());
 
         let mut guilds = self.guilds.lock().await;
         let mut needs_radio_refill = false;
@@ -760,7 +830,7 @@ impl PlayerRegistry {
         // already guard against on their own start paths).
         let mut started = false;
         while let Some(queued) = next {
-            let Some(call) = self.songbird.get(guild_id) else {
+            let Some(call) = self.voice.call(guild_id) else {
                 break;
             };
             match self
@@ -880,7 +950,7 @@ impl PlayerRegistry {
         };
         let handle = handle.ok_or(PlayerError::NothingPlaying)?;
         let result = handle
-            .play()
+            .resume()
             .map_err(|e| PlayerError::Playback(e.to_string()));
         if result.is_ok() {
             self.refresh_panel(guild_id).await;
@@ -972,11 +1042,7 @@ impl PlayerRegistry {
                 .get(&guild_id)
                 .and_then(|state| state.current_handle.clone())
         }?;
-        handle
-            .get_info()
-            .await
-            .ok()
-            .map(|state| matches!(state.playing, PlayMode::Pause))
+        handle.status().await.map(|status| status.paused)
     }
 
     /// This guild's persisted playback volume (0-100), for display — the
@@ -1179,7 +1245,7 @@ impl PlayerRegistry {
                 .get(&guild_id)
                 .and_then(|state| state.current_handle.clone())
         }?;
-        handle.get_info().await.ok().map(|state| state.position)
+        handle.status().await.map(|status| status.position)
     }
 
     /// Atomic check-and-reserve for the `/player` command: if this guild
@@ -1337,8 +1403,182 @@ impl PlayerRegistry {
     }
 }
 
+/// Production [`VoiceBackend`]: a thin adapter over a live [`Songbird`]
+/// manager. Every method here is a direct forward to the songbird call this
+/// file made before the trait seam existed — see that trait's doc comment.
+struct SongbirdBackend {
+    songbird: Arc<Songbird>,
+    /// Used by [`resolve::track_input`]/[`resolve::cached_track_input`] for
+    /// the `yt-dlp`-resolved HTTP stream, not for Discord's API.
+    http: reqwest::Client,
+    cookies_file: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl VoiceBackend for SongbirdBackend {
+    async fn join(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        events: Arc<dyn VoiceEvents>,
+    ) -> Result<(), String> {
+        let call = self
+            .songbird
+            .join(guild_id, channel_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Losing the voice connection (kicked or disconnected by a
+        // moderator, or a reconnect that exhausted its retries) is reported
+        // *only* through this core event — songbird fires no track End/Error
+        // for the track that was playing at the time. Without this handler
+        // that track's state would sit in `now_playing`/`current_handle`
+        // forever: nothing to advance the queue, nothing to time out (the
+        // idle check would keep seeing an occupied `now_playing`), and a
+        // `/player` panel frozen mid-progress-bar.
+        let mut call = call.lock().await;
+        // A rejoin reuses the same `Call`, so clear first rather than
+        // stacking a second handler onto the same connection.
+        call.remove_all_global_events();
+        call.add_global_event(
+            Event::Core(CoreEvent::DriverDisconnect),
+            DriverDisconnectHandler { guild_id, events },
+        );
+
+        Ok(())
+    }
+
+    async fn remove(&self, guild_id: GuildId) -> Result<(), String> {
+        self.songbird
+            .remove(guild_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    fn call(&self, guild_id: GuildId) -> Option<Arc<dyn VoiceCall>> {
+        self.songbird
+            .get(guild_id)
+            .map(|call| Arc::new(SongbirdCall(call)) as Arc<dyn VoiceCall>)
+    }
+
+    async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError> {
+        let input = resolve::cached_track_input(
+            self.http.clone(),
+            &track.video_id,
+            track.duration,
+            self.cookies_file.as_deref(),
+        )
+        .await?;
+        Ok(AudioSource {
+            video_id: track.video_id.clone(),
+            input,
+        })
+    }
+
+    fn streaming_source(&self, track: &Track) -> AudioSource {
+        let input = resolve::track_input(
+            self.http.clone(),
+            &track.video_id,
+            self.cookies_file.as_deref(),
+        );
+        AudioSource {
+            video_id: track.video_id.clone(),
+            input,
+        }
+    }
+}
+
+/// [`VoiceCall`] wrapper around a live songbird [`Call`].
+struct SongbirdCall(Arc<Mutex<Call>>);
+
+#[async_trait::async_trait]
+impl VoiceCall for SongbirdCall {
+    async fn play(&self, source: AudioSource) -> Arc<dyn VoiceTrack> {
+        let handle = {
+            let mut call = self.0.lock().await;
+            call.play_input(source.input)
+        };
+        tracing::debug!(video_id = %source.video_id, track_id = %handle.uuid(), "starting track playback");
+        Arc::new(SongbirdTrack(handle))
+    }
+}
+
+/// [`VoiceTrack`] wrapper around a songbird [`TrackHandle`]. Its `uuid()`
+/// comes straight from the handle — songbird already keys each track by one
+/// internally, so [`TrackEndHandler`]'s stale-event check just reuses it
+/// rather than minting a second identity for the same track.
+struct SongbirdTrack(TrackHandle);
+
+#[async_trait::async_trait]
+impl VoiceTrack for SongbirdTrack {
+    fn uuid(&self) -> Uuid {
+        self.0.uuid()
+    }
+
+    fn set_volume(&self, multiplier: f32) -> Result<(), String> {
+        self.0.set_volume(multiplier).map_err(|e| e.to_string())
+    }
+
+    fn stop(&self) -> Result<(), String> {
+        self.0.stop().map_err(|e| e.to_string())
+    }
+
+    fn pause(&self) -> Result<(), String> {
+        self.0.pause().map_err(|e| e.to_string())
+    }
+
+    fn resume(&self) -> Result<(), String> {
+        self.0.play().map_err(|e| e.to_string())
+    }
+
+    fn notify_when_finished(&self, guild_id: GuildId, events: Arc<dyn VoiceEvents>) {
+        let track_id = self.0.uuid();
+
+        // Best-effort: if registering these hooks itself fails, the track
+        // still plays, it just won't auto-advance the queue — surfacing
+        // that as a playback failure would be misleading.
+        //
+        // `Error` (not just `End`) is required: a track whose lazy input
+        // fails to resolve/stream/decode after it starts (network drop,
+        // yt-dlp hiccup, a bad remote stream) goes to songbird's
+        // `PlayMode::Errored` without ever firing `End` — see
+        // `driver::tasks::mixer`'s handling of `InputReadyingError`/
+        // `MixStatus::Errored` in songbird 0.6. Without this handler too,
+        // such a track leaves `now_playing` stuck forever: no auto-advance,
+        // no idle-disconnect (since `now_playing` looks occupied), and no
+        // error ever surfaced to Discord — playback just silently stalls.
+        if let Err(err) = self.0.add_event(
+            Event::Track(TrackEvent::End),
+            TrackEndHandler {
+                events: events.clone(),
+                guild_id,
+                track_id,
+            },
+        ) {
+            tracing::warn!(%err, "failed to register track-end handler");
+        }
+        if let Err(err) = self.0.add_event(
+            Event::Track(TrackEvent::Error),
+            TrackEndHandler {
+                events,
+                guild_id,
+                track_id,
+            },
+        ) {
+            tracing::warn!(%err, "failed to register track-error handler");
+        }
+    }
+
+    async fn status(&self) -> Option<TrackStatus> {
+        self.0.get_info().await.ok().map(|state| TrackStatus {
+            position: state.position,
+            paused: matches!(state.playing, PlayMode::Pause),
+        })
+    }
+}
+
 struct TrackEndHandler {
-    registry: PlayerRegistry,
+    events: Arc<dyn VoiceEvents>,
     guild_id: GuildId,
     /// Uuid of the track this handler was registered for — see `advance`'s
     /// doc comment for why this is needed to ignore stale events.
@@ -1348,7 +1588,9 @@ struct TrackEndHandler {
 #[async_trait::async_trait]
 impl SongbirdEventHandler for TrackEndHandler {
     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
-        self.registry.advance(self.guild_id, self.track_id).await;
+        self.events
+            .track_finished(self.guild_id, self.track_id)
+            .await;
         None
     }
 }
@@ -1356,18 +1598,19 @@ impl SongbirdEventHandler for TrackEndHandler {
 /// Reacts to the voice connection going away underneath us — the bot being
 /// disconnected or kicked by a moderator, or a reconnect that ran out of
 /// retries. Registered as a *global* event on the `Call` in
-/// [`PlayerRegistry::join`], because songbird reports this only through
+/// [`SongbirdBackend::join`], because songbird reports this only through
 /// [`CoreEvent::DriverDisconnect`]: the track that was playing fires no
 /// `End` and no `Error`, so nothing in the track-level path ever runs.
 ///
 /// Songbird reports a deliberate local `leave` with the same event (it can't
 /// be told apart from an admin kick — both land as
-/// `DisconnectReason::Requested` via `Call::leave_local`), so the teardown
-/// below has to be idempotent. It is: `leave` on an already-torn-down guild
-/// finds no state, no panel, and no call to remove.
+/// `DisconnectReason::Requested` via `Call::leave_local`), so
+/// [`VoiceEvents::connection_lost`]'s teardown has to be idempotent. It is:
+/// `leave` on an already-torn-down guild finds no state, no panel, and no
+/// call to remove.
 struct DriverDisconnectHandler {
-    registry: PlayerRegistry,
     guild_id: GuildId,
+    events: Arc<dyn VoiceEvents>,
 }
 
 #[async_trait::async_trait]
@@ -1383,19 +1626,13 @@ impl SongbirdEventHandler for DriverDisconnectHandler {
         }
 
         // Spawned rather than awaited inline: this runs on songbird's event
-        // task, and the teardown takes the `Call` lock (via
-        // `Songbird::remove`) plus does Discord HTTP for the panel edit —
-        // none of which the event loop should be blocked on.
-        let registry = self.registry.clone();
+        // task, and the teardown behind `connection_lost` takes the `Call`
+        // lock (via `Songbird::remove`) plus does Discord HTTP for the panel
+        // edit — none of which the event loop should be blocked on.
+        let events = self.events.clone();
         let guild_id = self.guild_id;
         tokio::spawn(async move {
-            // Drops the queue and now-playing state, refreshes the `/player`
-            // panel so it stops showing a live progress bar for a track that
-            // isn't playing, and removes the dead `Call` so the next `/play`
-            // rejoins voice instead of playing into nothing.
-            if let Err(err) = registry.leave(guild_id).await {
-                tracing::debug!(%guild_id, %err, "cleanup after voice disconnect");
-            }
+            events.connection_lost(guild_id).await;
         });
 
         None
