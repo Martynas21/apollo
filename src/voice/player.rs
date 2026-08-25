@@ -760,6 +760,28 @@ impl PlayerRegistry {
         handle.get_info().await.ok().map(|state| state.position)
     }
 
+    /// If this guild already has a live `/player` panel, refreshes it in
+    /// place and returns its location — for the `/player` command to point
+    /// back at instead of posting a duplicate. Returns `None` (forgetting
+    /// the panel) if there isn't one, or if refreshing it fails, e.g.
+    /// because it was deleted out from under the pointer.
+    pub async fn existing_panel(&self, guild_id: GuildId) -> Option<(ChannelId, MessageId)> {
+        let (channel_id, message_id) = {
+            let guilds = self.guilds.lock().await;
+            guilds.get(&guild_id).and_then(|state| state.panel)
+        }?;
+
+        if self.edit_panel(guild_id, channel_id, message_id).await.is_ok() {
+            return Some((channel_id, message_id));
+        }
+
+        let mut guilds = self.guilds.lock().await;
+        if let Some(state) = guilds.get_mut(&guild_id) {
+            state.panel = None;
+        }
+        None
+    }
+
     /// Points this guild's live `/player` panel at a new message, best-effort
     /// deleting whatever panel message preceded it (ignored if it's already
     /// gone — e.g. a user deleted it themselves).

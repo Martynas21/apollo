@@ -482,20 +482,33 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     }
 }
 
-/// Posts (or reposts) this guild's persistent player panel.
+/// Posts this guild's persistent player panel, or points back at it if one's
+/// already active.
 ///
 /// Combines playback controls with Search/Playlists entry points into the
 /// library, kept up to date on its own (by [`crate::voice::PlayerRegistry`])
 /// as state changes — whether via its own buttons, a slash command, or a
 /// track ending on its own.
 ///
-/// Deletes this guild's previous panel first, if it had one, so there's
-/// never more than one live panel per guild.
+/// Only one panel is ever live per guild: if this guild already has one,
+/// this refreshes it in place and replies with a link to it instead of
+/// posting a duplicate.
 #[poise::command(slash_command, guild_only)]
 pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = ctx
         .guild_id()
         .expect("guild_only commands always have a guild");
+
+    if let Some((channel_id, message_id)) = ctx.data().player.existing_panel(guild_id).await {
+        let link = message_id.link(channel_id, Some(guild_id));
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("The player panel is already active: {link}"))
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
 
     let (content, embed, components) =
         crate::voice::panel::render(&ctx.data().player, guild_id).await;
