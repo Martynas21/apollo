@@ -49,14 +49,14 @@ FROM debian:bookworm-slim
 ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg curl unzip \
-    && curl -fL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-        -o /usr/local/bin/yt-dlp \
-    && chmod a+rx /usr/local/bin/yt-dlp \
     && case "$TARGETARCH" in \
-        amd64) deno_arch=x86_64 ;; \
-        arm64) deno_arch=aarch64 ;; \
+        amd64) deno_arch=x86_64; ytdlp_asset=yt-dlp_linux ;; \
+        arm64) deno_arch=aarch64; ytdlp_asset=yt-dlp_linux_aarch64 ;; \
         *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
        esac \
+    && curl -fL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/${ytdlp_asset}" \
+        -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp \
     && curl -fL "https://github.com/denoland/deno/releases/latest/download/deno-${deno_arch}-unknown-linux-gnu.zip" \
         -o /tmp/deno.zip \
     && unzip -q /tmp/deno.zip -d /usr/local/bin \
