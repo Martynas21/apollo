@@ -120,41 +120,30 @@ See `.env.example` for the full list and inline docs:
   `/play`/`/add_to_queue`/etc., and leaves on its own 5 minutes after the
   queue drains empty (see `IDLE_DISCONNECT` in `src/voice/player.rs`).
 
-## Deployment
+## Running it
 
 Apollo is meant to run **locally** (your own machine, not a remote
-server) — so the simplest option is just `cargo run` (or a release build)
-with a `.env` file next to it. For that setup, `.env` with restrictive
-file permissions (`chmod 600 .env`) is a genuinely sufficient way to hold
-secrets — there's no multi-tenant server or remote attack surface to
-defend against, so a secrets manager/vault would be solving a problem
-this deployment doesn't have.
+server) — either directly with `cargo run` (or a release build) and a
+`.env` file next to it, or in Docker if you'd rather not install Rust,
+`yt-dlp`, `ffmpeg`, and Deno on the host yourself. Either way it's the
+same local, single-user setup — Docker here is just a convenience
+wrapper, not a deployment.
 
-Two other starting points are provided if you'd rather run it under a
-process supervisor on the same machine — pick whichever fits, neither is
-required over the other:
+For the `.env` route, restrictive file permissions (`chmod 600 .env`) are
+a genuinely sufficient way to hold secrets — there's no multi-tenant
+server or remote attack surface to defend against, so a secrets
+manager/vault would be solving a problem this setup doesn't have.
 
-- **systemd** (the more natural fit for "runs continuously on my own
-  Linux machine"): `deploy/apollo.service` runs the binary via
-  `EnvironmentFile`. It expects the binary and an `.env` file at
-  `/opt/apollo/`, owned by a dedicated `apollo` user, with the `.env` file
-  `chmod 600` — same reasoning as above, just formalized as a service.
-- **Docker**: `Dockerfile` builds a release binary and a runtime image
-  with `yt-dlp` (upstream's standalone binary, not the often-stale distro
-  package) and `ffmpeg` installed. Mount a volume for `DATABASE_URL`'s
-  SQLite file so it survives container recreation, and pass the
-  environment variables above via `--env-file`/`-e` (don't bake `.env`
-  into the image — see `.dockerignore`).
+For Docker: `Dockerfile` builds a release binary and a runtime image with
+`yt-dlp` (upstream's standalone binary, not the often-stale distro
+package), `ffmpeg`, and Deno installed. Mount a volume for
+`DATABASE_URL`'s SQLite file so it survives container recreation, and
+pass the environment variables above via `--env-file`/`-e` (don't bake
+`.env` into the image — see `.dockerignore`).
 
-If this ever moves to a remote/shared host, the secrets-handling calculus
-changes — a proper secrets manager, systemd-creds, or your platform's
-native secret store would then be worth it — but that's not this
-project's current shape, so it isn't built in.
-
-Beyond local `tracing` output to stdout/stderr (captured by
-`journalctl`/your terminal either way), no additional logging/metrics
-backend is wired in — reasonable for a local single-user deployment, and
-premature before this has even been run live once.
+Beyond local `tracing` output to stdout/stderr, no additional
+logging/metrics backend is wired in — reasonable for a local single-user
+setup, and premature before this has even been run live once.
 
 ## Project layout
 
@@ -169,5 +158,4 @@ premature before this has even been run live once.
   (Mix listing for radio mode).
 - `migrations/` — sqlx SQLite migrations (embedded into the binary at
   compile time).
-- `Dockerfile`, `deploy/apollo.service` — deployment starting points, see
-  above.
+- `Dockerfile` — optional local Docker build, see above.
