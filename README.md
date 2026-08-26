@@ -136,10 +136,11 @@ manager/vault would be solving a problem this setup doesn't have.
 
 For Docker: `Dockerfile` builds a release binary and a runtime image with
 `yt-dlp` (upstream's standalone binary, not the often-stale distro
-package), `ffmpeg`, and Deno installed. Mount a volume for
-`DATABASE_URL`'s SQLite file so it survives container recreation, and
-pass the environment variables above via `--env-file`/`-e` (don't bake
-`.env` into the image — see `.dockerignore`).
+package), `ffmpeg`, and Deno installed. `compose.yaml` wires it up with a
+volume for `DATABASE_URL`'s SQLite file (so it survives container
+recreation) and reads `.env` for the rest — `docker compose up -d --build`
+is all you need. `.env` is read at runtime, not baked into the image —
+see `.dockerignore`.
 
 Beyond local `tracing` output to stdout/stderr, no additional
 logging/metrics backend is wired in — reasonable for a local single-user
@@ -158,4 +159,4 @@ setup, and premature before this has even been run live once.
   (Mix listing for radio mode).
 - `migrations/` — sqlx SQLite migrations (embedded into the binary at
   compile time).
-- `Dockerfile` — optional local Docker build, see above.
+- `Dockerfile` / `compose.yaml` — optional local Docker build, see above.
