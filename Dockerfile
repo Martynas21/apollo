@@ -16,7 +16,9 @@ RUN apt-get update \
 # (~200 crates, including the libopus_sys CMake build) on every change.
 COPY Cargo.toml Cargo.lock ./
 COPY vendor ./vendor
-RUN mkdir src && echo "fn main() {}" > src/main.rs \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    mkdir src && echo "fn main() {}" > src/main.rs \
     && cargo build --release \
     && rm -rf src
 
@@ -24,7 +26,12 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs \
 # (see src/db.rs) — nothing extra to copy into the runtime stage for it.
 COPY src ./src
 COPY migrations ./migrations
-RUN touch src/main.rs && cargo build --release
+# /app/target is a cache mount (unavailable in later stages), so the binary
+# is copied out to a normal layer path before this RUN's mount is dropped.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    touch src/main.rs && cargo build --release \
+    && cp target/release/apollo /app/apollo
 
 # ---- runtime stage ------------------------------------------------------
 FROM debian:bookworm-slim
@@ -61,7 +68,7 @@ RUN apt-get update \
 
 RUN useradd --system --create-home --home-dir /app apollo
 WORKDIR /app
-COPY --from=build /app/target/release/apollo /usr/local/bin/apollo
+COPY --from=build /app/apollo /usr/local/bin/apollo
 
 # DATABASE_URL should point at a path under a mounted volume (e.g.
 # sqlite:///data/apollo.db with -v apollo-data:/data) so per-guild playback
