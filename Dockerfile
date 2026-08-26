@@ -9,6 +9,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+COPY vendor ./vendor
 RUN cargo build --release
 
 # ---- runtime stage ------------------------------------------------------
