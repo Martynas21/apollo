@@ -1,0 +1,12 @@
+services:
+  apollo:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: sqlite:///data/apollo.db
+    volumes:
+      - apollo-data:/data
+    restart: unless-stopped
+
+volumes:
+  apollo-data:

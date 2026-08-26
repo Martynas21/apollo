@@ -104,6 +104,44 @@ fn voice_channel_of(
     })
 }
 
+/// Deletes `handle`'s ephemeral picker message (search results + a
+/// [`track_select_menu`]) after [`super::playback::REPLY_CLEANUP_DELAY`],
+/// best-effort. `/add_to_queue`'s browsing reply always lands as a followup
+/// (it's already `defer_ephemeral`'d by the time it's sent), so cleanup goes
+/// through the interaction's followup-delete endpoint rather than a plain
+/// channel-level message delete, which fails for ephemeral messages — see
+/// `playback::schedule_cleanup` for the public-reply counterpart, which can
+/// use the simpler path.
+async fn schedule_picker_cleanup(ctx: Context<'_>, handle: poise::ReplyHandle<'_>) {
+    let Context::Application(app_ctx) = ctx else {
+        return;
+    };
+    let interaction = app_ctx.interaction.clone();
+    let http = app_ctx.serenity_context.http.clone();
+    let Ok(message) = handle.into_message().await else {
+        return;
+    };
+    let message_id = message.id;
+    tokio::spawn(async move {
+        tokio::time::sleep(super::playback::REPLY_CLEANUP_DELAY).await;
+        let _ = interaction.delete_followup(http, message_id).await;
+    });
+}
+
+/// Deletes `modal`'s picker message after
+/// [`super::playback::REPLY_CLEANUP_DELAY`], best-effort. Unlike
+/// [`schedule_picker_cleanup`], [`handle_search_modal_submit`] always edits
+/// the original deferred response rather than sending a followup, so cleanup
+/// goes through `delete_response` instead.
+fn schedule_modal_picker_cleanup(ctx: &serenity::Context, modal: &serenity::ModalInteraction) {
+    let modal = modal.clone();
+    let http = ctx.http.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(super::playback::REPLY_CLEANUP_DELAY).await;
+        let _ = modal.delete_response(http).await;
+    });
+}
+
 /// Edits the picker message in place with a plain-text result and drops
 /// its select menu — used for both the success confirmation and any error
 /// along the way, since the picker is single-use per click either way.
@@ -732,6 +770,7 @@ pub(super) async fn handle_search_modal_submit(
                 )]),
         )
         .await?;
+    schedule_modal_picker_cleanup(ctx, modal);
     Ok(())
 }
 
@@ -1196,19 +1235,21 @@ pub async fn add_to_queue(
         }
 
         let listing = format_track_list(&results, ADD_TO_QUEUE_DISPLAY_LIMIT);
-        ctx.send(
-            poise::CreateReply::default()
-                .content(format!(
-                    "Search results for \"{query}\":\n{listing}\n\nSelect one below to queue it, \
-                     or run `/add_to_queue {query} <number>` to do the same without the menu."
-                ))
-                .components(vec![track_select_menu(
-                    &results,
-                    ADD_TO_QUEUE_DISPLAY_LIMIT,
-                )])
-                .ephemeral(true),
-        )
-        .await?;
+        let handle = ctx
+            .send(
+                poise::CreateReply::default()
+                    .content(format!(
+                        "Search results for \"{query}\":\n{listing}\n\nSelect one below to queue it, \
+                         or run `/add_to_queue {query} <number>` to do the same without the menu."
+                    ))
+                    .components(vec![track_select_menu(
+                        &results,
+                        ADD_TO_QUEUE_DISPLAY_LIMIT,
+                    )])
+                    .ephemeral(true),
+            )
+            .await?;
+        schedule_picker_cleanup(ctx, handle).await;
         return Ok(());
     };
 
