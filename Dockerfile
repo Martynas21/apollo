@@ -72,7 +72,10 @@ COPY --from=build /app/apollo /usr/local/bin/apollo
 
 # DATABASE_URL should point at a path under a mounted volume (e.g.
 # sqlite:///data/apollo.db with -v apollo-data:/data) so per-guild playback
-# settings survive container recreation — see README.md.
+# settings survive container recreation — see README.md. Pre-creating and
+# chown'ing it here (rather than leaving Docker to create it root-owned on
+# first mount) lets the non-root `apollo` user below actually write to it.
+RUN mkdir /data && chown apollo:apollo /data
 USER apollo
 ENV RUST_LOG=info,apollo=info
 
