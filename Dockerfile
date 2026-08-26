@@ -4,13 +4,27 @@
 FROM rust:1-bookworm AS build
 WORKDIR /app
 
+# cmake is required to build libopus_sys (a songbird dependency) from its
+# bundled Opus source — rust:1-bookworm doesn't ship it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Dependencies (crates.io + the patched vendor/ deps) are built in their own
+# layer, keyed only on Cargo.toml/Cargo.lock/vendor — so editing src/ later
+# doesn't invalidate this and force recompiling the whole dependency graph
+# (~200 crates, including the libopus_sys CMake build) on every change.
+COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
+RUN mkdir src && echo "fn main() {}" > src/main.rs \
+    && cargo build --release \
+    && rm -rf src
+
 # sqlx::migrate! embeds migrations/*.sql into the binary at compile time
 # (see src/db.rs) — nothing extra to copy into the runtime stage for it.
-COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
-COPY vendor ./vendor
-RUN cargo build --release
+RUN touch src/main.rs && cargo build --release
 
 # ---- runtime stage ------------------------------------------------------
 FROM debian:bookworm-slim
