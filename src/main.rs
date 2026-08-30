@@ -53,7 +53,10 @@ async fn main() -> anyhow::Result<()> {
     // contexts that aren't already handling a Discord interaction, e.g. the
     // track-end handler that drives auto-advance.
     let discord_http = std::sync::Arc::new(serenity::Http::new(&config.discord_token));
-    let youtube_client = youtube::api::YouTubeClient::new(config.yt_dlp_cookies_file.clone());
+    let youtube_client = youtube::api::YouTubeClient::new(
+        config.yt_dlp_cookies_file.clone(),
+        config.playlist_track_limit,
+    );
     let player = voice::PlayerRegistry::new(
         songbird.clone(),
         reqwest::Client::new(),

@@ -22,7 +22,14 @@ pub struct Config {
     /// failure) — this is the standard workaround, and matters most from a
     /// datacenter/cloud host IP, which is where this bot will typically run.
     pub yt_dlp_cookies_file: Option<String>,
+    /// Max tracks returned by a playlist import. See
+    /// `crate::youtube::api::YouTubeClient::playlist_track_limit`.
+    pub playlist_track_limit: usize,
 }
+
+/// Default for [`Config::playlist_track_limit`] when
+/// `PLAYLIST_TRACK_LIMIT` is unset.
+const DEFAULT_PLAYLIST_TRACK_LIMIT: usize = 500;
 
 impl Config {
     /// Reads configuration from process environment variables.
@@ -45,7 +52,22 @@ impl Config {
             discord_guild_id: optional_guild_id(&lookup)?,
             database_url: env_var(&lookup, "DATABASE_URL")?,
             yt_dlp_cookies_file: optional_env_var(&lookup, "YT_DLP_COOKIES_FILE"),
+            playlist_track_limit: playlist_track_limit(&lookup)?,
         })
+    }
+}
+
+fn playlist_track_limit(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<usize> {
+    match lookup("PLAYLIST_TRACK_LIMIT") {
+        Ok(value) if value.trim().is_empty() => Ok(DEFAULT_PLAYLIST_TRACK_LIMIT),
+        Ok(value) => value
+            .trim()
+            .parse()
+            .with_context(|| format!("PLAYLIST_TRACK_LIMIT is not a valid number: {value}")),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_PLAYLIST_TRACK_LIMIT),
+        Err(err) => Err(err).context("failed to read PLAYLIST_TRACK_LIMIT"),
     }
 }
 
@@ -111,6 +133,7 @@ mod tests {
         assert_eq!(config.database_url, "sqlite://test.db");
         assert_eq!(config.discord_guild_id, None);
         assert_eq!(config.yt_dlp_cookies_file, None);
+        assert_eq!(config.playlist_track_limit, 500);
     }
 
     #[test]
@@ -192,5 +215,36 @@ mod tests {
         vars.insert("YT_DLP_COOKIES_FILE", "");
         let config = Config::from_source(lookup(&vars)).unwrap();
         assert_eq!(config.yt_dlp_cookies_file, None);
+    }
+
+    #[test]
+    fn playlist_track_limit_absent_uses_default() {
+        let vars = full_vars();
+        let config = Config::from_source(lookup(&vars)).unwrap();
+        assert_eq!(config.playlist_track_limit, 500);
+    }
+
+    #[test]
+    fn playlist_track_limit_present_parses() {
+        let mut vars = full_vars();
+        vars.insert("PLAYLIST_TRACK_LIMIT", "50");
+        let config = Config::from_source(lookup(&vars)).unwrap();
+        assert_eq!(config.playlist_track_limit, 50);
+    }
+
+    #[test]
+    fn playlist_track_limit_empty_string_uses_default() {
+        let mut vars = full_vars();
+        vars.insert("PLAYLIST_TRACK_LIMIT", "");
+        let config = Config::from_source(lookup(&vars)).unwrap();
+        assert_eq!(config.playlist_track_limit, 500);
+    }
+
+    #[test]
+    fn playlist_track_limit_malformed_produces_error_naming_it() {
+        let mut vars = full_vars();
+        vars.insert("PLAYLIST_TRACK_LIMIT", "not-a-number");
+        let err = Config::from_source(lookup(&vars)).expect_err("should fail");
+        assert!(err.to_string().contains("PLAYLIST_TRACK_LIMIT"));
     }
 }

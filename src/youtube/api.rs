@@ -19,12 +19,10 @@ use tokio::process::Command;
 /// `number` selection can reach any of the fetched set.
 const SEARCH_LIMIT: usize = 25;
 
-/// Max tracks returned by `list_playlist_items`. `YouTube` playlists can run
-/// up to 5000 entries; without a cap a very large (or deliberately crafted)
-/// playlist produces an unbounded `Vec<Track>`. Passed to `yt-dlp` itself via
-/// `--playlist-end` (so it stops fetching early) and enforced again on the
-/// parsed result as a defense-in-depth backstop.
-const PLAYLIST_LIMIT: usize = 500;
+/// Default for [`YouTubeClient::playlist_track_limit`] — see
+/// `Config::playlist_track_limit` (`PLAYLIST_TRACK_LIMIT` env var) to
+/// override it.
+const DEFAULT_PLAYLIST_LIMIT: usize = 500;
 
 /// Timeout for a single `yt-dlp` search or video-lookup call.
 const YT_DLP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -242,17 +240,36 @@ fn build_playlist_target(playlist_url_or_id: &str) -> Result<String, YouTubeApiE
 
 /// `yt-dlp`-backed `YouTube` client: search, single-video lookup, and
 /// playlist listing. Cheap to clone — holds only the (optional) cookies
-/// file path, no connection state.
-#[derive(Debug, Clone, Default)]
+/// file path and the playlist track cap, no connection state.
+#[derive(Debug, Clone)]
 pub struct YouTubeClient {
     /// Path to a Netscape-format cookies file, passed to `yt-dlp` as
     /// `--cookies` when set — see `Config::yt_dlp_cookies_file`.
     cookies_file: Option<String>,
+    /// Max tracks returned by `list_playlist_items`. `YouTube` playlists can
+    /// run up to 5000 entries; without a cap a very large (or deliberately
+    /// crafted) playlist produces an unbounded `Vec<Track>`. Passed to
+    /// `yt-dlp` itself via `--playlist-end` (so it stops fetching early) and
+    /// enforced again on the parsed result as a defense-in-depth backstop.
+    /// See `Config::playlist_track_limit`.
+    playlist_track_limit: usize,
+}
+
+impl Default for YouTubeClient {
+    fn default() -> Self {
+        Self {
+            cookies_file: None,
+            playlist_track_limit: DEFAULT_PLAYLIST_LIMIT,
+        }
+    }
 }
 
 impl YouTubeClient {
-    pub fn new(cookies_file: Option<String>) -> Self {
-        Self { cookies_file }
+    pub fn new(cookies_file: Option<String>, playlist_track_limit: usize) -> Self {
+        Self {
+            cookies_file,
+            playlist_track_limit,
+        }
     }
 
     /// Runs `yt-dlp -j <extra_args...> <target>` and returns its stdout on
@@ -330,13 +347,13 @@ impl YouTubeClient {
     /// own title if `yt-dlp` reported one. Rejects anything that doesn't
     /// validate as a `YouTube` playlist URL/id (see
     /// [`YouTubeApiError::InvalidInput`]), and returns at most
-    /// [`PLAYLIST_LIMIT`] tracks.
+    /// [`Self::playlist_track_limit`] tracks.
     pub async fn list_playlist_items(
         &self,
         playlist_url_or_id: &str,
     ) -> Result<PlaylistListing, YouTubeApiError> {
         let target = build_playlist_target(playlist_url_or_id)?;
-        let playlist_end = PLAYLIST_LIMIT.to_string();
+        let playlist_end = self.playlist_track_limit.to_string();
         let stdout = self
             .run(
                 &[
@@ -350,7 +367,7 @@ impl YouTubeClient {
             )
             .await?;
         let mut tracks = parse_tracks(&stdout);
-        tracks.truncate(PLAYLIST_LIMIT);
+        tracks.truncate(self.playlist_track_limit);
         Ok(PlaylistListing {
             title: first_playlist_title(&stdout),
             tracks,
@@ -665,11 +682,12 @@ mod tests {
         assert!(build_playlist_target("not a url://at all").is_err());
     }
 
-    // ---- PLAYLIST_LIMIT truncation ----
+    // ---- playlist track limit truncation ----
 
     #[test]
     fn track_list_is_truncated_to_playlist_limit() {
-        let mut tracks: Vec<Track> = (0..PLAYLIST_LIMIT + 50)
+        let limit = DEFAULT_PLAYLIST_LIMIT;
+        let mut tracks: Vec<Track> = (0..limit + 50)
             .map(|i| Track {
                 video_id: format!("id{i}"),
                 title: String::new(),
@@ -677,8 +695,8 @@ mod tests {
                 duration: None,
             })
             .collect();
-        tracks.truncate(PLAYLIST_LIMIT);
-        assert_eq!(tracks.len(), PLAYLIST_LIMIT);
+        tracks.truncate(limit);
+        assert_eq!(tracks.len(), limit);
         assert_eq!(tracks[0].video_id, "id0");
     }
 }
