@@ -17,7 +17,7 @@ use super::{Context, Data, Error};
 use crate::db::SavedPlaylist;
 use crate::voice::QueuedTrack;
 use crate::voice::panel::{format_duration, truncate_label};
-use crate::youtube::api::Track;
+use crate::youtube::api::{Track, YouTubeApiError};
 
 /// Max results shown by `/add_to_queue` when browsing (no `number` given).
 const ADD_TO_QUEUE_DISPLAY_LIMIT: usize = 5;
@@ -721,6 +721,10 @@ pub(super) async fn handle_search_modal_submit(
 ) -> Result<(), Error> {
     modal.defer_ephemeral(&ctx.http).await?;
 
+    let Some(guild_id) = modal.guild_id else {
+        return Ok(());
+    };
+
     let Some(query) = modal_query(&modal.data) else {
         modal
             .edit_response(
@@ -731,7 +735,7 @@ pub(super) async fn handle_search_modal_submit(
         return Ok(());
     };
 
-    let results = match data.youtube.search(&query).await {
+    let results = match search_with_cache(data, guild_id, &query).await {
         Ok(results) => results,
         Err(err) => {
             modal
@@ -1212,7 +1216,10 @@ pub async fn add_to_queue(
     // (see `join_and_enqueue`), which works fine as its own followup.
     ctx.defer_ephemeral().await?;
 
-    let results = match ctx.data().youtube.search(&query).await {
+    // guild_only guarantees a guild context; ctx.guild_id() still returns
+    // Option per poise's API, so unwrap with an expect documenting why.
+    let guild_id = ctx.guild_id().expect("guild_only command has a guild id");
+    let results = match search_with_cache(ctx.data(), guild_id, &query).await {
         Ok(results) => results,
         Err(err) => {
             ctx.send(
@@ -1266,6 +1273,34 @@ pub async fn add_to_queue(
     };
 
     join_and_enqueue(ctx, track).await
+}
+
+/// Checks the guild's cached playlist tracks for `query` before shelling out
+/// to `yt-dlp` — a fast, local hit for anything already known from a saved
+/// playlist. Falls back to [`YouTubeClient::search`] (exactly as before this
+/// existed) if the cache has no matches, or if the cache lookup itself
+/// fails — a cache read failing must never block search from working.
+async fn search_with_cache(
+    data: &Data,
+    guild_id: serenity::GuildId,
+    query: &str,
+) -> Result<Vec<Track>, YouTubeApiError> {
+    match crate::db::search_cached_tracks(
+        &data.db,
+        &guild_id.to_string(),
+        query,
+        ADD_TO_QUEUE_DISPLAY_LIMIT as i64,
+    )
+    .await
+    {
+        Ok(cached) if !cached.is_empty() => return Ok(cached),
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(%err, "failed to search cached playlist tracks; falling back to yt-dlp");
+        }
+    }
+
+    data.youtube.search(query).await
 }
 
 /// 1-indexes into `items` by a `u8` selection, returning a clone. `None` for

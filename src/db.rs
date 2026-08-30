@@ -5,7 +5,9 @@
 //! automatically on startup.
 
 use anyhow::{Context, Result};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use sqlx::{QueryBuilder, Sqlite};
 use std::str::FromStr;
 use std::time::Duration;
@@ -38,6 +40,11 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool> {
         // second concurrent writer (e.g. two guilds' playlist operations
         // landing around the same time) retry instead of failing outright.
         .journal_mode(SqliteJournalMode::Wal)
+        // Safe and standard under WAL: only a full OS crash (not just this
+        // process crashing) can lose the most recent commit, an acceptable
+        // tradeoff for a bot that isn't the system of record, in exchange for
+        // skipping an fsync on every commit.
+        .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(5));
 
     let pool = SqlitePoolOptions::new()
@@ -300,6 +307,222 @@ pub async fn replace_playlist_tracks(
         .context("failed to commit playlist cache transaction")?;
 
     Ok(())
+}
+
+/// A guild's in-progress queue/radio session, as persisted by
+/// [`save_guild_session`] and restored by [`load_guild_session`]. `queue[0]`
+/// is the track to resume as `now_playing`; the rest is the upcoming queue,
+/// in order. Each track is paired with the id of the user who requested it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedSession {
+    pub radio_enabled: bool,
+    pub radio_requested_by: Option<String>,
+    /// Oldest first, capped at `RADIO_HISTORY_CAP` by the caller — see
+    /// `voice::player::GuildState::radio_history`.
+    pub radio_history: Vec<String>,
+    pub queue: Vec<(Track, String)>,
+}
+
+/// Joins `radio_history` into the comma-separated form `guild_sessions`
+/// stores it in. Video ids are `[A-Za-z0-9_-]{11}` and never contain commas,
+/// so no escaping is needed.
+fn encode_radio_history(history: &[String]) -> String {
+    history.join(",")
+}
+
+/// Inverse of [`encode_radio_history`]. Filters out empty segments as
+/// defense in depth (e.g. an empty stored string splitting into `[""]`).
+fn decode_radio_history(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Persists `session` for `guild_id`, replacing whatever was there before.
+/// If `session.queue` is empty, there's nothing worth resuming, so this just
+/// clears the guild's row instead of leaving an empty one behind — see
+/// [`clear_guild_session`].
+///
+/// Runs as one transaction so a concurrent [`load_guild_session`] never sees
+/// a half-replaced queue.
+pub async fn save_guild_session(
+    pool: &SqlitePool,
+    guild_id: &str,
+    session: &PersistedSession,
+) -> Result<()> {
+    if session.queue.is_empty() {
+        return clear_guild_session(pool, guild_id).await;
+    }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start session save transaction")?;
+
+    sqlx::query(
+        "INSERT INTO guild_sessions (guild_id, radio_enabled, radio_requested_by, radio_history) \
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(guild_id) DO UPDATE SET
+             radio_enabled = excluded.radio_enabled,
+             radio_requested_by = excluded.radio_requested_by,
+             radio_history = excluded.radio_history",
+    )
+    .bind(guild_id)
+    .bind(session.radio_enabled)
+    .bind(&session.radio_requested_by)
+    .bind(encode_radio_history(&session.radio_history))
+    .execute(&mut *tx)
+    .await
+    .context("failed to save guild session")?;
+
+    sqlx::query("DELETE FROM guild_session_queue WHERE guild_id = ?1")
+        .bind(guild_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to clear old session queue")?;
+
+    // Batched into multi-row `INSERT`s, same as `replace_playlist_tracks` —
+    // a whole playlist can be queued (and thus persisted) at once.
+    let indexed_tracks = session.queue.iter().enumerate().collect::<Vec<_>>();
+    for batch in indexed_tracks.chunks(TRACK_INSERT_BATCH_SIZE) {
+        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "INSERT INTO guild_session_queue \
+             (guild_id, position, video_id, title, channel, duration_secs, requested_by) ",
+        );
+        builder.push_values(batch, |mut b, (position, (track, requested_by))| {
+            b.push_bind(guild_id)
+                .push_bind(*position as i64)
+                .push_bind(&track.video_id)
+                .push_bind(&track.title)
+                .push_bind(&track.channel)
+                .push_bind(track.duration.map(|d| d.as_secs() as i64))
+                .push_bind(requested_by);
+        });
+        builder
+            .build()
+            .execute(&mut *tx)
+            .await
+            .context("failed to insert session queue rows")?;
+    }
+
+    tx.commit()
+        .await
+        .context("failed to commit session save transaction")?;
+
+    Ok(())
+}
+
+/// Loads `guild_id`'s persisted session, if any. `None` if there's no row,
+/// or its queue is empty (shouldn't normally happen — `save_guild_session`
+/// clears rather than saving an empty queue — but treated the same as "no
+/// session" defensively).
+pub async fn load_guild_session(
+    pool: &SqlitePool,
+    guild_id: &str,
+) -> Result<Option<PersistedSession>> {
+    let session_row: Option<(bool, Option<String>, String)> = sqlx::query_as(
+        "SELECT radio_enabled, radio_requested_by, radio_history \
+         FROM guild_sessions WHERE guild_id = ?1",
+    )
+    .bind(guild_id)
+    .fetch_optional(pool)
+    .await
+    .context("failed to fetch guild session")?;
+
+    let Some((radio_enabled, radio_requested_by, radio_history)) = session_row else {
+        return Ok(None);
+    };
+
+    let rows: Vec<(String, String, String, Option<i64>, String)> = sqlx::query_as(
+        "SELECT video_id, title, channel, duration_secs, requested_by \
+         FROM guild_session_queue WHERE guild_id = ?1 ORDER BY position",
+    )
+    .bind(guild_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to fetch session queue")?;
+
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let queue = rows
+        .into_iter()
+        .map(
+            |(video_id, title, channel, duration_secs, requested_by)| {
+                #[allow(clippy::cast_sign_loss)]
+                let track = Track {
+                    video_id,
+                    title,
+                    channel,
+                    duration: duration_secs.map(|secs| Duration::from_secs(secs as u64)),
+                };
+                (track, requested_by)
+            },
+        )
+        .collect();
+
+    Ok(Some(PersistedSession {
+        radio_enabled,
+        radio_requested_by,
+        radio_history: decode_radio_history(&radio_history),
+        queue,
+    }))
+}
+
+/// Deletes `guild_id`'s persisted session (cascading to its queue rows), for
+/// when a session ends on purpose — `/leave` or an idle disconnect — rather
+/// than a crash. A no-op if there wasn't one.
+pub async fn clear_guild_session(pool: &SqlitePool, guild_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM guild_sessions WHERE guild_id = ?1")
+        .bind(guild_id)
+        .execute(pool)
+        .await
+        .context("failed to clear guild session")?;
+
+    Ok(())
+}
+
+/// Searches a guild's cached playlist tracks by title — a fast, local
+/// alternative to shelling out to `yt-dlp` when the wanted track is already
+/// known from an imported playlist. Case-insensitive for ASCII (SQLite's
+/// `LIKE` is by default); `query`'s own `%`/`_` are escaped so they match
+/// literally rather than acting as wildcards.
+pub async fn search_cached_tracks(
+    pool: &SqlitePool,
+    guild_id: &str,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<Track>> {
+    let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
+
+    let rows: Vec<(String, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT DISTINCT pt.video_id, pt.title, pt.channel, pt.duration_secs \
+         FROM playlist_tracks pt \
+         JOIN playlists p ON p.id = pt.playlist_id \
+         WHERE p.guild_id = ?1 AND pt.title LIKE ?2 ESCAPE '\\' \
+         ORDER BY pt.title \
+         LIMIT ?3",
+    )
+    .bind(guild_id)
+    .bind(pattern)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("failed to search cached playlist tracks")?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(video_id, title, channel, duration_secs)| Track {
+            video_id,
+            title,
+            channel,
+            #[allow(clippy::cast_sign_loss)]
+            duration: duration_secs.map(|secs| Duration::from_secs(secs as u64)),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -599,6 +822,149 @@ mod tests {
                 .map(|t| t.video_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["new1", "new2"]
+        );
+
+        Ok(())
+    }
+
+    fn sample_session(queue: Vec<(Track, &str)>) -> PersistedSession {
+        PersistedSession {
+            radio_enabled: true,
+            radio_requested_by: Some("42".to_string()),
+            radio_history: vec!["a".to_string(), "b".to_string()],
+            queue: queue
+                .into_iter()
+                .map(|(track, requested_by)| (track, requested_by.to_string()))
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_guild_session_none_when_never_saved() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        assert_eq!(load_guild_session(&pool, "1").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guild_session_save_and_load_round_trip() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        let session = sample_session(vec![
+            (sample_track("a", Some(Duration::from_secs(30))), "42"),
+            (sample_track("b", None), "43"),
+        ]);
+
+        save_guild_session(&pool, "1", &session).await?;
+
+        assert_eq!(load_guild_session(&pool, "1").await?, Some(session));
+        // A different guild is unaffected.
+        assert_eq!(load_guild_session(&pool, "2").await?, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guild_session_save_replaces_rather_than_appends() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        save_guild_session(&pool, "1", &sample_session(vec![(sample_track("old", None), "42")]))
+            .await?;
+
+        let replacement = sample_session(vec![(sample_track("new", None), "42")]);
+        save_guild_session(&pool, "1", &replacement).await?;
+
+        assert_eq!(load_guild_session(&pool, "1").await?, Some(replacement));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn guild_session_save_with_empty_queue_clears_instead_of_saving() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        save_guild_session(&pool, "1", &sample_session(vec![(sample_track("a", None), "42")]))
+            .await?;
+
+        save_guild_session(&pool, "1", &sample_session(vec![])).await?;
+
+        assert_eq!(load_guild_session(&pool, "1").await?, None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_guild_session_removes_it_and_its_queue() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        save_guild_session(&pool, "1", &sample_session(vec![(sample_track("a", None), "42")]))
+            .await?;
+
+        clear_guild_session(&pool, "1").await?;
+
+        assert_eq!(load_guild_session(&pool, "1").await?, None);
+        let orphaned: Vec<(String,)> =
+            sqlx::query_as("SELECT video_id FROM guild_session_queue WHERE guild_id = '1'")
+                .fetch_all(&pool)
+                .await?;
+        assert!(orphaned.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_guild_session_is_a_no_op_when_nothing_was_saved() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        clear_guild_session(&pool, "1").await?;
+        assert_eq!(load_guild_session(&pool, "1").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_cached_tracks_matches_by_title_case_insensitively() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        let id = save_guild_playlist(&pool, "1", "Mix", "https://example.com/list=abc", "42")
+            .await?;
+        replace_playlist_tracks(
+            &pool,
+            id,
+            &[sample_track("a", None), sample_track("b", None)],
+        )
+        .await?;
+
+        let results = search_cached_tracks(&pool, "1", "title a", 10).await?;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].video_id, "a");
+
+        // A different guild's cache is not searched.
+        assert_eq!(search_cached_tracks(&pool, "2", "title a", 10).await?, Vec::new());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_cached_tracks_treats_percent_and_underscore_literally() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        let id = save_guild_playlist(&pool, "1", "Mix", "https://example.com/list=abc", "42")
+            .await?;
+        let literal = Track {
+            video_id: "lit".to_string(),
+            title: "50% off_sale".to_string(),
+            channel: "Some Channel".to_string(),
+            duration: None,
+        };
+        let decoy = Track {
+            video_id: "decoy".to_string(),
+            title: "50X offXsale".to_string(),
+            channel: "Some Channel".to_string(),
+            duration: None,
+        };
+        replace_playlist_tracks(&pool, id, &[literal, decoy]).await?;
+
+        // Without escaping, "%" and "_" would act as SQL wildcards and also
+        // match the decoy track ("X" standing in for any single character).
+        let results = search_cached_tracks(&pool, "1", "50% off_sale", 10).await?;
+
+        assert_eq!(
+            results.iter().map(|t| t.video_id.as_str()).collect::<Vec<_>>(),
+            vec!["lit"]
         );
 
         Ok(())

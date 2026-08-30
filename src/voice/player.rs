@@ -526,7 +526,143 @@ impl PlayerRegistry {
         self.voice
             .join(guild_id, voice_channel_id, self.events())
             .await
-            .map_err(PlayerError::Join)
+            .map_err(PlayerError::Join)?;
+
+        // Only reached on a successful join, which every command that joins
+        // voice makes right before its own `enqueue`/`enqueue_many` call —
+        // see `restore_session_if_new`'s doc comment for why hooking in here
+        // is enough to cover every entry point without any command-layer
+        // changes.
+        if let Some(call) = self.voice.call(guild_id) {
+            self.restore_session_if_new(guild_id, call).await;
+        }
+
+        Ok(())
+    }
+
+    /// Restores a persisted session (see [`db::load_guild_session`]) into a
+    /// guild that doesn't already have in-memory state, and starts playing
+    /// its resumed `now_playing`. A no-op if the guild already has state
+    /// (mid-session, or a concurrent `join` already restored it), or if
+    /// there's nothing persisted to restore.
+    ///
+    /// Called from [`Self::join`] rather than from the command layer: every
+    /// `/play`-style command already calls `join` immediately before its own
+    /// `enqueue`/`enqueue_many`, and by the time that runs, `now_playing`
+    /// here is already `Some` (if anything was restored), so the freshly
+    /// requested track correctly lands *behind* the resumed queue instead of
+    /// jumping ahead of it.
+    async fn restore_session_if_new(&self, guild_id: GuildId, call: Arc<dyn VoiceCall>) {
+        {
+            let guilds = self.guilds.lock().await;
+            if guilds.contains_key(&guild_id) {
+                return;
+            }
+        }
+
+        let session = match db::load_guild_session(&self.db, &guild_id.to_string()).await {
+            Ok(Some(session)) if !session.queue.is_empty() => session,
+            Ok(_) => return,
+            Err(err) => {
+                tracing::warn!(%guild_id, %err, "failed to load persisted session");
+                return;
+            }
+        };
+
+        let candidate = {
+            let mut guilds = self.guilds.lock().await;
+            let state = guilds.entry(guild_id).or_default();
+            // Lost a race against a concurrent `join`/`enqueue` that landed
+            // between the check above and now — don't clobber real state
+            // with a stale restore.
+            if state.now_playing.is_some() || !state.queue.is_empty() {
+                return;
+            }
+
+            state.radio_enabled = session.radio_enabled;
+            state.radio_requested_by = session
+                .radio_requested_by
+                .as_deref()
+                .and_then(|id| id.parse().ok())
+                .map(UserId::new);
+            state.radio_history = session.radio_history.into();
+            state.queue = session
+                .queue
+                .into_iter()
+                .filter_map(|(track, requested_by)| {
+                    requested_by.parse().ok().map(|id| QueuedTrack {
+                        track,
+                        requested_by: UserId::new(id),
+                    })
+                })
+                .collect();
+            state.now_playing = state.queue.pop_front();
+            state.now_playing.clone()
+        };
+
+        // Mirrors `enqueue_many`'s start-and-retry loop: walk past restored
+        // tracks that fail to start instead of stalling on the first one.
+        let mut candidate = candidate;
+        let mut started = false;
+        while let Some(queued) = candidate {
+            match self
+                .start_playback(guild_id, call.clone(), queued, None)
+                .await
+            {
+                Ok(()) => {
+                    started = true;
+                    break;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "failed to start a restored session track, trying the next one");
+                    candidate = self.promote_next(guild_id).await;
+                }
+            }
+        }
+
+        if !started {
+            self.schedule_idle_disconnect(guild_id);
+        }
+
+        self.refresh_panel(guild_id).await;
+    }
+
+    /// Snapshots this guild's queue/radio state to the database, so a crash
+    /// or restart doesn't drop it — see [`Self::restore_session_if_new`].
+    /// Best-effort: a failure is logged, never surfaced as a [`PlayerError`],
+    /// since persistence must not stand in the way of playback.
+    ///
+    /// Called after every mutation that changes what a restore would need to
+    /// reproduce (queue contents, `now_playing`, radio state) — not after
+    /// every mutation in general, so e.g. `pause`/`resume`/`set_volume` don't
+    /// pay for a write that would restore into exactly the same state anyway.
+    async fn persist_session(&self, guild_id: GuildId) {
+        let guild_id_str = guild_id.to_string();
+        let session = {
+            let guilds = self.guilds.lock().await;
+            match guilds.get(&guild_id) {
+                Some(state) if !state.is_idle() => Some(db::PersistedSession {
+                    radio_enabled: state.radio_enabled,
+                    radio_requested_by: state.radio_requested_by.map(|id| id.to_string()),
+                    radio_history: Vec::from(state.radio_history.clone()),
+                    queue: state
+                        .now_playing
+                        .iter()
+                        .chain(state.queue.iter())
+                        .map(|queued| (queued.track.clone(), queued.requested_by.to_string()))
+                        .collect(),
+                }),
+                _ => None,
+            }
+        };
+
+        let result = match session {
+            Some(session) => db::save_guild_session(&self.db, &guild_id_str, &session).await,
+            None => db::clear_guild_session(&self.db, &guild_id_str).await,
+        };
+        if let Err(err) = result {
+            tracing::warn!(%guild_id, %err, "failed to persist guild session");
+        }
     }
 
     /// Leaves voice and drops all queued/now-playing state for the guild. If
@@ -544,6 +680,9 @@ impl PlayerRegistry {
         if let Some((channel_id, message_id)) = panel {
             let _ = self.edit_panel(guild_id, channel_id, message_id).await;
         }
+        // An explicit `/leave` means the session is over on purpose, not "a
+        // crash happened" — nothing to resume next time, unlike a restart.
+        self.persist_session(guild_id).await;
         result
     }
 
@@ -604,6 +743,10 @@ impl PlayerRegistry {
         if let Some((channel_id, message_id)) = panel {
             let _ = self.edit_panel(guild_id, channel_id, message_id).await;
         }
+        // Reaching here means the guild really was idle (empty queue, per
+        // `is_idle`), so there's nothing to persist — this just clears any
+        // stale row from before the idle disconnect.
+        self.persist_session(guild_id).await;
     }
 
     pub fn is_connected(&self, guild_id: GuildId) -> bool {
@@ -648,6 +791,7 @@ impl PlayerRegistry {
         }
 
         self.refresh_panel(guild_id).await;
+        self.persist_session(guild_id).await;
         Ok(())
     }
 
@@ -713,6 +857,7 @@ impl PlayerRegistry {
         }
 
         self.refresh_panel(guild_id).await;
+        self.persist_session(guild_id).await;
         Ok(total - failed)
     }
 
@@ -907,6 +1052,7 @@ impl PlayerRegistry {
         }
 
         self.refresh_panel(guild_id).await;
+        self.persist_session(guild_id).await;
     }
 
     fn schedule_idle_disconnect(&self, guild_id: GuildId) {
@@ -959,6 +1105,7 @@ impl PlayerRegistry {
         if result.is_ok() {
             self.schedule_idle_disconnect(guild_id);
             self.refresh_panel(guild_id).await;
+            self.persist_session(guild_id).await;
         }
         result
     }
@@ -1030,6 +1177,7 @@ impl PlayerRegistry {
         drop(guilds);
 
         self.refresh_panel(guild_id).await;
+        self.persist_session(guild_id).await;
         Ok(())
     }
 
@@ -1065,6 +1213,9 @@ impl PlayerRegistry {
         if index > 0 {
             self.restart_prefetch(state);
         }
+        drop(guilds);
+
+        self.persist_session(guild_id).await;
         Ok(())
     }
 
@@ -1153,6 +1304,7 @@ impl PlayerRegistry {
         }
 
         self.refresh_panel(guild_id).await;
+        self.persist_session(guild_id).await;
         enabled
     }
 
@@ -1285,6 +1437,7 @@ impl PlayerRegistry {
 
             if pushed > 0 {
                 registry.refresh_panel(guild_id).await;
+                registry.persist_session(guild_id).await;
             }
         });
     }
@@ -2547,6 +2700,123 @@ mod tests {
         registry.set_volume(guild_id, 50).await.unwrap();
 
         assert_eq!(track.volume(), Some(0.5));
+    }
+
+    // ---- session persistence (persist_session / restore_session_if_new) ----
+
+    #[tokio::test]
+    async fn enqueue_persists_a_resumable_session() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.enqueue(guild_id, queued("b")).await.unwrap();
+
+        let session = db::load_guild_session(&registry.db, &guild_id.to_string())
+            .await
+            .unwrap()
+            .expect("a session should have been persisted");
+        assert_eq!(
+            session
+                .queue
+                .iter()
+                .map(|(track, _)| track.video_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_clears_the_persisted_session() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+
+        registry.stop(guild_id).await.unwrap();
+
+        assert_eq!(
+            db::load_guild_session(&registry.db, &guild_id.to_string())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn leave_clears_the_persisted_session() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+
+        registry.leave(guild_id).await.unwrap();
+
+        assert_eq!(
+            db::load_guild_session(&registry.db, &guild_id.to_string())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn join_restores_a_persisted_session_and_starts_its_now_playing() {
+        let (registry, backend, guild_id) = new_registry().await;
+        let session = db::PersistedSession {
+            radio_enabled: true,
+            radio_requested_by: Some("1".to_string()),
+            radio_history: vec!["a".to_string()],
+            queue: vec![
+                (queued("a").track, "1".to_string()),
+                (queued("b").track, "1".to_string()),
+            ],
+        };
+        db::save_guild_session(&registry.db, &guild_id.to_string(), &session)
+            .await
+            .unwrap();
+
+        registry.join(guild_id, ChannelId::new(2)).await.unwrap();
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["b"]);
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+        assert!(registry.is_radio_enabled(guild_id).await);
+    }
+
+    /// The ordering `restore_session_if_new` exists to guarantee: a freshly
+    /// requested track must land behind whatever session was resumed, not
+    /// jump ahead of it.
+    #[tokio::test]
+    async fn enqueue_after_restore_appends_behind_the_resumed_queue() {
+        let (registry, backend, guild_id) = new_registry().await;
+        let session = db::PersistedSession {
+            radio_enabled: false,
+            radio_requested_by: None,
+            radio_history: Vec::new(),
+            queue: vec![(queued("a").track, "1".to_string())],
+        };
+        db::save_guild_session(&registry.db, &guild_id.to_string(), &session)
+            .await
+            .unwrap();
+
+        registry.join(guild_id, ChannelId::new(2)).await.unwrap();
+        registry.enqueue(guild_id, queued("new")).await.unwrap();
+
+        let call = backend.call_for(guild_id).unwrap();
+        // Only the restored "a" was ever started — "new" sits behind it.
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["new"]);
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+    }
+
+    #[tokio::test]
+    async fn join_with_no_persisted_session_starts_with_an_empty_queue() {
+        let (registry, backend, guild_id) = new_registry().await;
+
+        registry.join(guild_id, ChannelId::new(2)).await.unwrap();
+
+        assert!(backend.call_for(guild_id).unwrap().played_video_ids().is_empty());
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert!(snapshot.now_playing.is_none());
     }
 
     // Note on radio-refill / `epoch`: `maybe_spawn_radio_refill` only
