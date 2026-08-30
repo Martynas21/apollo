@@ -434,16 +434,24 @@ pub async fn play(
         return library::join_and_enqueue_all(ctx, &query, tracks).await;
     }
 
-    if !ctx.data().player.is_connected(guild_id) {
-        if let Some(channel_id) = voice_channel_of(ctx) {
+    // If the caller is in a voice channel, join it — moving there if the bot
+    // is already connected elsewhere in this guild, since a single bot
+    // identity can only ever hold one voice connection per guild (a Discord
+    // platform limit, not something apollo can route around). A caller with
+    // no voice channel of their own just queues into wherever the bot's
+    // already playing, if anywhere.
+    match voice_channel_of(ctx) {
+        Some(channel_id) => {
             if let Err(err) = ctx.data().player.join(guild_id, channel_id).await {
                 reply_error(ctx, err.to_string()).await?;
                 return Ok(());
             }
-        } else {
+        }
+        None if !ctx.data().player.is_connected(guild_id) => {
             reply_error(ctx, "join a voice channel first, or use `/join`.").await?;
             return Ok(());
         }
+        None => {}
     }
 
     let track = if let Some(video_id) = video_id {

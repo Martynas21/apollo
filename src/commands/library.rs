@@ -1078,16 +1078,18 @@ fn author_voice_channel(ctx: Context<'_>) -> Option<serenity::ChannelId> {
     })
 }
 
-/// Ensures the bot is connected to a voice channel in this guild, joining
-/// the invoking user's current channel if not. Replies ephemerally and
-/// returns `Ok(false)` if the bot isn't connected and the user isn't in a
-/// voice channel either (the expected "can't queue" case, not a real error).
+/// Ensures the bot is connected to a voice channel in this guild. If the
+/// invoking user is in a voice channel, joins it — moving there if the bot
+/// is already connected elsewhere in this guild, since a single bot
+/// identity can only ever hold one voice connection per guild. If the user
+/// isn't in a voice channel, falls back to whatever the bot's already
+/// connected to, if anything. Replies ephemerally and returns `Ok(false)` if
+/// neither is available (the expected "can't queue" case, not a real error).
 async fn ensure_connected(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result<bool, Error> {
-    if ctx.data().player.is_connected(guild_id) {
-        return Ok(true);
-    }
-
     let Some(channel_id) = author_voice_channel(ctx) else {
+        if ctx.data().player.is_connected(guild_id) {
+            return Ok(true);
+        }
         ctx.send(
             poise::CreateReply::default()
                 .content("Join a voice channel first, or use `/join`.")
