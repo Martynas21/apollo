@@ -96,7 +96,7 @@ pub async fn set_guild_volume(pool: &SqlitePool, guild_id: &str, volume: u8) -> 
 
 /// A guild's saved playlist: a named pointer to a `YouTube` playlist URL,
 /// browsable from the `/player` panel instead of re-pasting the URL into
-/// `/playlist_play` every time.
+/// `/play` every time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedPlaylist {
     pub id: i64,

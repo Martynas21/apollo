@@ -72,10 +72,12 @@ fn extract_video_id(input: &str) -> Option<String> {
 /// by playing the video, so this is only consulted when `extract_video_id`
 /// came back empty).
 ///
-/// Used by `/play` to catch a pasted playlist URL and point at
-/// `/playlist_play` instead of silently falling through to a free-text
-/// search for the raw URL string, which would queue an unrelated top search
-/// result with no indication anything went wrong.
+/// Used by `/play` to catch a pasted playlist URL and queue the whole
+/// playlist instead of silently falling through to a free-text search for
+/// the raw URL string, which would queue an unrelated top search result
+/// with no indication anything went wrong. A bare playlist ID (no URL) is
+/// not detected here — that's ambiguous with a single-word search term, so
+/// it's just treated as a search query.
 fn looks_like_playlist_url(input: &str) -> bool {
     let Ok(url) = url::Url::parse(input) else {
         return false;
@@ -399,8 +401,11 @@ async fn reply_error(ctx: Context<'_>, content: impl Into<String>) -> Result<(),
     Ok(())
 }
 
-/// Plays a `YouTube` video (URL or video ID), or searches and queues the top
-/// result if given free text.
+/// Plays a video/playlist link, or searches and queues the top result.
+///
+/// Given a `YouTube` video URL or video ID, plays that video. Given a
+/// playlist link, queues every track in it, in order. Given free text,
+/// searches and queues the top result.
 #[poise::command(slash_command, guild_only)]
 pub async fn play(
     ctx: Context<'_>,
@@ -419,12 +424,14 @@ pub async fn play(
 
     let video_id = extract_video_id(&query);
     if video_id.is_none() && looks_like_playlist_url(&query) {
-        reply_error(
-            ctx,
-            "that looks like a playlist link — use `/playlist_play` to queue the whole thing.",
-        )
-        .await?;
-        return Ok(());
+        let tracks = match ctx.data().youtube.list_playlist_items(&query).await {
+            Ok(listing) => listing.tracks,
+            Err(err) => return reply_error(ctx, err.to_string()).await,
+        };
+        if tracks.is_empty() {
+            return reply_error(ctx, "that playlist is empty (or couldn't be found).").await;
+        }
+        return library::join_and_enqueue_all(ctx, &query, tracks).await;
     }
 
     if !ctx.data().player.is_connected(guild_id) {

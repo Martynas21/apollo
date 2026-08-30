@@ -1,4 +1,4 @@
-//! `/add_to_queue`, `/playlist_play`: searching `YouTube` and queuing tracks
+//! `/add_to_queue`: searching `YouTube` and queuing tracks
 //! from a search result or a playlist URL/ID.
 //!
 //! `/add_to_queue` pairs its numbered text with a select-menu picker, so the
@@ -1147,7 +1147,7 @@ async fn join_and_enqueue(ctx: Context<'_>, track: Track) -> Result<(), Error> {
 /// the rest — it's tallied and reported alongside the successes, since one
 /// bad track (e.g. region-locked) shouldn't block queuing the rest of a
 /// playlist.
-async fn join_and_enqueue_all(
+pub(super) async fn join_and_enqueue_all(
     ctx: Context<'_>,
     label: &str,
     tracks: Vec<Track>,
@@ -1264,44 +1264,6 @@ pub async fn add_to_queue(
     };
 
     join_and_enqueue(ctx, track).await
-}
-
-/// Queues every track in a `YouTube` playlist (URL or bare playlist ID), in order.
-#[poise::command(slash_command, guild_only)]
-pub async fn playlist_play(
-    ctx: Context<'_>,
-    #[description = "Playlist URL or ID"] playlist: String,
-) -> Result<(), Error> {
-    // `list_playlist_items` shells out to yt-dlp and, for a large playlist,
-    // can easily take longer than Discord's 3-second ack deadline —
-    // deferred before it so a slow response doesn't drop the interaction.
-    // Public to match this command's success reply (`join_and_enqueue_all`).
-    ctx.defer().await?;
-
-    let tracks = match ctx.data().youtube.list_playlist_items(&playlist).await {
-        Ok(listing) => listing.tracks,
-        Err(err) => {
-            ctx.send(
-                poise::CreateReply::default()
-                    .content(format!("Failed to list playlist items: {err}"))
-                    .ephemeral(true),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    if tracks.is_empty() {
-        ctx.send(
-            poise::CreateReply::default()
-                .content("That playlist is empty (or couldn't be found).")
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    join_and_enqueue_all(ctx, &playlist, tracks).await
 }
 
 /// 1-indexes into `items` by a `u8` selection, returning a clone. `None` for

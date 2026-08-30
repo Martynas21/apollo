@@ -618,8 +618,8 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    /// Enqueues many tracks at once — for `/playlist_play`, queuing a whole
-    /// saved playlist in one go. Equivalent to calling [`Self::enqueue`]
+    /// Enqueues many tracks at once — for `/play`'s playlist branch, queuing
+    /// a whole playlist in one go. Equivalent to calling [`Self::enqueue`]
     /// once per track, but under a single lock and with a single panel
     /// refresh at the end, instead of one Discord API call *per track*:
     /// looping the single-track `enqueue` over a playlist of hundreds (or

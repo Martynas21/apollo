@@ -198,7 +198,7 @@ pub struct PlaylistListing {
 ///
 /// This is the fix for a `yt-dlp` argument-injection bug: `playlist_url_or_id`
 /// comes straight from raw user text (the playlist-import modal and
-/// `/playlist_play`'s argument), and without validation, a bare id starting
+/// `/play`'s playlist branch), and without validation, a bare id starting
 /// with `-` (e.g. `--exec=<cmd> http://x`) is parsed by `yt-dlp` as a
 /// command-line flag rather than a positional argument — `--exec` runs an
 /// arbitrary shell command. Rejecting a leading `-` is the critical check;

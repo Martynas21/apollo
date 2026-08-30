@@ -225,7 +225,7 @@ pub(crate) async fn render(
             )
         }
         None => (
-            "Nothing is playing — search, `/play`, or `/playlist_play` to get started.".to_string(),
+            "Nothing is playing — search or `/play` to get started.".to_string(),
             None,
             components,
         ),

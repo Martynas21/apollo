@@ -29,12 +29,12 @@ share with other people — some steps involve deliberately breaking things
       the menu.
 - [ ] `/add_to_queue <query> 0` (or any out-of-range number) replies
       "Invalid selection" rather than panicking or hanging.
-- [ ] `/playlist_play <a public playlist URL>` queues every track in it and
+- [ ] `/play <a public playlist URL>` queues every track in it and
       reports the count; `/queue` shows them all in order.
-- [ ] `/playlist_play <the same playlist's bare ID>` (no URL) works the same
-      way.
-- [ ] `/playlist_play <an empty or nonexistent playlist>` replies "That
-      playlist is empty (or couldn't be found)" rather than erroring.
+- [ ] `/play <the same playlist's bare ID>` (no URL) is treated as a search
+      query, not the playlist — expected, not a bug.
+- [ ] `/play <an empty or nonexistent playlist URL>` replies "that playlist
+      is empty (or couldn't be found)" rather than erroring.
 
 ## 2. Playback
 
@@ -66,7 +66,7 @@ is the one area with no live-Discord substitute for manual testing —
 everything here depends on real message edits landing in real time.
 
 - [ ] `/player` with nothing playing posts a panel: an informational
-      "search, `/play`, or `/playlist_play` to get started" message,
+      "search or `/play` to get started" message,
       playback buttons (Pause/Skip/Stop/Shuffle) disabled, and
       Search/Volume/Radio buttons enabled.
 - [ ] Panel's **Search** button opens a modal; submitting a query shows an
