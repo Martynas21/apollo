@@ -154,7 +154,9 @@ fn panel_components(
 
     // Volume (a single button, rather than the old step +/- pair, so the
     // exact level is one tap — opening a type-in modal — away instead of
-    // several) alongside the library entry point, both on one row.
+    // several) alongside the library entry point and Clear Queue, all on one
+    // row — `playback_row` above is already at Discord's 5-button cap, so
+    // Clear Queue (a queue op, like Shuffle) lands here instead.
     let controls_row = serenity::CreateActionRow::Buttons(vec![
         serenity::CreateButton::new("player:volume")
             .label(format!("{} {volume}%", volume_glyph(volume)))
@@ -165,6 +167,10 @@ fn panel_components(
         serenity::CreateButton::new("player:playlists")
             .label("🎵 Playlists")
             .style(serenity::ButtonStyle::Secondary),
+        serenity::CreateButton::new("player:clear")
+            .label("🗑 Clear Queue")
+            .style(serenity::ButtonStyle::Danger)
+            .disabled(snapshot.upcoming.is_empty()),
     ]);
 
     let mut rows = vec![playback_row, controls_row];
@@ -409,6 +415,19 @@ mod tests {
         let playlists_button = &json[1]["components"][2];
         assert_eq!(playlists_button["custom_id"], "player:playlists");
         assert_eq!(playlists_button["disabled"], false);
+    }
+
+    #[test]
+    fn clear_queue_button_disabled_when_queue_empty_and_enabled_otherwise() {
+        let empty = sample_queue_snapshot(true, 0);
+        let empty_json = components_json(&panel_components(&empty, Some(false), 50, false));
+        let clear_button = &empty_json[1]["components"][3];
+        assert_eq!(clear_button["custom_id"], "player:clear");
+        assert_eq!(clear_button["disabled"], true);
+
+        let nonempty = sample_queue_snapshot(true, 2);
+        let nonempty_json = components_json(&panel_components(&nonempty, Some(false), 50, false));
+        assert_eq!(nonempty_json[1]["components"][3]["disabled"], false);
     }
 
     #[test]

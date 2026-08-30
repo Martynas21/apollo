@@ -5,6 +5,7 @@
 //! automatically on startup.
 
 use anyhow::{Context, Result};
+use poise::serenity_prelude::UserId;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
@@ -12,6 +13,7 @@ use sqlx::{QueryBuilder, Sqlite};
 use std::str::FromStr;
 use std::time::Duration;
 
+use crate::voice::player::QueuedTrack;
 use crate::youtube::api::Track;
 
 /// How many rows [`replace_playlist_tracks`] inserts per multi-row
@@ -309,10 +311,13 @@ pub async fn replace_playlist_tracks(
     Ok(())
 }
 
-/// A guild's in-progress queue/radio session, as persisted by
-/// [`save_guild_session`] and restored by [`load_guild_session`]. `queue[0]`
-/// is the track to resume as `now_playing`; the rest is the upcoming queue,
-/// in order. Each track is paired with the id of the user who requested it.
+/// A guild's in-progress radio/now-playing session, as persisted by
+/// [`save_guild_session_meta`] and restored by [`load_guild_session`]. The
+/// *upcoming* queue is not part of this struct — `guild_session_queue` is
+/// itself the live, continuously-authoritative queue (written incrementally
+/// by the `queue_*` functions below, at the point of each mutation), so
+/// there's nothing to snapshot for it here. `now_playing` is paired with the
+/// id of the user who requested it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedSession {
     pub radio_enabled: bool,
@@ -320,7 +325,7 @@ pub struct PersistedSession {
     /// Oldest first, capped at `RADIO_HISTORY_CAP` by the caller — see
     /// `voice::player::GuildState::radio_history`.
     pub radio_history: Vec<String>,
-    pub queue: Vec<(Track, String)>,
+    pub now_playing: Option<(Track, String)>,
 }
 
 /// Joins `radio_history` into the comma-separated form `guild_sessions`
@@ -339,90 +344,85 @@ fn decode_radio_history(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Persists `session` for `guild_id`, replacing whatever was there before.
-/// If `session.queue` is empty, there's nothing worth resuming, so this just
-/// clears the guild's row instead of leaving an empty one behind — see
-/// [`clear_guild_session`].
-///
-/// Runs as one transaction so a concurrent [`load_guild_session`] never sees
-/// a half-replaced queue.
-pub async fn save_guild_session(
+/// Persists a guild's radio/now-playing metadata, replacing whatever was
+/// there before. Does *not* touch `guild_session_queue` — the upcoming queue
+/// is written incrementally by the `queue_*` functions below, at the point
+/// of each actual mutation, not as a periodic snapshot here.
+pub async fn save_guild_session_meta(
     pool: &SqlitePool,
     guild_id: &str,
-    session: &PersistedSession,
+    radio_enabled: bool,
+    radio_requested_by: Option<&str>,
+    radio_history: &[String],
+    now_playing: Option<(&Track, &str)>,
 ) -> Result<()> {
-    if session.queue.is_empty() {
-        return clear_guild_session(pool, guild_id).await;
-    }
-
-    let mut tx = pool
-        .begin()
-        .await
-        .context("failed to start session save transaction")?;
+    let (np_video_id, np_title, np_channel, np_duration_secs, np_requested_by) = match now_playing {
+        Some((track, requested_by)) => (
+            Some(track.video_id.as_str()),
+            Some(track.title.as_str()),
+            Some(track.channel.as_str()),
+            #[allow(clippy::cast_possible_wrap)]
+            track.duration.map(|d| d.as_secs() as i64),
+            Some(requested_by),
+        ),
+        None => (None, None, None, None, None),
+    };
 
     sqlx::query(
-        "INSERT INTO guild_sessions (guild_id, radio_enabled, radio_requested_by, radio_history) \
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO guild_sessions \
+         (guild_id, radio_enabled, radio_requested_by, radio_history, \
+          now_playing_video_id, now_playing_title, now_playing_channel, \
+          now_playing_duration_secs, now_playing_requested_by) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(guild_id) DO UPDATE SET
              radio_enabled = excluded.radio_enabled,
              radio_requested_by = excluded.radio_requested_by,
-             radio_history = excluded.radio_history",
+             radio_history = excluded.radio_history,
+             now_playing_video_id = excluded.now_playing_video_id,
+             now_playing_title = excluded.now_playing_title,
+             now_playing_channel = excluded.now_playing_channel,
+             now_playing_duration_secs = excluded.now_playing_duration_secs,
+             now_playing_requested_by = excluded.now_playing_requested_by",
     )
     .bind(guild_id)
-    .bind(session.radio_enabled)
-    .bind(&session.radio_requested_by)
-    .bind(encode_radio_history(&session.radio_history))
-    .execute(&mut *tx)
+    .bind(radio_enabled)
+    .bind(radio_requested_by)
+    .bind(encode_radio_history(radio_history))
+    .bind(np_video_id)
+    .bind(np_title)
+    .bind(np_channel)
+    .bind(np_duration_secs)
+    .bind(np_requested_by)
+    .execute(pool)
     .await
     .context("failed to save guild session")?;
-
-    sqlx::query("DELETE FROM guild_session_queue WHERE guild_id = ?1")
-        .bind(guild_id)
-        .execute(&mut *tx)
-        .await
-        .context("failed to clear old session queue")?;
-
-    // Batched into multi-row `INSERT`s, same as `replace_playlist_tracks` —
-    // a whole playlist can be queued (and thus persisted) at once.
-    let indexed_tracks = session.queue.iter().enumerate().collect::<Vec<_>>();
-    for batch in indexed_tracks.chunks(TRACK_INSERT_BATCH_SIZE) {
-        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "INSERT INTO guild_session_queue \
-             (guild_id, position, video_id, title, channel, duration_secs, requested_by) ",
-        );
-        builder.push_values(batch, |mut b, (position, (track, requested_by))| {
-            b.push_bind(guild_id)
-                .push_bind(*position as i64)
-                .push_bind(&track.video_id)
-                .push_bind(&track.title)
-                .push_bind(&track.channel)
-                .push_bind(track.duration.map(|d| d.as_secs() as i64))
-                .push_bind(requested_by);
-        });
-        builder
-            .build()
-            .execute(&mut *tx)
-            .await
-            .context("failed to insert session queue rows")?;
-    }
-
-    tx.commit()
-        .await
-        .context("failed to commit session save transaction")?;
 
     Ok(())
 }
 
-/// Loads `guild_id`'s persisted session, if any. `None` if there's no row,
-/// or its queue is empty (shouldn't normally happen — `save_guild_session`
-/// clears rather than saving an empty queue — but treated the same as "no
-/// session" defensively).
+/// Loads `guild_id`'s persisted session metadata, if any — `None` if there's
+/// no `guild_sessions` row for it. The upcoming queue is not loaded here:
+/// `guild_session_queue` is the live table, already reflecting whatever's
+/// actually queued, so there's nothing to restore for it — callers read it
+/// separately (`queue_pop_front`/`queue_all`/etc.) once they need to.
 pub async fn load_guild_session(
     pool: &SqlitePool,
     guild_id: &str,
 ) -> Result<Option<PersistedSession>> {
-    let session_row: Option<(bool, Option<String>, String)> = sqlx::query_as(
-        "SELECT radio_enabled, radio_requested_by, radio_history \
+    type SessionRow = (
+        bool,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    );
+    let row: Option<SessionRow> = sqlx::query_as(
+        "SELECT radio_enabled, radio_requested_by, radio_history, \
+                now_playing_video_id, now_playing_title, now_playing_channel, \
+                now_playing_duration_secs, now_playing_requested_by \
          FROM guild_sessions WHERE guild_id = ?1",
     )
     .bind(guild_id)
@@ -430,44 +430,42 @@ pub async fn load_guild_session(
     .await
     .context("failed to fetch guild session")?;
 
-    let Some((radio_enabled, radio_requested_by, radio_history)) = session_row else {
+    let Some((
+        radio_enabled,
+        radio_requested_by,
+        radio_history,
+        np_video_id,
+        np_title,
+        np_channel,
+        np_duration_secs,
+        np_requested_by,
+    )) = row
+    else {
         return Ok(None);
     };
 
-    let rows: Vec<(String, String, String, Option<i64>, String)> = sqlx::query_as(
-        "SELECT video_id, title, channel, duration_secs, requested_by \
-         FROM guild_session_queue WHERE guild_id = ?1 ORDER BY position",
-    )
-    .bind(guild_id)
-    .fetch_all(pool)
-    .await
-    .context("failed to fetch session queue")?;
-
-    if rows.is_empty() {
-        return Ok(None);
-    }
-
-    let queue = rows
-        .into_iter()
-        .map(
-            |(video_id, title, channel, duration_secs, requested_by)| {
-                #[allow(clippy::cast_sign_loss)]
-                let track = Track {
-                    video_id,
-                    title,
-                    channel,
-                    duration: duration_secs.map(|secs| Duration::from_secs(secs as u64)),
-                };
-                (track, requested_by)
-            },
-        )
-        .collect();
+    // The five `now_playing_*` columns are always written together (all
+    // `Some` or all `None`) by `save_guild_session_meta` — matching on all
+    // four non-duration columns being `Some` is just defense in depth.
+    let now_playing = match (np_video_id, np_title, np_channel, np_requested_by) {
+        (Some(video_id), Some(title), Some(channel), Some(requested_by)) => {
+            #[allow(clippy::cast_sign_loss)]
+            let track = Track {
+                video_id,
+                title,
+                channel,
+                duration: np_duration_secs.map(|secs| Duration::from_secs(secs as u64)),
+            };
+            Some((track, requested_by))
+        }
+        _ => None,
+    };
 
     Ok(Some(PersistedSession {
         radio_enabled,
         radio_requested_by,
         radio_history: decode_radio_history(&radio_history),
-        queue,
+        now_playing,
     }))
 }
 
@@ -484,6 +482,311 @@ pub async fn clear_guild_session(pool: &SqlitePool, guild_id: &str) -> Result<()
     Ok(())
 }
 
+/// Turns a `guild_session_queue` row into a [`QueuedTrack`]. `None` if
+/// `requested_by` fails to parse as a Discord snowflake — shouldn't happen,
+/// since only valid ids are ever written, but matches this file's existing
+/// defensive-parsing style (see `restore_session_if_new`).
+fn queued_track_from_row(
+    row: (String, String, String, Option<i64>, String),
+) -> Option<QueuedTrack> {
+    let (video_id, title, channel, duration_secs, requested_by) = row;
+    let requested_by = requested_by.parse::<u64>().ok()?;
+    #[allow(clippy::cast_sign_loss)]
+    let track = Track {
+        video_id,
+        title,
+        channel,
+        duration: duration_secs.map(|secs| Duration::from_secs(secs as u64)),
+    };
+    Some(QueuedTrack {
+        track,
+        requested_by: UserId::new(requested_by),
+    })
+}
+
+/// Appends `queued` to `guild_id`'s live upcoming queue, at
+/// `MAX(position) + 1`. Ensures a `guild_sessions` parent row exists first
+/// (`guild_session_queue.guild_id` has an `ON DELETE CASCADE` FK back to
+/// it), since this can be the very first thing ever persisted for a guild.
+pub async fn queue_push_back(
+    pool: &SqlitePool,
+    guild_id: &str,
+    queued: &QueuedTrack,
+) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start queue push transaction")?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO guild_sessions (guild_id, radio_enabled, radio_requested_by, radio_history) \
+         VALUES (?1, 0, NULL, '')",
+    )
+    .bind(guild_id)
+    .execute(&mut *tx)
+    .await
+    .context("failed to ensure guild session row")?;
+
+    sqlx::query(
+        "INSERT INTO guild_session_queue \
+         (guild_id, position, video_id, title, channel, duration_secs, requested_by) \
+         VALUES (?1, (SELECT COALESCE(MAX(position), -1) + 1 FROM guild_session_queue WHERE guild_id = ?1), \
+                 ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(guild_id)
+    .bind(&queued.track.video_id)
+    .bind(&queued.track.title)
+    .bind(&queued.track.channel)
+    .bind(queued.track.duration.map(|d| d.as_secs() as i64))
+    .bind(queued.requested_by.to_string())
+    .execute(&mut *tx)
+    .await
+    .context("failed to push a queued track")?;
+
+    tx.commit()
+        .await
+        .context("failed to commit queue push transaction")?;
+    Ok(())
+}
+
+/// Appends `tracks` to `guild_id`'s live upcoming queue in position order,
+/// continuing from the current `MAX(position)`. Batched into multi-row
+/// `INSERT`s, same as `replace_playlist_tracks` — a whole playlist can be
+/// queued (and thus persisted) at once. No-op if `tracks` is empty.
+pub async fn queue_push_many(
+    pool: &SqlitePool,
+    guild_id: &str,
+    tracks: &[QueuedTrack],
+) -> Result<()> {
+    if tracks.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start queue push transaction")?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO guild_sessions (guild_id, radio_enabled, radio_requested_by, radio_history) \
+         VALUES (?1, 0, NULL, '')",
+    )
+    .bind(guild_id)
+    .execute(&mut *tx)
+    .await
+    .context("failed to ensure guild session row")?;
+
+    let (next_position,): (i64,) = sqlx::query_as(
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM guild_session_queue WHERE guild_id = ?1",
+    )
+    .bind(guild_id)
+    .fetch_one(&mut *tx)
+    .await
+    .context("failed to compute the next queue position")?;
+
+    let indexed_tracks: Vec<(i64, &QueuedTrack)> = tracks
+        .iter()
+        .enumerate()
+        .map(|(i, queued)| (next_position + i as i64, queued))
+        .collect();
+    for batch in indexed_tracks.chunks(TRACK_INSERT_BATCH_SIZE) {
+        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "INSERT INTO guild_session_queue \
+             (guild_id, position, video_id, title, channel, duration_secs, requested_by) ",
+        );
+        builder.push_values(batch, |mut b, (position, queued): &(i64, &QueuedTrack)| {
+            b.push_bind(guild_id)
+                .push_bind(*position)
+                .push_bind(&queued.track.video_id)
+                .push_bind(&queued.track.title)
+                .push_bind(&queued.track.channel)
+                .push_bind(queued.track.duration.map(|d| d.as_secs() as i64))
+                .push_bind(queued.requested_by.to_string());
+        });
+        builder
+            .build()
+            .execute(&mut *tx)
+            .await
+            .context("failed to insert queued tracks")?;
+    }
+
+    tx.commit()
+        .await
+        .context("failed to commit queue push transaction")?;
+    Ok(())
+}
+
+/// Removes and returns the lowest-position row in `guild_id`'s upcoming
+/// queue — the track that should become the new `now_playing`. `None` if
+/// the queue is empty. Runs as one transaction so a concurrent read never
+/// sees the row gone without having been returned to somebody.
+pub async fn queue_pop_front(pool: &SqlitePool, guild_id: &str) -> Result<Option<QueuedTrack>> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start queue pop transaction")?;
+
+    let row: Option<(i64, String, String, String, Option<i64>, String)> = sqlx::query_as(
+        "SELECT position, video_id, title, channel, duration_secs, requested_by \
+         FROM guild_session_queue WHERE guild_id = ?1 ORDER BY position LIMIT 1",
+    )
+    .bind(guild_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("failed to read the front of the queue")?;
+
+    let Some((position, video_id, title, channel, duration_secs, requested_by)) = row else {
+        tx.commit()
+            .await
+            .context("failed to commit queue pop transaction")?;
+        return Ok(None);
+    };
+
+    sqlx::query("DELETE FROM guild_session_queue WHERE guild_id = ?1 AND position = ?2")
+        .bind(guild_id)
+        .bind(position)
+        .execute(&mut *tx)
+        .await
+        .context("failed to remove the popped queue row")?;
+
+    tx.commit()
+        .await
+        .context("failed to commit queue pop transaction")?;
+
+    Ok(queued_track_from_row((
+        video_id,
+        title,
+        channel,
+        duration_secs,
+        requested_by,
+    )))
+}
+
+/// Reads (without removing) the lowest-position row in `guild_id`'s upcoming
+/// queue. `None` if it's empty.
+pub async fn queue_peek_front(pool: &SqlitePool, guild_id: &str) -> Result<Option<QueuedTrack>> {
+    let row: Option<(String, String, String, Option<i64>, String)> = sqlx::query_as(
+        "SELECT video_id, title, channel, duration_secs, requested_by \
+         FROM guild_session_queue WHERE guild_id = ?1 ORDER BY position LIMIT 1",
+    )
+    .bind(guild_id)
+    .fetch_optional(pool)
+    .await
+    .context("failed to peek the front of the queue")?;
+
+    Ok(row.and_then(queued_track_from_row))
+}
+
+/// Number of tracks in `guild_id`'s upcoming queue.
+pub async fn queue_len(pool: &SqlitePool, guild_id: &str) -> Result<usize> {
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM guild_session_queue WHERE guild_id = ?1")
+            .bind(guild_id)
+            .fetch_one(pool)
+            .await
+            .context("failed to count queued tracks")?;
+    #[allow(clippy::cast_sign_loss)]
+    Ok(count.max(0) as usize)
+}
+
+/// `guild_id`'s whole upcoming queue, in order.
+pub async fn queue_all(pool: &SqlitePool, guild_id: &str) -> Result<Vec<QueuedTrack>> {
+    let rows: Vec<(String, String, String, Option<i64>, String)> = sqlx::query_as(
+        "SELECT video_id, title, channel, duration_secs, requested_by \
+         FROM guild_session_queue WHERE guild_id = ?1 ORDER BY position",
+    )
+    .bind(guild_id)
+    .fetch_all(pool)
+    .await
+    .context("failed to fetch the queue")?;
+
+    Ok(rows.into_iter().filter_map(queued_track_from_row).collect())
+}
+
+/// Empties `guild_id`'s upcoming queue. Leaves the `guild_sessions` parent
+/// row alone — that row's lifecycle (and the `now_playing` it may still
+/// carry) is managed separately by `save_guild_session_meta`/
+/// `clear_guild_session`.
+pub async fn queue_clear(pool: &SqlitePool, guild_id: &str) -> Result<()> {
+    sqlx::query("DELETE FROM guild_session_queue WHERE guild_id = ?1")
+        .bind(guild_id)
+        .execute(pool)
+        .await
+        .context("failed to clear the queue")?;
+    Ok(())
+}
+
+/// Removes the `count` lowest-position rows from `guild_id`'s upcoming
+/// queue, leaving the rest in their existing order — for `jump_to` dropping
+/// the entries ahead of a selected track. No-op if `count` is 0.
+pub async fn queue_drop_front(pool: &SqlitePool, guild_id: &str, count: usize) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    #[allow(clippy::cast_possible_wrap)]
+    let count = count as i64;
+    sqlx::query(
+        "DELETE FROM guild_session_queue WHERE guild_id = ?1 AND position IN \
+         (SELECT position FROM guild_session_queue WHERE guild_id = ?1 ORDER BY position LIMIT ?2)",
+    )
+    .bind(guild_id)
+    .bind(count)
+    .execute(pool)
+    .await
+    .context("failed to drop the front of the queue")?;
+    Ok(())
+}
+
+/// Replaces `guild_id`'s entire upcoming queue with `tracks`, in the given
+/// order, renumbering positions `0..N` — used by `shuffle`. Runs as one
+/// transaction so a concurrent read never sees a half-replaced queue.
+pub async fn queue_replace_all(
+    pool: &SqlitePool,
+    guild_id: &str,
+    tracks: &[QueuedTrack],
+) -> Result<()> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to start queue replace transaction")?;
+
+    sqlx::query("DELETE FROM guild_session_queue WHERE guild_id = ?1")
+        .bind(guild_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to clear the queue before replacing it")?;
+
+    let indexed_tracks = tracks.iter().enumerate().collect::<Vec<_>>();
+    for batch in indexed_tracks.chunks(TRACK_INSERT_BATCH_SIZE) {
+        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "INSERT INTO guild_session_queue \
+             (guild_id, position, video_id, title, channel, duration_secs, requested_by) ",
+        );
+        builder.push_values(
+            batch,
+            |mut b, (position, queued): &(usize, &QueuedTrack)| {
+                b.push_bind(guild_id)
+                    .push_bind(*position as i64)
+                    .push_bind(&queued.track.video_id)
+                    .push_bind(&queued.track.title)
+                    .push_bind(&queued.track.channel)
+                    .push_bind(queued.track.duration.map(|d| d.as_secs() as i64))
+                    .push_bind(queued.requested_by.to_string());
+            },
+        );
+        builder
+            .build()
+            .execute(&mut *tx)
+            .await
+            .context("failed to insert queued tracks")?;
+    }
+
+    tx.commit()
+        .await
+        .context("failed to commit queue replace transaction")?;
+    Ok(())
+}
+
 /// Searches a guild's cached playlist tracks by title — a fast, local
 /// alternative to shelling out to `yt-dlp` when the wanted track is already
 /// known from an imported playlist. Case-insensitive for ASCII (SQLite's
@@ -495,7 +798,10 @@ pub async fn search_cached_tracks(
     query: &str,
     limit: i64,
 ) -> Result<Vec<Track>> {
-    let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
     let pattern = format!("%{escaped}%");
 
     let rows: Vec<(String, String, String, Option<i64>)> = sqlx::query_as(
@@ -827,15 +1133,38 @@ mod tests {
         Ok(())
     }
 
-    fn sample_session(queue: Vec<(Track, &str)>) -> PersistedSession {
+    fn sample_session(now_playing: Option<(Track, &str)>) -> PersistedSession {
         PersistedSession {
             radio_enabled: true,
             radio_requested_by: Some("42".to_string()),
             radio_history: vec!["a".to_string(), "b".to_string()],
-            queue: queue
-                .into_iter()
-                .map(|(track, requested_by)| (track, requested_by.to_string()))
-                .collect(),
+            now_playing: now_playing.map(|(track, requested_by)| (track, requested_by.to_string())),
+        }
+    }
+
+    async fn save_session(
+        pool: &SqlitePool,
+        guild_id: &str,
+        session: &PersistedSession,
+    ) -> Result<()> {
+        save_guild_session_meta(
+            pool,
+            guild_id,
+            session.radio_enabled,
+            session.radio_requested_by.as_deref(),
+            &session.radio_history,
+            session
+                .now_playing
+                .as_ref()
+                .map(|(track, requested_by)| (track, requested_by.as_str())),
+        )
+        .await
+    }
+
+    fn sample_queued(video_id: &str, duration: Option<Duration>, requested_by: u64) -> QueuedTrack {
+        QueuedTrack {
+            track: sample_track(video_id, duration),
+            requested_by: UserId::new(requested_by),
         }
     }
 
@@ -849,12 +1178,12 @@ mod tests {
     #[tokio::test]
     async fn guild_session_save_and_load_round_trip() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
-        let session = sample_session(vec![
-            (sample_track("a", Some(Duration::from_secs(30))), "42"),
-            (sample_track("b", None), "43"),
-        ]);
+        let session = sample_session(Some((
+            sample_track("a", Some(Duration::from_secs(30))),
+            "42",
+        )));
 
-        save_guild_session(&pool, "1", &session).await?;
+        save_session(&pool, "1", &session).await?;
 
         assert_eq!(load_guild_session(&pool, "1").await?, Some(session));
         // A different guild is unaffected.
@@ -864,13 +1193,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guild_session_save_replaces_rather_than_appends() -> Result<()> {
+    async fn guild_session_save_replaces_rather_than_appending() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
-        save_guild_session(&pool, "1", &sample_session(vec![(sample_track("old", None), "42")]))
-            .await?;
+        save_session(
+            &pool,
+            "1",
+            &sample_session(Some((sample_track("old", None), "42"))),
+        )
+        .await?;
 
-        let replacement = sample_session(vec![(sample_track("new", None), "42")]);
-        save_guild_session(&pool, "1", &replacement).await?;
+        let replacement = sample_session(Some((sample_track("new", None), "42")));
+        save_session(&pool, "1", &replacement).await?;
 
         assert_eq!(load_guild_session(&pool, "1").await?, Some(replacement));
 
@@ -878,14 +1211,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guild_session_save_with_empty_queue_clears_instead_of_saving() -> Result<()> {
+    async fn saving_meta_with_no_now_playing_leaves_existing_queue_rows_alone() -> Result<()> {
+        // `save_guild_session_meta` only ever touches `guild_sessions` — the
+        // upcoming queue lives in `guild_session_queue` continuously and is
+        // never rewritten as a side effect of a meta save.
         let pool = connect("sqlite::memory:").await?;
-        save_guild_session(&pool, "1", &sample_session(vec![(sample_track("a", None), "42")]))
-            .await?;
+        save_session(
+            &pool,
+            "1",
+            &sample_session(Some((sample_track("a", None), "42"))),
+        )
+        .await?;
+        queue_push_back(&pool, "1", &sample_queued("b", None, 42)).await?;
 
-        save_guild_session(&pool, "1", &sample_session(vec![])).await?;
+        save_session(&pool, "1", &sample_session(None)).await?;
 
-        assert_eq!(load_guild_session(&pool, "1").await?, None);
+        let session = load_guild_session(&pool, "1")
+            .await?
+            .expect("row still exists");
+        assert_eq!(session.now_playing, None);
+        assert_eq!(
+            queue_all(&pool, "1")
+                .await?
+                .iter()
+                .map(|q| q.track.video_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
 
         Ok(())
     }
@@ -893,17 +1245,18 @@ mod tests {
     #[tokio::test]
     async fn clear_guild_session_removes_it_and_its_queue() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
-        save_guild_session(&pool, "1", &sample_session(vec![(sample_track("a", None), "42")]))
-            .await?;
+        save_session(
+            &pool,
+            "1",
+            &sample_session(Some((sample_track("a", None), "42"))),
+        )
+        .await?;
+        queue_push_back(&pool, "1", &sample_queued("b", None, 42)).await?;
 
         clear_guild_session(&pool, "1").await?;
 
         assert_eq!(load_guild_session(&pool, "1").await?, None);
-        let orphaned: Vec<(String,)> =
-            sqlx::query_as("SELECT video_id FROM guild_session_queue WHERE guild_id = '1'")
-                .fetch_all(&pool)
-                .await?;
-        assert!(orphaned.is_empty());
+        assert_eq!(queue_all(&pool, "1").await?, Vec::new());
 
         Ok(())
     }
@@ -917,10 +1270,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_push_back_appends_in_order() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        queue_push_back(&pool, "1", &sample_queued("a", None, 42)).await?;
+        queue_push_back(&pool, "1", &sample_queued("b", None, 42)).await?;
+
+        assert_eq!(
+            queue_all(&pool, "1")
+                .await?
+                .iter()
+                .map(|q| q.track.video_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_push_back_creates_a_guild_session_row_if_missing() -> Result<()> {
+        // The FK on `guild_session_queue.guild_id` requires a parent
+        // `guild_sessions` row to already exist — `queue_push_back` must
+        // create one rather than erroring on a guild's very first track.
+        let pool = connect("sqlite::memory:").await?;
+        queue_push_back(&pool, "1", &sample_queued("a", None, 42)).await?;
+
+        let session = load_guild_session(&pool, "1")
+            .await?
+            .expect("row should exist");
+        assert_eq!(session.now_playing, None);
+        assert!(!session.radio_enabled);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_push_many_appends_all_in_order() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        queue_push_back(&pool, "1", &sample_queued("a", None, 42)).await?;
+        queue_push_many(
+            &pool,
+            "1",
+            &[sample_queued("b", None, 42), sample_queued("c", None, 42)],
+        )
+        .await?;
+
+        assert_eq!(
+            queue_all(&pool, "1")
+                .await?
+                .iter()
+                .map(|q| q.track.video_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_push_many_is_a_no_op_for_an_empty_slice() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        queue_push_many(&pool, "1", &[]).await?;
+        assert_eq!(queue_len(&pool, "1").await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_pop_front_removes_and_returns_the_earliest_track() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        queue_push_back(&pool, "1", &sample_queued("a", None, 42)).await?;
+        queue_push_back(&pool, "1", &sample_queued("b", None, 42)).await?;
+
+        let popped = queue_pop_front(&pool, "1")
+            .await?
+            .expect("a track should pop");
+        assert_eq!(popped.track.video_id, "a");
+        assert_eq!(
+            queue_all(&pool, "1")
+                .await?
+                .iter()
+                .map(|q| q.track.video_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_pop_front_is_none_on_an_empty_queue() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        assert_eq!(queue_pop_front(&pool, "1").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_peek_front_does_not_remove_the_row() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        queue_push_back(&pool, "1", &sample_queued("a", None, 42)).await?;
+
+        let peeked = queue_peek_front(&pool, "1")
+            .await?
+            .expect("a track should be there");
+        assert_eq!(peeked.track.video_id, "a");
+        assert_eq!(queue_len(&pool, "1").await?, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_clear_empties_the_queue() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        queue_push_back(&pool, "1", &sample_queued("a", None, 42)).await?;
+
+        queue_clear(&pool, "1").await?;
+
+        assert_eq!(queue_len(&pool, "1").await?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_drop_front_removes_exactly_the_earliest_n_and_preserves_order() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        for id in ["a", "b", "c", "d"] {
+            queue_push_back(&pool, "1", &sample_queued(id, None, 42)).await?;
+        }
+
+        queue_drop_front(&pool, "1", 2).await?;
+
+        assert_eq!(
+            queue_all(&pool, "1")
+                .await?
+                .iter()
+                .map(|q| q.track.video_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "d"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_drop_front_zero_is_a_no_op() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        queue_push_back(&pool, "1", &sample_queued("a", None, 42)).await?;
+
+        queue_drop_front(&pool, "1", 0).await?;
+
+        assert_eq!(queue_len(&pool, "1").await?, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_replace_all_reorders_and_renumbers() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        queue_push_back(&pool, "1", &sample_queued("a", None, 42)).await?;
+        queue_push_back(&pool, "1", &sample_queued("b", None, 42)).await?;
+
+        queue_replace_all(
+            &pool,
+            "1",
+            &[sample_queued("b", None, 42), sample_queued("a", None, 42)],
+        )
+        .await?;
+
+        assert_eq!(
+            queue_all(&pool, "1")
+                .await?
+                .iter()
+                .map(|q| q.track.video_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn search_cached_tracks_matches_by_title_case_insensitively() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
-        let id = save_guild_playlist(&pool, "1", "Mix", "https://example.com/list=abc", "42")
-            .await?;
+        let id =
+            save_guild_playlist(&pool, "1", "Mix", "https://example.com/list=abc", "42").await?;
         replace_playlist_tracks(
             &pool,
             id,
@@ -934,7 +1464,10 @@ mod tests {
         assert_eq!(results[0].video_id, "a");
 
         // A different guild's cache is not searched.
-        assert_eq!(search_cached_tracks(&pool, "2", "title a", 10).await?, Vec::new());
+        assert_eq!(
+            search_cached_tracks(&pool, "2", "title a", 10).await?,
+            Vec::new()
+        );
 
         Ok(())
     }
@@ -942,8 +1475,8 @@ mod tests {
     #[tokio::test]
     async fn search_cached_tracks_treats_percent_and_underscore_literally() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
-        let id = save_guild_playlist(&pool, "1", "Mix", "https://example.com/list=abc", "42")
-            .await?;
+        let id =
+            save_guild_playlist(&pool, "1", "Mix", "https://example.com/list=abc", "42").await?;
         let literal = Track {
             video_id: "lit".to_string(),
             title: "50% off_sale".to_string(),
@@ -963,7 +1496,10 @@ mod tests {
         let results = search_cached_tracks(&pool, "1", "50% off_sale", 10).await?;
 
         assert_eq!(
-            results.iter().map(|t| t.video_id.as_str()).collect::<Vec<_>>(),
+            results
+                .iter()
+                .map(|t| t.video_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["lit"]
         );
 

@@ -144,6 +144,7 @@ pub async fn handle_component(
         "skip" => data.player.skip(guild_id).await,
         "stop" => data.player.stop(guild_id).await,
         "shuffle" => data.player.shuffle(guild_id).await,
+        "clear" => data.player.clear_queue(guild_id).await,
         "radio" => {
             data.player.toggle_radio(guild_id).await;
             Ok(())
@@ -666,6 +667,20 @@ pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
         Err(PlayerError::NothingToShuffle) => {
             reply_error(ctx, "not enough upcoming tracks to shuffle").await
         }
+        Err(err) => reply_error(ctx, err.to_string()).await,
+    }
+}
+
+/// Clears the upcoming queue. Leaves the currently playing track alone.
+#[poise::command(slash_command, guild_only)]
+pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
+    let guild_id = ctx
+        .guild_id()
+        .expect("guild_only commands always have a guild");
+
+    match ctx.data().player.clear_queue(guild_id).await {
+        Ok(()) => reply_public(ctx, "Cleared the queue.").await,
+        Err(PlayerError::QueueEmpty) => reply_error(ctx, "the queue is already empty").await,
         Err(err) => reply_error(ctx, err.to_string()).await,
     }
 }

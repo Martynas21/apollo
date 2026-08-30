@@ -1,10 +1,15 @@
-//! Per-guild playback state: an in-memory queue driven by songbird's
-//! track-end event, plus idle auto-disconnect.
+//! Per-guild playback state: a SQLite-backed upcoming queue driven by
+//! songbird's track-end event, plus idle auto-disconnect.
 //!
 //! [`PlayerRegistry`] is the single shared entry point commands use — it
-//! owns the voice backend handle and all per-guild queues, so every
-//! command (`/play`, `/skip`, `/queue`, ...) goes through the same state
-//! rather than each reaching into songbird directly.
+//! owns the voice backend handle and all per-guild state, so every command
+//! (`/play`, `/skip`, `/queue`, ...) goes through the same state rather than
+//! each reaching into songbird directly. The upcoming queue itself lives in
+//! `guild_session_queue` (see `db.rs`'s `queue_*` functions), not in memory
+//! — only what can't be persisted (live track handles, panel pointers, radio
+//! bookkeeping) stays in [`GuildState`]. See the `guilds` field's doc
+//! comment on [`PlayerRegistry`] for the locking discipline that keeps queue
+//! mutations correct without a live in-memory copy.
 //!
 //! Songbird itself sits behind the [`VoiceBackend`]/[`VoiceCall`]/
 //! [`VoiceTrack`] traits, whose only production implementation
@@ -142,7 +147,7 @@ impl PanelEditFailure {
 }
 
 /// A track paired with who queued it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedTrack {
     pub track: Track,
     pub requested_by: UserId,
@@ -156,6 +161,8 @@ pub enum PlayerError {
     NothingPlaying,
     /// `/shuffle` with fewer than two upcoming tracks to shuffle.
     NothingToShuffle,
+    /// `/clear` (or the panel's Clear Queue button) with nothing queued.
+    QueueEmpty,
     /// A queue-jump selection that's out of range, e.g. because the queue
     /// changed between the panel being rendered and the click landing.
     InvalidSelection,
@@ -171,6 +178,7 @@ impl std::fmt::Display for PlayerError {
             Self::NotConnected => write!(f, "not connected to a voice channel"),
             Self::NothingPlaying => write!(f, "nothing is playing"),
             Self::NothingToShuffle => write!(f, "not enough upcoming tracks to shuffle"),
+            Self::QueueEmpty => write!(f, "the queue is already empty"),
             Self::InvalidSelection => {
                 write!(
                     f,
@@ -285,7 +293,6 @@ pub trait VoiceTrack: Send + Sync {
 
 #[derive(Default)]
 struct GuildState {
-    queue: VecDeque<QueuedTrack>,
     now_playing: Option<QueuedTrack>,
     current_handle: Option<Arc<dyn VoiceTrack>>,
     /// `current_handle`'s track uuid, captured at the same time it's set.
@@ -297,10 +304,12 @@ struct GuildState {
     /// clearing its handle out from under it or layering another track on
     /// top of it (two tracks audibly playing at once).
     current_track_id: Option<Uuid>,
-    /// Background pre-buffer for `queue`'s front entry, started right after
-    /// the current track begins playing. Always corresponds to whatever is
-    /// at the front of `queue` — `enqueue`/`advance`/`stop` are the only
-    /// places that mutate the queue, and each keeps this in sync.
+    /// Background pre-buffer for the upcoming queue's front entry (now a
+    /// live DB table, `guild_session_queue` — see `db::queue_peek_front` and
+    /// friends), started right after the current track begins playing.
+    /// Always corresponds to whatever is at the front of that table —
+    /// `enqueue`/`advance`/`stop` are the only places that mutate the queue,
+    /// and each keeps this in sync.
     prefetch: Option<Prefetch>,
     /// The live `/player` panel message for this guild, if one has been
     /// posted — kept current by [`PlayerRegistry::refresh_panel`] after
@@ -338,25 +347,14 @@ struct GuildState {
     /// guild lock and comes back later (radio's refill task) captures this
     /// first and refuses to commit if it changed meanwhile — a `/stop` that
     /// lands mid-refill must not have a track pushed into the queue behind
-    /// it, which would break the `now_playing.is_none()` ⇔ `queue.is_empty()`
-    /// invariant `is_idle` (and the idle disconnect) rely on.
+    /// it, which would break the "nothing playing implies nothing queued"
+    /// invariant the idle disconnect relies on (see `leave_if_idle` and
+    /// `persist_session`, which now check the live DB queue directly since
+    /// there's no in-memory queue to inspect synchronously anymore).
     epoch: u64,
 }
 
 impl GuildState {
-    /// Whether this guild has nothing playing *and* nothing queued — the one
-    /// definition of "idle" shared by the idle-disconnect timer
-    /// ([`PlayerRegistry::schedule_idle_disconnect`]) and the leave path it
-    /// triggers ([`PlayerRegistry::leave_if_idle`]).
-    ///
-    /// Checking the queue too, not just `now_playing`, is deliberate: a
-    /// queue entry with nothing playing is a state that shouldn't happen,
-    /// but if it ever does (a background refill racing a `/stop`, say),
-    /// disconnecting would silently destroy it.
-    fn is_idle(&self) -> bool {
-        self.now_playing.is_none() && self.queue.is_empty()
-    }
-
     /// Atomically checks for a live `/player` panel and, if there isn't one,
     /// reserves this guild's panel slot — the check-and-reserve
     /// [`PlayerRegistry::claim_panel_slot`] performs under the guild lock so
@@ -437,6 +435,17 @@ pub struct PlayerRegistry {
     /// hydrate bare video ids (from `crate::voice::radio::list_mix_video_ids`)
     /// into full `Track`s — see `maybe_spawn_radio_refill`.
     youtube: YouTubeClient,
+    /// The upcoming queue itself lives in SQLite (`guild_session_queue`),
+    /// not here — only the state that can't be persisted (live track
+    /// handles, panel pointers, radio bookkeeping) is kept in memory. Every
+    /// method that reads or writes that table does so while holding this
+    /// lock, deliberately: it's what keeps a queue mutation exactly as
+    /// atomic (process-wide) as it was back when the queue itself was a
+    /// plain `VecDeque` guarded by the same lock. This serializes queue I/O
+    /// across every guild, not just within one — an accepted trade-off for
+    /// a bot this size, not an oversight; don't "fix" it by moving a
+    /// `db::queue_*` call outside its critical section without re-checking
+    /// the race it was closing.
     guilds: Arc<Mutex<HashMap<GuildId, GuildState>>>,
 }
 
@@ -560,49 +569,64 @@ impl PlayerRegistry {
             }
         }
 
-        let session = match db::load_guild_session(&self.db, &guild_id.to_string()).await {
-            Ok(Some(session)) if !session.queue.is_empty() => session,
-            Ok(_) => return,
+        let guild_id_str = guild_id.to_string();
+        let session = match db::load_guild_session(&self.db, &guild_id_str).await {
+            Ok(Some(session)) => session,
+            Ok(None) => return,
             Err(err) => {
                 tracing::warn!(%guild_id, %err, "failed to load persisted session");
                 return;
             }
         };
 
-        let candidate = {
+        let already_racing = {
             let mut guilds = self.guilds.lock().await;
             let state = guilds.entry(guild_id).or_default();
             // Lost a race against a concurrent `join`/`enqueue` that landed
             // between the check above and now — don't clobber real state
-            // with a stale restore.
-            if state.now_playing.is_some() || !state.queue.is_empty() {
-                return;
-            }
-
-            state.radio_enabled = session.radio_enabled;
-            state.radio_requested_by = session
-                .radio_requested_by
-                .as_deref()
-                .and_then(|id| id.parse().ok())
-                .map(UserId::new);
-            state.radio_history = session.radio_history.into();
-            state.queue = session
-                .queue
-                .into_iter()
-                .filter_map(|(track, requested_by)| {
+            // with a stale restore. `now_playing.is_some()` alone is a
+            // sufficient guard: whenever a concurrent `enqueue`/
+            // `enqueue_many` has actually started something, it always sets
+            // `now_playing` synchronously (under this same lock) before
+            // doing anything else — there's no "queue non-empty but
+            // now_playing still None" state reachable via those paths.
+            if state.now_playing.is_some() {
+                true
+            } else {
+                state.radio_enabled = session.radio_enabled;
+                state.radio_requested_by = session
+                    .radio_requested_by
+                    .as_deref()
+                    .and_then(|id| id.parse().ok())
+                    .map(UserId::new);
+                state.radio_history = session.radio_history.into();
+                state.now_playing = session.now_playing.and_then(|(track, requested_by)| {
                     requested_by.parse().ok().map(|id| QueuedTrack {
                         track,
                         requested_by: UserId::new(id),
                     })
-                })
-                .collect();
-            state.now_playing = state.queue.pop_front();
-            state.now_playing.clone()
+                });
+                false
+            }
         };
+        if already_racing {
+            return;
+        }
+
+        let mut candidate = {
+            let guilds = self.guilds.lock().await;
+            guilds.get(&guild_id).and_then(|s| s.now_playing.clone())
+        };
+        if candidate.is_none() {
+            // Nothing was actively playing when this was persisted (or its
+            // `requested_by` failed to parse) — but the DB queue is the live
+            // upcoming-queue table regardless of what got restored above, so
+            // pop its front as the resumed `now_playing` if anything's there.
+            candidate = self.promote_next(guild_id).await;
+        }
 
         // Mirrors `enqueue_many`'s start-and-retry loop: walk past restored
         // tracks that fail to start instead of stalling on the first one.
-        let mut candidate = candidate;
         let mut started = false;
         while let Some(queued) = candidate {
             match self
@@ -627,39 +651,62 @@ impl PlayerRegistry {
         self.refresh_panel(guild_id).await;
     }
 
-    /// Snapshots this guild's queue/radio state to the database, so a crash
-    /// or restart doesn't drop it — see [`Self::restore_session_if_new`].
+    /// Snapshots this guild's radio/now-playing state to the database, so a
+    /// crash or restart doesn't drop it — see [`Self::restore_session_if_new`].
     /// Best-effort: a failure is logged, never surfaced as a [`PlayerError`],
     /// since persistence must not stand in the way of playback.
     ///
-    /// Called after every mutation that changes what a restore would need to
-    /// reproduce (queue contents, `now_playing`, radio state) — not after
-    /// every mutation in general, so e.g. `pause`/`resume`/`set_volume` don't
-    /// pay for a write that would restore into exactly the same state anyway.
+    /// Much cheaper than it used to be: the upcoming queue is no longer
+    /// rewritten wholesale here (it's written incrementally, at the actual
+    /// point of each mutation, by the `queue_*` functions in `db.rs`) — this
+    /// only has to keep the `guild_sessions` meta row (radio state,
+    /// `now_playing`) in sync. Called after every mutation that changes
+    /// that meta — not after every mutation in general, so e.g.
+    /// `pause`/`resume`/`set_volume` don't pay for a write that would
+    /// restore into exactly the same state anyway.
     async fn persist_session(&self, guild_id: GuildId) {
         let guild_id_str = guild_id.to_string();
-        let session = {
-            let guilds = self.guilds.lock().await;
-            match guilds.get(&guild_id) {
-                Some(state) if !state.is_idle() => Some(db::PersistedSession {
-                    radio_enabled: state.radio_enabled,
-                    radio_requested_by: state.radio_requested_by.map(|id| id.to_string()),
-                    radio_history: Vec::from(state.radio_history.clone()),
-                    queue: state
-                        .now_playing
-                        .iter()
-                        .chain(state.queue.iter())
-                        .map(|queued| (queued.track.clone(), queued.requested_by.to_string()))
-                        .collect(),
-                }),
-                _ => None,
+        let guilds = self.guilds.lock().await;
+        let Some(state) = guilds.get(&guild_id) else {
+            drop(guilds);
+            if let Err(err) = db::clear_guild_session(&self.db, &guild_id_str).await {
+                tracing::warn!(%guild_id, %err, "failed to persist guild session");
             }
+            return;
         };
 
-        let result = match session {
-            Some(session) => db::save_guild_session(&self.db, &guild_id_str, &session).await,
-            None => db::clear_guild_session(&self.db, &guild_id_str).await,
+        let now_playing = state.now_playing.clone();
+        let radio_enabled = state.radio_enabled;
+        let radio_requested_by = state.radio_requested_by.map(|id| id.to_string());
+        let radio_history = Vec::from(state.radio_history.clone());
+
+        // Only paid on the rare "just went idle" path — the common "still
+        // playing" case short-circuits before ever touching the DB queue.
+        let is_idle = if now_playing.is_none() {
+            db::queue_len(&self.db, &guild_id_str).await.unwrap_or(0) == 0
+        } else {
+            false
         };
+
+        let result = if is_idle {
+            db::clear_guild_session(&self.db, &guild_id_str).await
+        } else {
+            let now_playing_requested_by = now_playing.as_ref().map(|q| q.requested_by.to_string());
+            let now_playing_arg = now_playing
+                .as_ref()
+                .zip(now_playing_requested_by.as_deref())
+                .map(|(q, rb)| (&q.track, rb));
+            db::save_guild_session_meta(
+                &self.db,
+                &guild_id_str,
+                radio_enabled,
+                radio_requested_by.as_deref(),
+                &radio_history,
+                now_playing_arg,
+            )
+            .await
+        };
+        drop(guilds);
         if let Err(err) = result {
             tracing::warn!(%guild_id, %err, "failed to persist guild session");
         }
@@ -731,8 +778,20 @@ impl PlayerRegistry {
         let (result, panel) = {
             let mut guilds = self.guilds.lock().await;
             match guilds.get(&guild_id) {
-                Some(state) if !state.is_idle() => return,
+                Some(state) if state.now_playing.is_some() => return,
                 _ => {}
+            }
+            // The upcoming queue no longer lives in memory, so "idle" needs
+            // a DB round trip — done here, still inside the same lock
+            // acquisition as the teardown below, so nothing (a radio refill
+            // landing rows, a queue push) can slip into the gap between
+            // deciding this guild is idle and actually leaving voice.
+            let queue_empty = db::queue_len(&self.db, &guild_id.to_string())
+                .await
+                .unwrap_or(0)
+                == 0;
+            if !queue_empty {
+                return;
             }
             self.leave_under_lock(guild_id, &mut guilds).await
         };
@@ -743,9 +802,9 @@ impl PlayerRegistry {
         if let Some((channel_id, message_id)) = panel {
             let _ = self.edit_panel(guild_id, channel_id, message_id).await;
         }
-        // Reaching here means the guild really was idle (empty queue, per
-        // `is_idle`), so there's nothing to persist — this just clears any
-        // stale row from before the idle disconnect.
+        // Reaching here means the guild really was idle (nothing playing,
+        // empty queue), so there's nothing to persist — this just clears
+        // any stale row from before the idle disconnect.
         self.persist_session(guild_id).await;
     }
 
@@ -769,8 +828,10 @@ impl PlayerRegistry {
             let should_start = state.now_playing.is_none();
             if should_start {
                 state.now_playing = Some(queued.clone());
-            } else {
-                state.queue.push_back(queued.clone());
+            } else if let Err(err) =
+                db::queue_push_back(&self.db, &guild_id.to_string(), &queued).await
+            {
+                return Err(PlayerError::Storage(err.to_string()));
             }
             (call, should_start)
         };
@@ -782,7 +843,7 @@ impl PlayerRegistry {
             // `current_handle` and no `TrackEndHandler` ever registered to
             // advance past it, permanently orphaning every track queued
             // behind it (they just see `now_playing.is_some()` and pile up
-            // in `state.queue` instead of ever being tried).
+            // in the DB queue instead of ever being tried).
             let mut guilds = self.guilds.lock().await;
             if let Some(state) = guilds.get_mut(&guild_id) {
                 state.now_playing = None;
@@ -814,6 +875,9 @@ impl PlayerRegistry {
             return Ok(0);
         }
         let total = tracks.len();
+        let guild_id_str = guild_id.to_string();
+        let mut tracks = tracks;
+        let first = tracks.first().cloned();
 
         let (call, needs_start) = {
             let mut guilds = self.guilds.lock().await;
@@ -822,12 +886,38 @@ impl PlayerRegistry {
             let state = guilds.entry(guild_id).or_default();
             state.radio_exhausted = false;
             let needs_start = state.now_playing.is_none();
-            state.queue.extend(tracks);
             if needs_start {
-                state.now_playing = state.queue.pop_front();
+                state.now_playing = first.clone();
             }
             (call, needs_start)
         };
+
+        // The rest of the list (everything but the track about to become
+        // `now_playing`, if any) is persisted up front, before anything
+        // else touches this guild's queue — nothing has been told about
+        // these tracks yet, so there's no concurrent-access window to close
+        // here, unlike the other queue mutations below (see the `guilds`
+        // field's doc comment).
+        let rest: Vec<QueuedTrack> = if needs_start {
+            tracks.split_off(1)
+        } else {
+            std::mem::take(&mut tracks)
+        };
+        if !rest.is_empty()
+            && let Err(err) = db::queue_push_many(&self.db, &guild_id_str, &rest).await
+        {
+            if needs_start {
+                // The speculative `now_playing` claim above never got a
+                // chance to actually start — roll it back so it doesn't
+                // orphan whatever might get queued behind it later (same
+                // reasoning as `enqueue`'s own rollback).
+                let mut guilds = self.guilds.lock().await;
+                if let Some(state) = guilds.get_mut(&guild_id) {
+                    state.now_playing = None;
+                }
+            }
+            return Err(PlayerError::Storage(err.to_string()));
+        }
 
         let mut failed = 0;
         if needs_start {
@@ -837,10 +927,7 @@ impl PlayerRegistry {
             // start, just looped here since the whole playlist is already
             // sitting in the queue rather than trickling in one call at a
             // time.
-            let mut candidate = {
-                let guilds = self.guilds.lock().await;
-                guilds.get(&guild_id).and_then(|s| s.now_playing.clone())
-            };
+            let mut candidate = first;
             while let Some(queued) = candidate {
                 match self
                     .start_playback(guild_id, call.clone(), queued, None)
@@ -909,14 +996,30 @@ impl PlayerRegistry {
         PlayerError::Playback(better_playback_error(err, preflight).to_string())
     }
 
-    /// Moves the front of the queue into `now_playing` and returns it (or
-    /// `None` if the queue is empty, or the guild's state is gone). Used to
-    /// walk past tracks that fail to start rather than stalling on them.
+    /// Pops the front of the (DB-backed) upcoming queue into `now_playing`
+    /// and returns it — `None` if the queue is empty, or the guild's state
+    /// is gone. Used to walk past tracks that fail to start rather than
+    /// stalling on them.
     async fn promote_next(&self, guild_id: GuildId) -> Option<QueuedTrack> {
         let mut guilds = self.guilds.lock().await;
+        // Checked before the DB pop, not after: a track popped for a guild
+        // that's already been torn down (a concurrent `/leave` landing
+        // between calls) would just be discarded — better to leave it in
+        // the DB queue for nobody to ever have removed it in the first
+        // place.
+        if !guilds.contains_key(&guild_id) {
+            return None;
+        }
+        let next = match db::queue_pop_front(&self.db, &guild_id.to_string()).await {
+            Ok(next) => next,
+            Err(err) => {
+                tracing::warn!(%guild_id, %err, "failed to pop the next queued track");
+                None
+            }
+        };
         let state = guilds.get_mut(&guild_id)?;
-        state.now_playing = state.queue.pop_front();
-        state.now_playing.clone()
+        state.now_playing = next.clone();
+        next
     }
 
     async fn start_playback(
@@ -973,7 +1076,11 @@ impl PlayerRegistry {
 
             // Start pre-buffering whatever's next in the queue now, so its
             // download runs in the background while this track plays.
-            if let Some(next) = state.queue.front().cloned() {
+            let next = db::queue_peek_front(&self.db, &guild_id.to_string())
+                .await
+                .ok()
+                .flatten();
+            if let Some(next) = next {
                 let registry = self.clone();
                 state.prefetch = Some(tokio::spawn(
                     async move { registry.cached_input(&next).await },
@@ -1018,8 +1125,20 @@ impl PlayerRegistry {
             }
             state.current_handle = None;
             state.current_track_id = None;
-            state.now_playing = state.queue.pop_front();
-            (state.now_playing.clone(), state.prefetch.take())
+            // The DB pop happens only after re-confirming `current_track_id`
+            // above, and while still holding this same lock — otherwise a
+            // stale/duplicate End event for a track that's already been
+            // superseded (see this method's doc comment) could pop a track
+            // it has no business popping.
+            let next = match db::queue_pop_front(&self.db, &guild_id.to_string()).await {
+                Ok(next) => next,
+                Err(err) => {
+                    tracing::warn!(%guild_id, %err, "failed to pop the next queued track");
+                    None
+                }
+            };
+            state.now_playing = next.clone();
+            (next, state.prefetch.take())
         };
 
         // Walk past tracks that fail to start instead of stalling on the
@@ -1076,7 +1195,6 @@ impl PlayerRegistry {
             let Some(state) = guilds.get_mut(&guild_id) else {
                 return Err(PlayerError::NothingPlaying);
             };
-            state.queue.clear();
             state.now_playing = None;
             state.current_track_id = None;
             // Invalidates any in-flight background refill: radio's mix
@@ -1087,7 +1205,15 @@ impl PlayerRegistry {
             if let Some(prefetch) = state.prefetch.take() {
                 prefetch.abort();
             }
-            state.current_handle.take()
+            let handle = state.current_handle.take();
+            // The epoch bump above already gates any in-flight refill from
+            // committing a track behind this `/stop` — see the `guilds`
+            // field's doc comment for why this DB call still happens inside
+            // the same lock acquisition rather than after it.
+            if let Err(err) = db::queue_clear(&self.db, &guild_id.to_string()).await {
+                tracing::warn!(%guild_id, %err, "failed to clear the persisted queue on stop");
+            }
+            handle
         };
 
         let Some(handle) = handle else {
@@ -1162,19 +1288,67 @@ impl PlayerRegistry {
     /// Shuffles the upcoming queue in place. Leaves `now_playing` where it
     /// is — shuffling shouldn't restart or skip the current track.
     pub async fn shuffle(&self, guild_id: GuildId) -> Result<(), PlayerError> {
+        let guild_id_str = guild_id.to_string();
+        // Fetch, shuffle, and write back all under one lock acquisition —
+        // splitting the fetch and the write across two would reopen a
+        // window for a concurrent `enqueue` to land in between and get
+        // silently discarded by the write. See the `guilds` field's doc
+        // comment.
         let mut guilds = self.guilds.lock().await;
-        let Some(state) = guilds.get_mut(&guild_id) else {
-            return Err(PlayerError::NothingToShuffle);
-        };
-        if state.queue.len() < 2 {
+        let mut items = db::queue_all(&self.db, &guild_id_str)
+            .await
+            .map_err(|e| PlayerError::Storage(e.to_string()))?;
+        if items.len() < 2 {
             return Err(PlayerError::NothingToShuffle);
         }
 
-        let mut items: Vec<QueuedTrack> = state.queue.drain(..).collect();
         items.shuffle(&mut rand::rng());
-        state.queue = items.into();
-        self.restart_prefetch(state);
+        db::queue_replace_all(&self.db, &guild_id_str, &items)
+            .await
+            .map_err(|e| PlayerError::Storage(e.to_string()))?;
+        if let Some(state) = guilds.get_mut(&guild_id) {
+            self.restart_prefetch(state, items.first().cloned());
+        }
         drop(guilds);
+
+        self.refresh_panel(guild_id).await;
+        self.persist_session(guild_id).await;
+        Ok(())
+    }
+
+    /// Clears every upcoming track, leaving `now_playing` (and the current
+    /// track's playback) untouched. If radio mode is on, kicks off a fresh
+    /// refill afterward — mirroring `toggle_radio`'s "just turned on against
+    /// an empty queue" trigger — since clearing just wiped out whatever
+    /// runway `start_playback` had already topped up for when the current
+    /// track ends.
+    pub async fn clear_queue(&self, guild_id: GuildId) -> Result<(), PlayerError> {
+        let guild_id_str = guild_id.to_string();
+        let needs_refill = {
+            let mut guilds = self.guilds.lock().await;
+            let len = db::queue_len(&self.db, &guild_id_str)
+                .await
+                .map_err(|e| PlayerError::Storage(e.to_string()))?;
+            if len == 0 {
+                return Err(PlayerError::QueueEmpty);
+            }
+            db::queue_clear(&self.db, &guild_id_str)
+                .await
+                .map_err(|e| PlayerError::Storage(e.to_string()))?;
+            match guilds.get_mut(&guild_id) {
+                Some(state) => {
+                    if let Some(prefetch) = state.prefetch.take() {
+                        prefetch.abort();
+                    }
+                    state.radio_enabled
+                }
+                None => false,
+            }
+        };
+
+        if needs_refill {
+            self.maybe_spawn_radio_refill(guild_id);
+        }
 
         self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
@@ -1187,13 +1361,17 @@ impl PlayerRegistry {
     /// to the new front of the queue exactly as it would on a natural
     /// track end or a `/skip`.
     pub async fn jump_to(&self, guild_id: GuildId, index: usize) -> Result<(), PlayerError> {
+        let guild_id_str = guild_id.to_string();
         let mut guilds = self.guilds.lock().await;
+        let queue_len = db::queue_len(&self.db, &guild_id_str)
+            .await
+            .map_err(|e| PlayerError::Storage(e.to_string()))?;
+        if index >= queue_len {
+            return Err(PlayerError::InvalidSelection);
+        }
         let state = guilds
             .get_mut(&guild_id)
             .ok_or(PlayerError::InvalidSelection)?;
-        if index >= state.queue.len() {
-            return Err(PlayerError::InvalidSelection);
-        }
         let handle = state
             .current_handle
             .clone()
@@ -1209,9 +1387,14 @@ impl PlayerRegistry {
             .stop()
             .map_err(|e| PlayerError::Playback(e.to_string()))?;
 
-        state.queue.drain(..index);
+        db::queue_drop_front(&self.db, &guild_id_str, index)
+            .await
+            .map_err(|e| PlayerError::Storage(e.to_string()))?;
         if index > 0 {
-            self.restart_prefetch(state);
+            let next = db::queue_peek_front(&self.db, &guild_id_str)
+                .await
+                .map_err(|e| PlayerError::Storage(e.to_string()))?;
+            self.restart_prefetch(state, next);
         }
         drop(guilds);
 
@@ -1219,19 +1402,19 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    /// Cancels any in-flight prefetch and starts a fresh one for the new
-    /// front of `state.queue`, if there is one. `prefetch` is only ever kept
-    /// in sync automatically when the queue is mutated by `push_back`/
-    /// `pop_front` (see the field's doc comment) — `shuffle` and `jump_to`
+    /// Cancels any in-flight prefetch and starts a fresh one for `next` (the
+    /// new front of the upcoming queue), if there is one. `prefetch` is only
+    /// ever kept in sync automatically when the queue is mutated by a plain
+    /// push/pop (see the field's doc comment) — `shuffle` and `jump_to`
     /// instead reorder or drop entries out from under an in-flight prefetch,
     /// which would otherwise hand the *next* track a download meant for
     /// whatever used to be at the front (wrong audio playing under the
     /// right track's title). Must be called with `state`'s guild lock held.
-    fn restart_prefetch(&self, state: &mut GuildState) {
+    fn restart_prefetch(&self, state: &mut GuildState, next: Option<QueuedTrack>) {
         if let Some(old) = state.prefetch.take() {
             old.abort();
         }
-        if let Some(next) = state.queue.front().cloned() {
+        if let Some(next) = next {
             let registry = self.clone();
             state.prefetch = Some(tokio::spawn(
                 async move { registry.cached_input(&next).await },
@@ -1296,7 +1479,16 @@ impl PlayerRegistry {
             // Toggling is the user's "try again" for a mix that previously
             // came up empty.
             state.radio_exhausted = false;
-            (state.radio_enabled, state.queue.is_empty())
+            let enabled = state.radio_enabled;
+            let needs_refill = if enabled {
+                db::queue_len(&self.db, &guild_id.to_string())
+                    .await
+                    .unwrap_or(0)
+                    == 0
+            } else {
+                false
+            };
+            (enabled, needs_refill)
         };
 
         if enabled && needs_refill {
@@ -1418,18 +1610,35 @@ impl PlayerRegistry {
                 // hydration above were in flight: pushing now would
                 // resurrect a queue behind a stopped player, leaving an
                 // entry that either sits inert or gets quietly eaten by the
-                // idle disconnect `stop` already scheduled.
+                // idle disconnect `stop` already scheduled. The DB push
+                // below happens while still holding this same lock — the
+                // whole point of the epoch check is that nothing can
+                // invalidate this decision between checking it and
+                // committing, which is only true if the write lands inside
+                // the same critical section (see the `guilds` field's doc
+                // comment).
                 match guilds.get_mut(&guild_id) {
                     Some(state) if state.radio_enabled && state.epoch == epoch => {
-                        let count = hydrated.len();
-                        for track in hydrated {
-                            state.radio_played.insert(track.video_id.clone());
-                            state.queue.push_back(QueuedTrack {
-                                track,
-                                requested_by,
-                            });
+                        let to_queue: Vec<QueuedTrack> = hydrated
+                            .into_iter()
+                            .map(|track| {
+                                state.radio_played.insert(track.video_id.clone());
+                                QueuedTrack {
+                                    track,
+                                    requested_by,
+                                }
+                            })
+                            .collect();
+                        let count = to_queue.len();
+                        match db::queue_push_many(&registry.db, &guild_id.to_string(), &to_queue)
+                            .await
+                        {
+                            Ok(()) => count,
+                            Err(err) => {
+                                tracing::warn!(%guild_id, %err, "radio refill: failed to persist refilled tracks");
+                                0
+                            }
                         }
-                        count
                     }
                     _ => 0,
                 }
@@ -1444,15 +1653,16 @@ impl PlayerRegistry {
 
     pub async fn queue_snapshot(&self, guild_id: GuildId) -> QueueSnapshot {
         let guilds = self.guilds.lock().await;
-        match guilds.get(&guild_id) {
-            Some(state) => QueueSnapshot {
-                now_playing: state.now_playing.clone(),
-                upcoming: state.queue.iter().cloned().collect(),
-            },
-            None => QueueSnapshot {
-                now_playing: None,
-                upcoming: Vec::new(),
-            },
+        let now_playing = guilds.get(&guild_id).and_then(|s| s.now_playing.clone());
+        let upcoming = db::queue_all(&self.db, &guild_id.to_string())
+            .await
+            .unwrap_or_else(|err| {
+                tracing::warn!(%guild_id, %err, "failed to load queue snapshot");
+                Vec::new()
+            });
+        QueueSnapshot {
+            now_playing,
+            upcoming,
         }
     }
 
@@ -1879,29 +2089,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fresh_state_is_idle() {
-        assert!(GuildState::default().is_idle());
-    }
-
-    #[test]
-    fn state_with_a_current_track_is_not_idle() {
-        let state = GuildState {
-            now_playing: Some(queued("abc")),
-            ..GuildState::default()
-        };
-        assert!(!state.is_idle());
-    }
-
-    /// The case a `now_playing`-only idle check missed: a queue entry with
-    /// nothing playing (e.g. a radio refill that landed just after a
-    /// `/stop`) must not be silently disconnected out from under.
-    #[test]
-    fn state_with_only_a_queued_track_is_not_idle() {
-        let mut state = GuildState::default();
-        state.queue.push_back(queued("abc"));
-        assert!(!state.is_idle());
-    }
+    // `GuildState::is_idle` was a sync helper over the in-memory queue;
+    // there's no synchronous equivalent now that the upcoming queue lives in
+    // the DB. Its cases are covered by the `leave_if_idle_*` tests below
+    // instead, which exercise the same "nothing playing and nothing queued"
+    // decision through the real (now async) code path.
 
     #[test]
     fn volume_is_clamped_to_full_scale() {
@@ -2472,8 +2664,6 @@ mod tests {
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert!(snapshot.now_playing.is_none());
         assert!(snapshot.upcoming.is_empty());
-        let guilds = registry.guilds.lock().await;
-        assert!(guilds.get(&guild_id).unwrap().is_idle());
     }
 
     #[tokio::test]
@@ -2510,10 +2700,15 @@ mod tests {
         registry.stop(guild_id).await.unwrap();
 
         assert!(track.was_stopped());
+        assert_eq!(
+            db::queue_len(&registry.db, &guild_id.to_string())
+                .await
+                .unwrap(),
+            0
+        );
         let guilds = registry.guilds.lock().await;
         let state = guilds.get(&guild_id).unwrap();
         assert!(state.now_playing.is_none());
-        assert!(state.queue.is_empty());
         assert!(state.current_track_id.is_none());
         assert!(state.current_handle.is_none());
         assert_eq!(state.epoch, epoch_before.wrapping_add(1));
@@ -2589,6 +2784,45 @@ mod tests {
         assert!(matches!(err, PlayerError::InvalidSelection));
     }
 
+    // ---- clear_queue() ----
+
+    #[tokio::test]
+    async fn clear_queue_drops_upcoming_but_leaves_now_playing_alone() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry
+            .enqueue_many(guild_id, vec![queued("b"), queued("c")])
+            .await
+            .unwrap();
+        let a_track = backend.call_for(guild_id).unwrap().last_track();
+
+        registry.clear_queue(guild_id).await.unwrap();
+
+        assert!(!a_track.was_stopped());
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+        assert!(snapshot.upcoming.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_queue_with_nothing_queued_reports_queue_empty() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+
+        let err = registry.clear_queue(guild_id).await.unwrap_err();
+
+        assert!(matches!(err, PlayerError::QueueEmpty));
+    }
+
+    #[tokio::test]
+    async fn clear_queue_with_no_guild_state_reports_queue_empty() {
+        let (registry, _backend, guild_id) = new_registry().await;
+
+        let err = registry.clear_queue(guild_id).await.unwrap_err();
+
+        assert!(matches!(err, PlayerError::QueueEmpty));
+    }
+
     // ---- leave_if_idle / schedule_idle_disconnect ----
     //
     // These call `leave_if_idle` directly rather than going through
@@ -2622,18 +2856,13 @@ mod tests {
 
     #[tokio::test]
     async fn leave_if_idle_does_nothing_if_only_the_queue_is_non_empty() {
-        // Mirrors `state_with_only_a_queued_track_is_not_idle`: a queue
-        // entry with nothing playing must not be disconnected out from
+        // A queue entry with nothing playing (e.g. a radio refill that
+        // landed just after a `/stop`) must not be disconnected out from
         // under either.
         let (registry, backend, guild_id) = joined_registry().await;
-        {
-            let mut guilds = registry.guilds.lock().await;
-            guilds
-                .entry(guild_id)
-                .or_default()
-                .queue
-                .push_back(queued("a"));
-        }
+        db::queue_push_back(&registry.db, &guild_id.to_string(), &queued("a"))
+            .await
+            .unwrap();
 
         registry.leave_if_idle(guild_id).await;
 
@@ -2716,12 +2945,17 @@ mod tests {
             .unwrap()
             .expect("a session should have been persisted");
         assert_eq!(
-            session
-                .queue
+            session.now_playing.map(|(track, _)| track.video_id),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            db::queue_all(&registry.db, &guild_id.to_string())
+                .await
+                .unwrap()
                 .iter()
-                .map(|(track, _)| track.video_id.as_str())
+                .map(|q| q.track.video_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["a", "b"]
+            vec!["b"]
         );
     }
 
@@ -2758,16 +2992,17 @@ mod tests {
     #[tokio::test]
     async fn join_restores_a_persisted_session_and_starts_its_now_playing() {
         let (registry, backend, guild_id) = new_registry().await;
-        let session = db::PersistedSession {
-            radio_enabled: true,
-            radio_requested_by: Some("1".to_string()),
-            radio_history: vec!["a".to_string()],
-            queue: vec![
-                (queued("a").track, "1".to_string()),
-                (queued("b").track, "1".to_string()),
-            ],
-        };
-        db::save_guild_session(&registry.db, &guild_id.to_string(), &session)
+        db::save_guild_session_meta(
+            &registry.db,
+            &guild_id.to_string(),
+            true,
+            Some("1"),
+            &["a".to_string()],
+            Some((&queued("a").track, "1")),
+        )
+        .await
+        .unwrap();
+        db::queue_push_back(&registry.db, &guild_id.to_string(), &queued("b"))
             .await
             .unwrap();
 
@@ -2787,15 +3022,16 @@ mod tests {
     #[tokio::test]
     async fn enqueue_after_restore_appends_behind_the_resumed_queue() {
         let (registry, backend, guild_id) = new_registry().await;
-        let session = db::PersistedSession {
-            radio_enabled: false,
-            radio_requested_by: None,
-            radio_history: Vec::new(),
-            queue: vec![(queued("a").track, "1".to_string())],
-        };
-        db::save_guild_session(&registry.db, &guild_id.to_string(), &session)
-            .await
-            .unwrap();
+        db::save_guild_session_meta(
+            &registry.db,
+            &guild_id.to_string(),
+            false,
+            None,
+            &[],
+            Some((&queued("a").track, "1")),
+        )
+        .await
+        .unwrap();
 
         registry.join(guild_id, ChannelId::new(2)).await.unwrap();
         registry.enqueue(guild_id, queued("new")).await.unwrap();
@@ -2814,7 +3050,13 @@ mod tests {
 
         registry.join(guild_id, ChannelId::new(2)).await.unwrap();
 
-        assert!(backend.call_for(guild_id).unwrap().played_video_ids().is_empty());
+        assert!(
+            backend
+                .call_for(guild_id)
+                .unwrap()
+                .played_video_ids()
+                .is_empty()
+        );
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert!(snapshot.now_playing.is_none());
     }
