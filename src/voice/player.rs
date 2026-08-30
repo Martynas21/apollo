@@ -53,10 +53,42 @@ const IDLE_DISCONNECT: Duration = Duration::from_secs(150);
 /// not "louder".
 const MAX_VOLUME: u8 = 100;
 
+/// How many recently-started tracks `GuildState::radio_history` remembers.
+/// Refills pick a seed from this window (weighted toward the most recent —
+/// see `pick_radio_seed`) instead of always reseeding off the single latest
+/// track, so a long radio session doesn't commit 100% to wherever the Mix
+/// chain wandered off to.
+const RADIO_HISTORY_CAP: usize = 5;
+
+/// How many mix candidates a single radio refill hydrates and queues at
+/// once. Refills only run when the queue has drained to empty (see
+/// `maybe_spawn_radio_refill`'s caller), so queuing several at a time — not
+/// just one — means several tracks play before the next `yt-dlp` spawn plus
+/// Data API hydration round-trip, instead of paying that cost every track.
+const RADIO_REFILL_BATCH: usize = 3;
+
 /// Converts a 0-100 volume percentage into songbird's gain multiplier,
 /// clamping out-of-range input rather than trusting it.
 fn volume_multiplier(volume: u8) -> f32 {
     f32::from(volume.min(MAX_VOLUME)) / 100.0
+}
+
+/// Picks a radio-refill seed from `history` (oldest first, newest last),
+/// weighting linearly toward the most recent entries — position `i` (0 =
+/// oldest) gets weight `i + 1` — rather than always reseeding off the single
+/// latest track. Keeps a long radio session from committing 100% to
+/// wherever the Mix chain happened to wander, while still mostly following
+/// "whatever just played". `None` only if `history` is empty.
+fn pick_radio_seed<'a>(history: &'a [String], rng: &mut impl rand::Rng) -> Option<&'a str> {
+    use rand::seq::IndexedRandom;
+
+    history
+        .iter()
+        .enumerate()
+        .collect::<Vec<_>>()
+        .choose_weighted(rng, |(i, _)| (i + 1) as u32)
+        .ok()
+        .map(|(_, id)| id.as_str())
 }
 
 /// Picks the more informative of a playback resolution failure and a
@@ -280,15 +312,16 @@ struct GuildState {
     /// see no panel and both post one. See [`GuildState::claim_panel`].
     panel_reserved: bool,
     /// Whether radio mode is on for this guild — a pure toggle, not tied to
-    /// any particular seed. See `radio_seed`.
+    /// any particular seed. See `radio_history`.
     radio_enabled: bool,
-    /// Video id of the most recently *started* track (playlist, one-off
-    /// `/play`, search result, or a radio-fetched track alike — every path
-    /// through `start_playback` updates this), used to look up the next
-    /// radio track when the queue runs dry. `None` until something has
-    /// played this session.
-    radio_seed: Option<String>,
-    /// Requester of the track `radio_seed` points at — attributed to
+    /// Video ids of the most recently *started* tracks, newest at the back,
+    /// capped at [`RADIO_HISTORY_CAP`] (playlist, one-off `/play`, search
+    /// result, or a radio-fetched track alike — every path through
+    /// `start_playback` pushes onto this). A refill draws its seed from
+    /// this window rather than always the single latest entry — see
+    /// `pick_radio_seed`. Empty until something has played this session.
+    radio_history: VecDeque<String>,
+    /// Requester of the most recently started track — attributed to
     /// radio-fetched tracks too, since nothing new requested them.
     radio_requested_by: Option<UserId>,
     /// Video ids already surfaced by radio mode this session, so it doesn't
@@ -784,10 +817,13 @@ impl PlayerRegistry {
         if let Some(state) = guilds.get_mut(&guild_id) {
             state.current_handle = Some(handle);
             state.current_track_id = Some(track_id);
-            // Every track start updates the radio seed, regardless of how
+            // Every track start feeds the radio history, regardless of how
             // the track got here (playlist, one-off `/play`, search, or a
             // radio-fetched track itself) — see `maybe_spawn_radio_refill`.
-            state.radio_seed = Some(queued.track.video_id.clone());
+            state.radio_history.push_back(queued.track.video_id.clone());
+            if state.radio_history.len() > RADIO_HISTORY_CAP {
+                state.radio_history.pop_front();
+            }
             state.radio_requested_by = Some(queued.requested_by);
 
             // Start pre-buffering whatever's next in the queue now, so its
@@ -1129,11 +1165,12 @@ impl PlayerRegistry {
             .is_some_and(|state| state.radio_enabled)
     }
 
-    /// Spawns a background task that tops up `guild_id`'s queue with one
-    /// radio-mix track, if radio mode is on and something has already
-    /// played this session (`radio_seed`/`radio_requested_by` set). No-op
-    /// otherwise — called from `start_playback` whenever the queue goes
-    /// empty as a track starts, and from `toggle_radio` when radio is
+    /// Spawns a background task that tops up `guild_id`'s queue with up to
+    /// [`RADIO_REFILL_BATCH`] radio-mix tracks, if radio mode is on and
+    /// something has already played this session (`radio_history` non-empty,
+    /// `radio_requested_by` set). No-op otherwise — called from
+    /// `start_playback` whenever the queue goes empty as a track starts, and
+    /// from `toggle_radio` when radio is
     /// switched on mid-session against an already-empty queue. Calling it
     /// from both places can race (e.g. toggled on the instant a track
     /// starts with an empty queue) — worst case two tracks land instead of
@@ -1146,7 +1183,7 @@ impl PlayerRegistry {
     fn maybe_spawn_radio_refill(&self, guild_id: GuildId) {
         let registry = self.clone();
         tokio::spawn(async move {
-            let (enabled, seed, requested_by, played, epoch) = {
+            let (enabled, history, requested_by, played, epoch) = {
                 let guilds = registry.guilds.lock().await;
                 let Some(state) = guilds.get(&guild_id) else {
                     return;
@@ -1160,18 +1197,21 @@ impl PlayerRegistry {
                 }
                 (
                     state.radio_enabled,
-                    state.radio_seed.clone(),
+                    Vec::from(state.radio_history.clone()),
                     state.radio_requested_by,
                     state.radio_played.clone(),
                     state.epoch,
                 )
             };
-            let (true, Some(seed), Some(requested_by)) = (enabled, seed, requested_by) else {
+            let (true, Some(requested_by)) = (enabled, requested_by) else {
+                return;
+            };
+            let Some(seed) = pick_radio_seed(&history, &mut rand::rng()) else {
                 return;
             };
 
             let mix_ids =
-                match radio::list_mix_video_ids(&seed, registry.cookies_file.as_deref()).await {
+                match radio::list_mix_video_ids(seed, registry.cookies_file.as_deref()).await {
                     Ok(ids) => ids,
                     Err(err) => {
                         tracing::warn!(%guild_id, %seed, %err, "radio refill: failed to list mix");
@@ -1179,11 +1219,17 @@ impl PlayerRegistry {
                     }
                 };
 
-            let candidates: Vec<&str> = mix_ids
+            // A wider pool than `RADIO_REFILL_BATCH` needs, then shuffled:
+            // taking a strict prefix would always follow YouTube's single
+            // "most related" ordering, so every refill off the same seed
+            // would pick the same tracks in the same order.
+            let mut candidates: Vec<&str> = mix_ids
                 .iter()
                 .map(String::as_str)
-                .filter(|id| *id != seed.as_str() && !played.contains(*id))
-                .take(5)
+                .filter(|id| {
+                    !history.iter().any(|played_id| played_id == id) && !played.contains(*id)
+                })
+                .take(10)
                 .collect();
             if candidates.is_empty() {
                 tracing::warn!(
@@ -1198,6 +1244,8 @@ impl PlayerRegistry {
                 }
                 return;
             }
+            candidates.shuffle(&mut rand::rng());
+            candidates.truncate(RADIO_REFILL_BATCH);
 
             let hydrated = match registry.youtube.hydrate_videos(&candidates).await {
                 Ok(tracks) => tracks,
@@ -1206,10 +1254,10 @@ impl PlayerRegistry {
                     return;
                 }
             };
-            let Some(chosen) = hydrated.into_iter().next() else {
+            if hydrated.is_empty() {
                 tracing::warn!(%guild_id, %seed, "radio refill: hydration returned no tracks");
                 return;
-            };
+            }
 
             let pushed = {
                 let mut guilds = registry.guilds.lock().await;
@@ -1221,18 +1269,21 @@ impl PlayerRegistry {
                 // idle disconnect `stop` already scheduled.
                 match guilds.get_mut(&guild_id) {
                     Some(state) if state.radio_enabled && state.epoch == epoch => {
-                        state.radio_played.insert(chosen.video_id.clone());
-                        state.queue.push_back(QueuedTrack {
-                            track: chosen,
-                            requested_by,
-                        });
-                        true
+                        let count = hydrated.len();
+                        for track in hydrated {
+                            state.radio_played.insert(track.video_id.clone());
+                            state.queue.push_back(QueuedTrack {
+                                track,
+                                requested_by,
+                            });
+                        }
+                        count
                     }
-                    _ => false,
+                    _ => 0,
                 }
             };
 
-            if pushed {
+            if pushed > 0 {
                 registry.refresh_panel(guild_id).await;
             }
         });
@@ -1705,6 +1756,53 @@ mod tests {
         assert!((volume_multiplier(50) - 0.5).abs() < f32::EPSILON);
         assert!((volume_multiplier(100) - 1.0).abs() < f32::EPSILON);
         assert!((volume_multiplier(255) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn empty_history_yields_no_seed() {
+        assert_eq!(pick_radio_seed(&[], &mut rand::rng()), None);
+    }
+
+    #[test]
+    fn single_entry_history_always_picks_it() {
+        let history = vec!["only".to_string()];
+        assert_eq!(pick_radio_seed(&history, &mut rand::rng()), Some("only"));
+    }
+
+    #[test]
+    fn seed_is_always_one_of_the_history_entries() {
+        let history: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        for _ in 0..200 {
+            let seed = pick_radio_seed(&history, &mut rand::rng()).expect("non-empty history");
+            assert!(history.iter().any(|id| id == seed));
+        }
+    }
+
+    #[test]
+    fn weighting_favors_the_most_recent_entry_over_many_draws() {
+        // Weight is linear in position (oldest = 1, ..., newest = len), so
+        // with 4 entries the newest is picked 4x as often as the oldest —
+        // never literally 100% of the time, unlike the old single-seed
+        // behavior. `StdRng` is deterministic, so the counts below are
+        // stable across runs.
+        use rand::SeedableRng;
+        let history: Vec<String> = ["oldest", "b", "c", "newest"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let mut newest_count = 0;
+        let mut oldest_count = 0;
+        for _ in 0..1000 {
+            match pick_radio_seed(&history, &mut rng) {
+                Some("newest") => newest_count += 1,
+                Some("oldest") => oldest_count += 1,
+                _ => {}
+            }
+        }
+        assert!(newest_count > oldest_count);
+        // Not deterministic to a single track: the oldest still shows up.
+        assert!(oldest_count > 0);
     }
 
     #[test]
