@@ -3,14 +3,24 @@
 //! Values are loaded once at startup via [`Config::from_env`]. This will be
 //! extended as new subsystems (database, etc.) land.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+
+/// A single Discord bot identity — its own token/application, able to hold
+/// its own independent voice connection per guild. Running more than one of
+/// these is what lets different voice channels in the same guild be served
+/// simultaneously: a single bot user can only ever hold one voice connection
+/// per guild, so per-channel playback requires per-channel *identities*.
+#[derive(Debug, Clone)]
+pub struct BotIdentity {
+    pub token: String,
+    pub application_id: String,
+}
 
 /// All configuration the bot needs, sourced from environment variables
 /// (see `.env.example`).
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub discord_token: String,
-    pub discord_application_id: String,
+    pub bots: Vec<BotIdentity>,
     /// Guild to register slash commands against for fast dev iteration.
     /// `None` means register globally.
     pub discord_guild_id: Option<u64>,
@@ -47,8 +57,7 @@ impl Config {
     /// (which would be flaky under parallel test execution).
     fn from_source(lookup: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<Self> {
         Ok(Self {
-            discord_token: env_var(&lookup, "DISCORD_TOKEN")?,
-            discord_application_id: env_var(&lookup, "DISCORD_APPLICATION_ID")?,
+            bots: bot_identities(&lookup)?,
             discord_guild_id: optional_guild_id(&lookup)?,
             database_url: env_var(&lookup, "DATABASE_URL")?,
             yt_dlp_cookies_file: optional_env_var(&lookup, "YT_DLP_COOKIES_FILE"),
@@ -69,6 +78,35 @@ fn playlist_track_limit(
         Err(std::env::VarError::NotPresent) => Ok(DEFAULT_PLAYLIST_TRACK_LIMIT),
         Err(err) => Err(err).context("failed to read PLAYLIST_TRACK_LIMIT"),
     }
+}
+
+/// Reads `DISCORD_TOKEN_1`/`DISCORD_APPLICATION_ID_1`, `_2`, `_3`, ... until
+/// a numbered token is absent. At least one identity is required.
+fn bot_identities(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<Vec<BotIdentity>> {
+    let mut bots = Vec::new();
+    let mut n = 1;
+    loop {
+        let token_key = format!("DISCORD_TOKEN_{n}");
+        let app_id_key = format!("DISCORD_APPLICATION_ID_{n}");
+        match lookup(&token_key) {
+            Ok(token) => {
+                let application_id = env_var(lookup, &app_id_key)?;
+                bots.push(BotIdentity {
+                    token,
+                    application_id,
+                });
+            }
+            Err(std::env::VarError::NotPresent) => break,
+            Err(err) => return Err(err).context(format!("failed to read {token_key}")),
+        }
+        n += 1;
+    }
+    if bots.is_empty() {
+        bail!("missing required environment variable: DISCORD_TOKEN_1");
+    }
+    Ok(bots)
 }
 
 fn env_var(
@@ -118,8 +156,8 @@ mod tests {
 
     fn full_vars() -> HashMap<&'static str, &'static str> {
         HashMap::from([
-            ("DISCORD_TOKEN", "token123"),
-            ("DISCORD_APPLICATION_ID", "app456"),
+            ("DISCORD_TOKEN_1", "token123"),
+            ("DISCORD_APPLICATION_ID_1", "app456"),
             ("DATABASE_URL", "sqlite://test.db"),
         ])
     }
@@ -128,8 +166,9 @@ mod tests {
     fn all_required_vars_present_succeeds() {
         let vars = full_vars();
         let config = Config::from_source(lookup(&vars)).expect("should succeed");
-        assert_eq!(config.discord_token, "token123");
-        assert_eq!(config.discord_application_id, "app456");
+        assert_eq!(config.bots.len(), 1);
+        assert_eq!(config.bots[0].token, "token123");
+        assert_eq!(config.bots[0].application_id, "app456");
         assert_eq!(config.database_url, "sqlite://test.db");
         assert_eq!(config.discord_guild_id, None);
         assert_eq!(config.yt_dlp_cookies_file, None);
@@ -139,17 +178,46 @@ mod tests {
     #[test]
     fn missing_discord_token_produces_error_naming_it() {
         let mut vars = full_vars();
-        vars.remove("DISCORD_TOKEN");
+        vars.remove("DISCORD_TOKEN_1");
         let err = Config::from_source(lookup(&vars)).expect_err("should fail");
-        assert!(err.to_string().contains("DISCORD_TOKEN"));
+        assert!(err.to_string().contains("DISCORD_TOKEN_1"));
     }
 
     #[test]
     fn missing_discord_application_id_produces_error_naming_it() {
         let mut vars = full_vars();
-        vars.remove("DISCORD_APPLICATION_ID");
+        vars.remove("DISCORD_APPLICATION_ID_1");
         let err = Config::from_source(lookup(&vars)).expect_err("should fail");
-        assert!(err.to_string().contains("DISCORD_APPLICATION_ID"));
+        assert!(err.to_string().contains("DISCORD_APPLICATION_ID_1"));
+    }
+
+    #[test]
+    fn multiple_bot_identities_are_all_loaded_in_order() {
+        let mut vars = full_vars();
+        vars.insert("DISCORD_TOKEN_2", "token789");
+        vars.insert("DISCORD_APPLICATION_ID_2", "app012");
+        let config = Config::from_source(lookup(&vars)).expect("should succeed");
+        assert_eq!(config.bots.len(), 2);
+        assert_eq!(config.bots[1].token, "token789");
+        assert_eq!(config.bots[1].application_id, "app012");
+    }
+
+    #[test]
+    fn a_gap_in_numbering_stops_loading_further_identities() {
+        let mut vars = full_vars();
+        // No DISCORD_TOKEN_2 — DISCORD_TOKEN_3 should never be consulted.
+        vars.insert("DISCORD_TOKEN_3", "token789");
+        vars.insert("DISCORD_APPLICATION_ID_3", "app012");
+        let config = Config::from_source(lookup(&vars)).expect("should succeed");
+        assert_eq!(config.bots.len(), 1);
+    }
+
+    #[test]
+    fn a_numbered_token_without_its_application_id_produces_an_error() {
+        let mut vars = full_vars();
+        vars.insert("DISCORD_TOKEN_2", "token789");
+        let err = Config::from_source(lookup(&vars)).expect_err("should fail");
+        assert!(err.to_string().contains("DISCORD_APPLICATION_ID_2"));
     }
 
     #[test]
