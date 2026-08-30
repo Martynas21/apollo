@@ -619,47 +619,55 @@ pub async fn queue_push_many(
 /// Removes and returns the lowest-position row in `guild_id`'s upcoming
 /// queue — the track that should become the new `now_playing`. `None` if
 /// the queue is empty. Runs as one transaction so a concurrent read never
-/// sees the row gone without having been returned to somebody.
+/// sees a row gone without having been returned to somebody, and so a
+/// corrupt row (see below) is skipped atomically along with everything
+/// still queued behind it in the empty case.
+///
+/// A row that fails to parse (see `queued_track_from_row`) is deleted and
+/// skipped rather than returned as `None` — otherwise it would look
+/// indistinguishable from a genuinely empty queue to callers like
+/// `promote_next`, which would then idle-disconnect while valid tracks are
+/// still queued behind it.
 pub async fn queue_pop_front(pool: &SqlitePool, guild_id: &str) -> Result<Option<QueuedTrack>> {
     let mut tx = pool
         .begin()
         .await
         .context("failed to start queue pop transaction")?;
 
-    let row: Option<(i64, String, String, String, Option<i64>, String)> = sqlx::query_as(
-        "SELECT position, video_id, title, channel, duration_secs, requested_by \
-         FROM guild_session_queue WHERE guild_id = ?1 ORDER BY position LIMIT 1",
-    )
-    .bind(guild_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .context("failed to read the front of the queue")?;
+    loop {
+        let row: Option<(i64, String, String, String, Option<i64>, String)> = sqlx::query_as(
+            "SELECT position, video_id, title, channel, duration_secs, requested_by \
+             FROM guild_session_queue WHERE guild_id = ?1 ORDER BY position LIMIT 1",
+        )
+        .bind(guild_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to read the front of the queue")?;
 
-    let Some((position, video_id, title, channel, duration_secs, requested_by)) = row else {
+        let Some((position, video_id, title, channel, duration_secs, requested_by)) = row else {
+            tx.commit()
+                .await
+                .context("failed to commit queue pop transaction")?;
+            return Ok(None);
+        };
+
+        sqlx::query("DELETE FROM guild_session_queue WHERE guild_id = ?1 AND position = ?2")
+            .bind(guild_id)
+            .bind(position)
+            .execute(&mut *tx)
+            .await
+            .context("failed to remove the popped queue row")?;
+
+        let Some(queued) = queued_track_from_row((video_id, title, channel, duration_secs, requested_by)) else {
+            tracing::warn!(guild_id, position, "skipping unparsable queue row");
+            continue;
+        };
+
         tx.commit()
             .await
             .context("failed to commit queue pop transaction")?;
-        return Ok(None);
-    };
-
-    sqlx::query("DELETE FROM guild_session_queue WHERE guild_id = ?1 AND position = ?2")
-        .bind(guild_id)
-        .bind(position)
-        .execute(&mut *tx)
-        .await
-        .context("failed to remove the popped queue row")?;
-
-    tx.commit()
-        .await
-        .context("failed to commit queue pop transaction")?;
-
-    Ok(queued_track_from_row((
-        video_id,
-        title,
-        channel,
-        duration_secs,
-        requested_by,
-    )))
+        return Ok(Some(queued));
+    }
 }
 
 /// Reads (without removing) the lowest-position row in `guild_id`'s upcoming
@@ -1361,6 +1369,36 @@ mod tests {
     async fn queue_pop_front_is_none_on_an_empty_queue() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
         assert_eq!(queue_pop_front(&pool, "1").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queue_pop_front_skips_a_row_with_an_unparsable_requested_by() -> Result<()> {
+        // A corrupt row shouldn't be mistaken for an empty queue — it should
+        // be dropped and popping should continue on to the next valid one.
+        let pool = connect("sqlite::memory:").await?;
+        queue_push_back(&pool, "1", &sample_queued("a", None, 42)).await?;
+        sqlx::query(
+            "INSERT INTO guild_session_queue \
+             (guild_id, position, video_id, title, channel, duration_secs, requested_by) \
+             VALUES ('1', 1, 'bad', 'Bad', 'Chan', NULL, 'not-a-number')",
+        )
+        .execute(&pool)
+        .await?;
+        queue_push_back(&pool, "1", &sample_queued("b", None, 42)).await?;
+
+        let popped = queue_pop_front(&pool, "1")
+            .await?
+            .expect("should skip the corrupt row and return the next valid one");
+        assert_eq!(popped.track.video_id, "a");
+
+        let popped = queue_pop_front(&pool, "1")
+            .await?
+            .expect("should skip the corrupt row and return the next valid one");
+        assert_eq!(popped.track.video_id, "b");
+
+        assert_eq!(queue_all(&pool, "1").await?, Vec::new());
+
         Ok(())
     }
 

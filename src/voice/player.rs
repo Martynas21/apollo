@@ -579,7 +579,7 @@ impl PlayerRegistry {
             }
         };
 
-        let already_racing = {
+        let (already_racing, mut candidate) = {
             let mut guilds = self.guilds.lock().await;
             let state = guilds.entry(guild_id).or_default();
             // Lost a race against a concurrent `join`/`enqueue` that landed
@@ -591,7 +591,7 @@ impl PlayerRegistry {
             // doing anything else — there's no "queue non-empty but
             // now_playing still None" state reachable via those paths.
             if state.now_playing.is_some() {
-                true
+                (true, None)
             } else {
                 state.radio_enabled = session.radio_enabled;
                 state.radio_requested_by = session
@@ -606,23 +606,35 @@ impl PlayerRegistry {
                         requested_by: UserId::new(id),
                     })
                 });
-                false
+                // Determined in this same critical section, not a separate
+                // re-lock afterward — releasing the lock between setting
+                // `now_playing` above and reading it back here would open a
+                // window for a concurrent `/play` to set its own
+                // `now_playing` and start its own track, only for this
+                // restore to then read (and start) that same track too,
+                // racing two songbird tracks for the guild.
+                if state.now_playing.is_none() {
+                    // Nothing was actively playing when this was persisted
+                    // (or its `requested_by` failed to parse) — but the DB
+                    // queue is the live upcoming-queue table regardless of
+                    // what got restored above, so pop its front as the
+                    // resumed `now_playing` if anything's there. Inlined
+                    // rather than calling `promote_next` (which re-acquires
+                    // this same lock and would deadlock here).
+                    let next = match db::queue_pop_front(&self.db, &guild_id_str).await {
+                        Ok(next) => next,
+                        Err(err) => {
+                            tracing::warn!(%guild_id, %err, "failed to pop the next queued track");
+                            None
+                        }
+                    };
+                    state.now_playing = next.clone();
+                }
+                (false, state.now_playing.clone())
             }
         };
         if already_racing {
             return;
-        }
-
-        let mut candidate = {
-            let guilds = self.guilds.lock().await;
-            guilds.get(&guild_id).and_then(|s| s.now_playing.clone())
-        };
-        if candidate.is_none() {
-            // Nothing was actively playing when this was persisted (or its
-            // `requested_by` failed to parse) — but the DB queue is the live
-            // upcoming-queue table regardless of what got restored above, so
-            // pop its front as the resumed `now_playing` if anything's there.
-            candidate = self.promote_next(guild_id).await;
         }
 
         // Mirrors `enqueue_many`'s start-and-retry loop: walk past restored
@@ -889,35 +901,35 @@ impl PlayerRegistry {
             if needs_start {
                 state.now_playing = first.clone();
             }
-            (call, needs_start)
-        };
 
-        // The rest of the list (everything but the track about to become
-        // `now_playing`, if any) is persisted up front, before anything
-        // else touches this guild's queue — nothing has been told about
-        // these tracks yet, so there's no concurrent-access window to close
-        // here, unlike the other queue mutations below (see the `guilds`
-        // field's doc comment).
-        let rest: Vec<QueuedTrack> = if needs_start {
-            tracks.split_off(1)
-        } else {
-            std::mem::take(&mut tracks)
-        };
-        if !rest.is_empty()
-            && let Err(err) = db::queue_push_many(&self.db, &guild_id_str, &rest).await
-        {
-            if needs_start {
-                // The speculative `now_playing` claim above never got a
-                // chance to actually start — roll it back so it doesn't
-                // orphan whatever might get queued behind it later (same
-                // reasoning as `enqueue`'s own rollback).
-                let mut guilds = self.guilds.lock().await;
-                if let Some(state) = guilds.get_mut(&guild_id) {
+            // The rest of the list (everything but the track about to become
+            // `now_playing`, if any) is persisted while the lock is still
+            // held, same as `enqueue`'s `db::queue_push_back` call — letting
+            // go of the lock first would open a window for a concurrent
+            // `/stop` to clear the DB queue between claiming `now_playing`
+            // and this write, which would then land the rest of the
+            // playlist back into `guild_session_queue` after `/stop` just
+            // cleared it (see the `guilds` field's doc comment).
+            let rest: Vec<QueuedTrack> = if needs_start {
+                tracks.split_off(1)
+            } else {
+                std::mem::take(&mut tracks)
+            };
+            if !rest.is_empty()
+                && let Err(err) = db::queue_push_many(&self.db, &guild_id_str, &rest).await
+            {
+                if needs_start {
+                    // The speculative `now_playing` claim above never got a
+                    // chance to actually start — roll it back so it doesn't
+                    // orphan whatever might get queued behind it later (same
+                    // reasoning as `enqueue`'s own rollback).
                     state.now_playing = None;
                 }
+                return Err(PlayerError::Storage(err.to_string()));
             }
-            return Err(PlayerError::Storage(err.to_string()));
-        }
+
+            (call, needs_start)
+        };
 
         let mut failed = 0;
         if needs_start {
