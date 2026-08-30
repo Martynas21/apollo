@@ -27,8 +27,10 @@ it (see Prerequisites).
   (Opus-in-WebM) path. `ffmpeg` is still a required dependency: it's
   checked for at startup since `yt-dlp` itself may shell out to it for some
   post-processing paths.
-- A local SQLite database (via `sqlx`) persists only per-guild playback
-  settings (currently just volume) across restarts.
+- A local SQLite database (via `sqlx`) persists per-guild playback settings
+  (currently just volume) and saved playlists (a named pointer to a
+  `YouTube` playlist URL, browsable from the `/player` panel) across
+  restarts.
 
 ## Prerequisites
 
@@ -107,17 +109,24 @@ See `.env.example` for the full list and inline docs:
 
 ## Commands
 
-- **Playback**: `/play <query|url>` (auto-joins your voice channel), `/queue`,
-  `/skip`, `/pause`, `/resume`, `/stop`, `/player`, `/shuffle`, `/radio`,
+- **Playback**: `/play <query|url|playlist-url>` (auto-joins your voice
+  channel) — plays a video, queues an entire playlist given its URL, or
+  searches and queues the top hit for free text. `/queue`, `/skip`,
+  `/pause`, `/resume`, `/stop`, `/player`, `/shuffle`, `/radio`,
   `/volume <0-100>` (persists per-guild across restarts)
 - **Library browsing**: `/add_to_queue <query>` shows a numbered listing
   alongside a select menu — clicking an entry queues it immediately. The
   numbered form still works too: `/add_to_queue <query> <number>` queues a
-  search hit directly. `/playlist_play <url-or-id>` queues an entire public
-  `YouTube` playlist in one shot, given its URL or bare playlist ID.
+  search hit directly.
+- **Player panel**: `/player` posts a persistent per-guild panel (playback
+  controls plus Search/Playlists buttons into the library, kept in sync as
+  state changes) or points back at the existing one if it's already active.
+  Its Playlists button opens a picker for this guild's saved playlists —
+  import one from a `YouTube` playlist URL, then browse/play/refresh/remove
+  it later without re-pasting the URL into `/play`.
 
   There's no manual `/join`/`/leave` — the bot joins automatically on
-  `/play`/`/add_to_queue`/etc., and leaves on its own 5 minutes after the
+  `/play`/`/add_to_queue`/etc., and leaves on its own ~2.5 minutes after the
   queue drains empty (see `IDLE_DISCONNECT` in `src/voice/player.rs`).
 
 ## Running it
@@ -150,13 +159,14 @@ setup, and premature before this has even been run live once.
 
 - `src/main.rs` — entrypoint: config, logging, client/framework wiring.
 - `src/config.rs` — environment-based configuration.
-- `src/db.rs` — SQLite persistence for per-guild playback settings (`sqlx`).
+- `src/db.rs` — SQLite persistence for per-guild playback settings and saved
+  playlists (`sqlx`).
 - `src/commands/` — poise slash commands: `playback.rs` (playback control),
-  `library.rs` (search/queue/playlist), `radio.rs` (`/radio`).
+  `library.rs` (search/queue/saved playlists), `radio.rs` (`/radio`).
 - `src/youtube/api.rs` — `yt-dlp`-backed search/single-video/playlist client.
-- `src/voice/` — `player.rs` (per-guild queue engine), `resolve.rs`
-  (yt-dlp-backed audio resolution + startup dependency check), `radio.rs`
-  (Mix listing for radio mode).
+- `src/voice/` — `player.rs` (per-guild queue engine), `panel.rs` (the
+  `/player` panel's rendering), `resolve.rs` (yt-dlp-backed audio resolution
+  + startup dependency check), `radio.rs` (Mix listing for radio mode).
 - `migrations/` — sqlx SQLite migrations (embedded into the binary at
   compile time).
 - `Dockerfile` / `compose.yaml` — optional local Docker build, see above.
