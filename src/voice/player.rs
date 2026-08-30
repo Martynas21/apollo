@@ -438,10 +438,6 @@ pub struct PlayerRegistry {
     /// into full `Track`s — see `maybe_spawn_radio_refill`.
     youtube: YouTubeClient,
     guilds: Arc<Mutex<HashMap<GuildId, GuildState>>>,
-    /// This registry's owning bot identity's application id — `guild_settings`
-    /// (volume) is keyed on `(guild_id, bot_id)` since multiple identities
-    /// can independently occupy the same guild (see `Config::bots`).
-    bot_id: String,
 }
 
 /// [`VoiceEvents`] callbacks land here from whichever backend the registry
@@ -472,7 +468,6 @@ impl PlayerRegistry {
         cookies_file: Option<String>,
         db: sqlx::SqlitePool,
         youtube: YouTubeClient,
-        bot_id: String,
     ) -> Self {
         let voice = Arc::new(SongbirdBackend {
             songbird,
@@ -486,7 +481,6 @@ impl PlayerRegistry {
             db,
             youtube,
             guilds: Arc::new(Mutex::new(HashMap::new())),
-            bot_id,
         }
     }
 
@@ -512,7 +506,6 @@ impl PlayerRegistry {
             db,
             youtube: YouTubeClient::default(),
             guilds: Arc::new(Mutex::new(HashMap::new())),
-            bot_id: "test-bot".to_string(),
         }
     }
 
@@ -806,7 +799,7 @@ impl PlayerRegistry {
         // Best-effort: a missing/unreadable volume setting shouldn't block
         // playback — fall back to songbird's own default (100%) rather than
         // erroring the whole track out.
-        let volume = db::get_guild_volume(&self.db, &guild_id.to_string(), &self.bot_id)
+        let volume = db::get_guild_volume(&self.db, &guild_id.to_string())
             .await
             .unwrap_or(db::DEFAULT_VOLUME);
         // Clamped here rather than trusting callers/storage: songbird takes
@@ -1109,7 +1102,7 @@ impl PlayerRegistry {
     /// This guild's persisted playback volume (0-100), for display — the
     /// same lookup [`Self::start_playback`] uses to apply it to a new track.
     pub async fn get_volume(&self, guild_id: GuildId) -> u8 {
-        db::get_guild_volume(&self.db, &guild_id.to_string(), &self.bot_id)
+        db::get_guild_volume(&self.db, &guild_id.to_string())
             .await
             .unwrap_or(db::DEFAULT_VOLUME)
     }
@@ -1120,7 +1113,7 @@ impl PlayerRegistry {
         // Clamped rather than trusting the caller to have validated — see
         // `start_playback`.
         let volume = volume.min(MAX_VOLUME);
-        db::set_guild_volume(&self.db, &guild_id.to_string(), &self.bot_id, volume)
+        db::set_guild_volume(&self.db, &guild_id.to_string(), volume)
             .await
             .map_err(|e| PlayerError::Storage(e.to_string()))?;
 

@@ -56,19 +56,15 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool> {
 /// Default playback volume (percent) for a guild with no `guild_settings` row.
 pub const DEFAULT_VOLUME: u8 = 100;
 
-/// Reads a guild's persisted playback volume (0-100) for the given bot
-/// identity, defaulting to [`DEFAULT_VOLUME`] if it's never been set.
-/// Scoped by `bot_id` since multiple bot identities can independently
-/// occupy the same guild (each holding its own voice channel).
-pub async fn get_guild_volume(pool: &SqlitePool, guild_id: &str, bot_id: &str) -> Result<u8> {
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT volume FROM guild_settings WHERE guild_id = ?1 AND bot_id = ?2",
-    )
-    .bind(guild_id)
-    .bind(bot_id)
-    .fetch_optional(pool)
-    .await
-    .context("failed to fetch guild volume")?;
+/// Reads a guild's persisted playback volume (0-100), defaulting to
+/// [`DEFAULT_VOLUME`] if it's never been set.
+pub async fn get_guild_volume(pool: &SqlitePool, guild_id: &str) -> Result<u8> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT volume FROM guild_settings WHERE guild_id = ?1")
+            .bind(guild_id)
+            .fetch_optional(pool)
+            .await
+            .context("failed to fetch guild volume")?;
 
     Ok(match row {
         Some((volume,)) => u8::try_from(volume).unwrap_or_else(|_| {
@@ -83,19 +79,13 @@ pub async fn get_guild_volume(pool: &SqlitePool, guild_id: &str, bot_id: &str) -
     })
 }
 
-/// Persists a guild's playback volume (0-100) for the given bot identity.
-pub async fn set_guild_volume(
-    pool: &SqlitePool,
-    guild_id: &str,
-    bot_id: &str,
-    volume: u8,
-) -> Result<()> {
+/// Persists a guild's playback volume (0-100).
+pub async fn set_guild_volume(pool: &SqlitePool, guild_id: &str, volume: u8) -> Result<()> {
     sqlx::query(
-        "INSERT INTO guild_settings (guild_id, bot_id, volume) VALUES (?1, ?2, ?3)
-         ON CONFLICT(guild_id, bot_id) DO UPDATE SET volume = excluded.volume",
+        "INSERT INTO guild_settings (guild_id, volume) VALUES (?1, ?2)
+         ON CONFLICT(guild_id) DO UPDATE SET volume = excluded.volume",
     )
     .bind(guild_id)
-    .bind(bot_id)
     .bind(i64::from(volume))
     .execute(pool)
     .await
@@ -319,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn guild_volume_defaults_when_unset() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
-        assert_eq!(get_guild_volume(&pool, "1", "bot-a").await?, DEFAULT_VOLUME);
+        assert_eq!(get_guild_volume(&pool, "1").await?, DEFAULT_VOLUME);
         Ok(())
     }
 
@@ -327,31 +317,15 @@ mod tests {
     async fn guild_volume_set_and_get_round_trip() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
 
-        set_guild_volume(&pool, "1", "bot-a", 42).await?;
-        assert_eq!(get_guild_volume(&pool, "1", "bot-a").await?, 42);
+        set_guild_volume(&pool, "1", 42).await?;
+        assert_eq!(get_guild_volume(&pool, "1").await?, 42);
 
         // A different guild is unaffected.
-        assert_eq!(get_guild_volume(&pool, "2", "bot-a").await?, DEFAULT_VOLUME);
+        assert_eq!(get_guild_volume(&pool, "2").await?, DEFAULT_VOLUME);
 
         // Setting again replaces rather than erroring on the existing row.
-        set_guild_volume(&pool, "1", "bot-a", 7).await?;
-        assert_eq!(get_guild_volume(&pool, "1", "bot-a").await?, 7);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn guild_volume_is_scoped_per_bot_identity() -> Result<()> {
-        let pool = connect("sqlite::memory:").await?;
-
-        set_guild_volume(&pool, "1", "bot-a", 42).await?;
-
-        // A different bot identity in the same guild is unaffected.
-        assert_eq!(get_guild_volume(&pool, "1", "bot-b").await?, DEFAULT_VOLUME);
-
-        set_guild_volume(&pool, "1", "bot-b", 7).await?;
-        assert_eq!(get_guild_volume(&pool, "1", "bot-a").await?, 42);
-        assert_eq!(get_guild_volume(&pool, "1", "bot-b").await?, 7);
+        set_guild_volume(&pool, "1", 7).await?;
+        assert_eq!(get_guild_volume(&pool, "1").await?, 7);
 
         Ok(())
     }
@@ -363,13 +337,13 @@ mod tests {
         // Bypass `set_guild_volume` (which only ever writes valid `u8`
         // values) to simulate a corrupted row.
         sqlx::query(
-            "INSERT INTO guild_settings (guild_id, bot_id, volume) VALUES ('1', 'bot-a', 99999)
-             ON CONFLICT(guild_id, bot_id) DO UPDATE SET volume = excluded.volume",
+            "INSERT INTO guild_settings (guild_id, volume) VALUES ('1', 99999)
+             ON CONFLICT(guild_id) DO UPDATE SET volume = excluded.volume",
         )
         .execute(&pool)
         .await?;
 
-        assert_eq!(get_guild_volume(&pool, "1", "bot-a").await?, DEFAULT_VOLUME);
+        assert_eq!(get_guild_volume(&pool, "1").await?, DEFAULT_VOLUME);
 
         Ok(())
     }
