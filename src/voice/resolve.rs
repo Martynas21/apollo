@@ -24,6 +24,10 @@ const STDERR_TRUNCATE_LEN: usize = 200;
 /// path, to bound worst-case memory use. See `cached_track_input`.
 const MAX_BUFFERED_TRACK_DURATION: Duration = Duration::from_mins(20);
 
+/// Timeout for the `yt-dlp` preflight call, matching `YT_DLP_TIMEOUT` in
+/// `src/youtube/api.rs` for the same single-video lookup shape.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug)]
 pub enum PlaybackError {
     /// yt-dlp reported the video requires sign-in/age verification.
@@ -34,6 +38,9 @@ pub enum PlaybackError {
     Unavailable,
     /// The `yt-dlp` binary itself could not be found on `PATH`.
     YtDlpMissing,
+    /// The `yt-dlp` process didn't finish within its allotted timeout and
+    /// was killed.
+    Timeout,
     /// Any other non-zero exit, carrying a truncated copy of stderr.
     Other(String),
 }
@@ -45,6 +52,7 @@ impl std::fmt::Display for PlaybackError {
             Self::RegionLocked => write!(f, "video is not available in this region"),
             Self::Unavailable => write!(f, "video is unavailable (private or deleted)"),
             Self::YtDlpMissing => write!(f, "yt-dlp is not installed or not on PATH"),
+            Self::Timeout => write!(f, "yt-dlp timed out"),
             Self::Other(message) => write!(f, "yt-dlp failed: {message}"),
         }
     }
@@ -120,19 +128,23 @@ pub async fn preflight_check(
     let url = format!("https://www.youtube.com/watch?v={video_id}");
 
     let mut command = Command::new("yt-dlp");
+    command.kill_on_drop(true);
     command.args(["-j", "--no-playlist", "--simulate"]);
     if let Some(cookies_file) = cookies_file {
         command.args(["--cookies", cookies_file]);
     }
     command.arg(&url);
 
-    let output = command.output().await.map_err(|e| {
-        if e.kind() == ErrorKind::NotFound {
-            PlaybackError::YtDlpMissing
-        } else {
-            PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN))
-        }
-    })?;
+    let output = tokio::time::timeout(PREFLIGHT_TIMEOUT, command.output())
+        .await
+        .map_err(|_elapsed| PlaybackError::Timeout)?
+        .map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                PlaybackError::YtDlpMissing
+            } else {
+                PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN))
+            }
+        })?;
 
     if output.status.success() {
         return Ok(());

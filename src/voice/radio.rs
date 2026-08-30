@@ -16,6 +16,7 @@
 //! bot plays.
 
 use std::io::ErrorKind;
+use std::time::Duration;
 
 use tokio::process::Command;
 
@@ -24,6 +25,10 @@ use tokio::process::Command;
 /// `crate::voice::player`'s `maybe_spawn_radio_refill`), and a smaller
 /// `--playlist-end` keeps the subprocess itself fast.
 const MIX_LISTING_LIMIT: usize = 20;
+
+/// Timeout for the mix-listing `yt-dlp` call, matching `YT_DLP_TIMEOUT` in
+/// `src/youtube/api.rs` for the same single-target lookup shape.
+const MIX_LISTING_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Truncation length for stderr embedded in `RadioError::YtDlpFailed`,
 /// matching `PlaybackError::Other`'s convention in `resolve.rs`.
@@ -38,6 +43,9 @@ pub enum RadioError {
     YtDlpFailed(String),
     /// yt-dlp exited zero but produced no parseable entries at all.
     Empty,
+    /// The `yt-dlp` process didn't finish within its allotted timeout and
+    /// was killed.
+    Timeout,
 }
 
 impl std::fmt::Display for RadioError {
@@ -46,6 +54,7 @@ impl std::fmt::Display for RadioError {
             Self::YtDlpMissing => write!(f, "yt-dlp is not installed or not on PATH"),
             Self::YtDlpFailed(message) => write!(f, "yt-dlp failed to list mix: {message}"),
             Self::Empty => write!(f, "mix listing returned no usable entries"),
+            Self::Timeout => write!(f, "yt-dlp timed out"),
         }
     }
 }
@@ -103,6 +112,7 @@ pub async fn list_mix_video_ids(
     let url = format!("https://www.youtube.com/watch?v={seed_video_id}&list=RD{seed_video_id}");
 
     let mut command = Command::new("yt-dlp");
+    command.kill_on_drop(true);
     command.args([
         "-j",
         "--flat-playlist",
@@ -115,13 +125,16 @@ pub async fn list_mix_video_ids(
     }
     command.arg(&url);
 
-    let output = command.output().await.map_err(|e| {
-        if e.kind() == ErrorKind::NotFound {
-            RadioError::YtDlpMissing
-        } else {
-            RadioError::YtDlpFailed(truncate_tail(&e.to_string(), STDERR_TRUNCATE_LEN))
-        }
-    })?;
+    let output = tokio::time::timeout(MIX_LISTING_TIMEOUT, command.output())
+        .await
+        .map_err(|_elapsed| RadioError::Timeout)?
+        .map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                RadioError::YtDlpMissing
+            } else {
+                RadioError::YtDlpFailed(truncate_tail(&e.to_string(), STDERR_TRUNCATE_LEN))
+            }
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
