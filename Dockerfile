@@ -10,12 +10,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake \
     && rm -rf /var/lib/apt/lists/*
 
-# Dependencies (crates.io + the patched vendor/ deps) are built in their own
-# layer, keyed only on Cargo.toml/Cargo.lock/vendor — so editing src/ later
-# doesn't invalidate this and force recompiling the whole dependency graph
-# (~200 crates, including the libopus_sys CMake build) on every change.
+# Dependencies (crates.io deps) are built in their own layer, keyed only on
+# Cargo.toml/Cargo.lock — so editing src/ later doesn't invalidate this and
+# force recompiling the whole dependency graph (~200 crates, including the
+# libopus_sys CMake build) on every change.
 COPY Cargo.toml Cargo.lock ./
-COPY vendor ./vendor
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     mkdir src && echo "fn main() {}" > src/main.rs \
