@@ -104,6 +104,7 @@ dependencies = [
  "anyhow",
  "apollo-ipc",
  "async-trait",
+ "dotenvy",
  "songbird",
  "symphonia",
  "tokio",

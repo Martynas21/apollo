@@ -67,11 +67,11 @@ impl Config {
             discord_application_id: env_var(&lookup, "DISCORD_APPLICATION_ID")?,
             discord_guild_id: optional_guild_id(&lookup)?,
             database_url: env_var(&lookup, "DATABASE_URL")?,
-            yt_dlp_cookies_file: optional_env_var(&lookup, "YT_DLP_COOKIES_FILE"),
+            yt_dlp_cookies_file: apollo_ipc::optional_env_var(&lookup, "YT_DLP_COOKIES_FILE"),
             playlist_track_limit: playlist_track_limit(&lookup)?,
-            audio_worker_socket: optional_env_var(&lookup, "AUDIO_WORKER_SOCKET")
+            audio_worker_socket: apollo_ipc::optional_env_var(&lookup, "AUDIO_WORKER_SOCKET")
                 .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_PATH.to_string()),
-            audio_buffer_dir: optional_env_var(&lookup, "AUDIO_BUFFER_DIR")
+            audio_buffer_dir: apollo_ipc::optional_env_var(&lookup, "AUDIO_BUFFER_DIR")
                 .unwrap_or_else(|| DEFAULT_AUDIO_BUFFER_DIR.to_string()),
         })
     }
@@ -96,15 +96,6 @@ fn env_var(
     key: &str,
 ) -> Result<String> {
     lookup(key).with_context(|| format!("missing required environment variable: {key}"))
-}
-
-/// Reads an optional environment variable, treating both "unset" and "set
-/// but empty" as absent.
-fn optional_env_var(
-    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
-    key: &str,
-) -> Option<String> {
-    lookup(key).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn optional_guild_id(

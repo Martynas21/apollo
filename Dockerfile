@@ -120,8 +120,10 @@ ENTRYPOINT ["/usr/local/bin/apollo"]
 FROM debian:bookworm-slim AS audio-worker
 ARG APOLLO_UID
 
+# netcat-openbsd is only for compose.yaml's healthcheck (`nc -Uz` against
+# the IPC socket) — nothing in the worker itself uses it.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --system --uid ${APOLLO_UID} --create-home --home-dir /app apollo

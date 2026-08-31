@@ -267,8 +267,10 @@ pub trait VoiceBackend: Send + Sync + 'static {
 /// One guild's live voice connection.
 #[async_trait::async_trait]
 pub trait VoiceCall: Send + Sync {
-    /// Starts `source` playing, returning a handle to control it.
-    async fn play(&self, source: AudioSource) -> Arc<dyn VoiceTrack>;
+    /// Starts `source` playing, returning a handle to control it. Errs if
+    /// the backend rejects (or can't confirm) the request — e.g. the IPC
+    /// backend, when the audio worker has no session for this guild.
+    async fn play(&self, source: AudioSource) -> Result<Arc<dyn VoiceTrack>, String>;
 }
 
 /// A control handle for a track that is (or was) playing.
@@ -276,10 +278,10 @@ pub trait VoiceCall: Send + Sync {
 pub trait VoiceTrack: Send + Sync {
     /// The track's own id, used to recognise stale end events.
     fn uuid(&self) -> Uuid;
-    fn set_volume(&self, multiplier: f32) -> Result<(), String>;
-    fn stop(&self) -> Result<(), String>;
-    fn pause(&self) -> Result<(), String>;
-    fn resume(&self) -> Result<(), String>;
+    async fn set_volume(&self, multiplier: f32) -> Result<(), String>;
+    async fn stop(&self) -> Result<(), String>;
+    async fn pause(&self) -> Result<(), String>;
+    async fn resume(&self) -> Result<(), String>;
     /// Registers `events` to be notified once this track ends *or* errors
     /// out. Best-effort by design: a registration failure is logged rather
     /// than returned, since the track still plays — it just won't
@@ -729,10 +731,23 @@ impl PlayerRegistry {
     /// common case of the idle-timeout auto-disconnect in
     /// [`Self::schedule_idle_disconnect`]).
     pub async fn leave(&self, guild_id: GuildId) -> Result<(), PlayerError> {
-        let (result, panel) = {
+        let panel = {
             let mut guilds = self.guilds.lock().await;
-            self.leave_under_lock(guild_id, &mut guilds).await
+            Self::take_guild_state(guild_id, &mut guilds)
         };
+
+        // `remove`, not `leave` — `Songbird::leave` only clears the voice
+        // connection, leaving the (now-disconnected) `Call` registered in
+        // songbird's manager map. `is_connected` would then keep reporting
+        // this guild as connected, so `/play` would skip rejoining voice
+        // and play into a `Call` with nothing on the other end.
+        //
+        // Deliberately outside the lock above: this is an IPC round trip to
+        // the audio worker, and `guilds` is the single process-wide mutex
+        // every guild's commands share (see its doc comment) — a slow or
+        // stuck worker response must not stall every other guild along with
+        // this one.
+        let result = self.voice.remove(guild_id).await.map_err(PlayerError::Join);
 
         if let Some((channel_id, message_id)) = panel {
             let _ = self.edit_panel(guild_id, channel_id, message_id).await;
@@ -743,31 +758,21 @@ impl PlayerRegistry {
         result
     }
 
-    /// Leaves voice and drops the guild's state, with the caller's guild-map
-    /// lock held throughout so the decision to leave and the teardown can't
-    /// be interleaved with an `enqueue` (see [`Self::leave_if_idle`]).
-    ///
-    /// Returns the panel pointer (if any) instead of refreshing it here: the
-    /// panel renderer reads this same map, so it must only run once the
-    /// caller has dropped the lock.
-    async fn leave_under_lock(
-        &self,
+    /// Removes the guild's entry from the map (aborting any live prefetch)
+    /// and returns its panel pointer, if it had one. Synchronous and
+    /// lock-scoped only — the actual voice teardown is a separate IPC round
+    /// trip callers must make after dropping the guild-map lock, so it can't
+    /// stall every other guild sharing that same mutex (see [`Self::leave`]
+    /// and [`Self::leave_if_idle`]).
+    fn take_guild_state(
         guild_id: GuildId,
         guilds: &mut HashMap<GuildId, GuildState>,
-    ) -> (Result<(), PlayerError>, Option<(ChannelId, MessageId)>) {
+    ) -> Option<(ChannelId, MessageId)> {
         let mut removed = guilds.remove(&guild_id);
         if let Some(prefetch) = removed.as_mut().and_then(|state| state.prefetch.take()) {
             prefetch.abort();
         }
-
-        // `remove`, not `leave` — `Songbird::leave` only clears the voice
-        // connection, leaving the (now-disconnected) `Call` registered in
-        // songbird's manager map. `is_connected` would then keep reporting
-        // this guild as connected, so `/play` would skip rejoining voice
-        // and play into a `Call` with nothing on the other end.
-        let result = self.voice.remove(guild_id).await.map_err(PlayerError::Join);
-
-        (result, removed.and_then(|state| state.panel))
+        removed.and_then(|state| state.panel)
     }
 
     /// Leaves voice, but only if the guild is still idle — the action half
@@ -785,7 +790,7 @@ impl PlayerRegistry {
     /// sees a non-idle guild and bails) or lose it (and see no `Call`,
     /// reporting `NotConnected` rather than playing into a dead one).
     async fn leave_if_idle(&self, guild_id: GuildId) {
-        let (result, panel) = {
+        let panel = {
             let mut guilds = self.guilds.lock().await;
             match guilds.get(&guild_id) {
                 Some(state) if state.now_playing.is_some() => return,
@@ -793,9 +798,9 @@ impl PlayerRegistry {
             }
             // The upcoming queue no longer lives in memory, so "idle" needs
             // a DB round trip — done here, still inside the same lock
-            // acquisition as the teardown below, so nothing (a radio refill
+            // acquisition as the removal below, so nothing (a radio refill
             // landing rows, a queue push) can slip into the gap between
-            // deciding this guild is idle and actually leaving voice.
+            // deciding this guild is idle and removing its map entry.
             let queue_empty = db::queue_len(&self.db, &guild_id.to_string())
                 .await
                 .unwrap_or(0)
@@ -803,8 +808,12 @@ impl PlayerRegistry {
             if !queue_empty {
                 return;
             }
-            self.leave_under_lock(guild_id, &mut guilds).await
+            Self::take_guild_state(guild_id, &mut guilds)
         };
+
+        // Outside the lock, same reasoning as `leave`: this is an IPC round
+        // trip, and every other guild shares this mutex.
+        let result = self.voice.remove(guild_id).await.map_err(PlayerError::Join);
 
         if let Err(err) = result {
             tracing::warn!(%guild_id, %err, "idle disconnect failed to leave voice");
@@ -1051,7 +1060,10 @@ impl PlayerRegistry {
             }
         };
 
-        let handle = call.play(source).await;
+        let handle = call
+            .play(source)
+            .await
+            .map_err(PlayerError::Playback)?;
         let track_id = handle.uuid();
 
         // Best-effort: a missing/unreadable volume setting shouldn't block
@@ -1064,7 +1076,7 @@ impl PlayerRegistry {
         // an unbounded multiplier, so a stray >100 value (a hand-edited row,
         // a future caller that forgets to validate) would blow out the
         // amplitude and clip.
-        if let Err(err) = handle.set_volume(volume_multiplier(volume)) {
+        if let Err(err) = handle.set_volume(volume_multiplier(volume)).await {
             tracing::warn!(%err, "failed to apply saved volume to new track");
         }
 
@@ -1239,6 +1251,7 @@ impl PlayerRegistry {
         // instead of relying on that event to do it.
         let result = handle
             .stop()
+            .await
             .map_err(|e| PlayerError::Playback(e.to_string()));
         if result.is_ok() {
             self.schedule_idle_disconnect(guild_id);
@@ -1260,6 +1273,7 @@ impl PlayerRegistry {
         let handle = handle.ok_or(PlayerError::NothingPlaying)?;
         handle
             .stop()
+            .await
             .map_err(|e| PlayerError::Playback(e.to_string()))
     }
 
@@ -1273,6 +1287,7 @@ impl PlayerRegistry {
         let handle = handle.ok_or(PlayerError::NothingPlaying)?;
         let result = handle
             .pause()
+            .await
             .map_err(|e| PlayerError::Playback(e.to_string()));
         if result.is_ok() {
             self.refresh_panel(guild_id).await;
@@ -1290,6 +1305,7 @@ impl PlayerRegistry {
         let handle = handle.ok_or(PlayerError::NothingPlaying)?;
         let result = handle
             .resume()
+            .await
             .map_err(|e| PlayerError::Playback(e.to_string()));
         if result.is_ok() {
             self.refresh_panel(guild_id).await;
@@ -1397,6 +1413,7 @@ impl PlayerRegistry {
         // same lock) from popping the old front before it's drained.
         handle
             .stop()
+            .await
             .map_err(|e| PlayerError::Playback(e.to_string()))?;
 
         db::queue_drop_front(&self.db, &guild_id_str, index)
@@ -1470,7 +1487,7 @@ impl PlayerRegistry {
                 .and_then(|state| state.current_handle.clone())
         };
         if let Some(handle) = handle
-            && let Err(err) = handle.set_volume(volume_multiplier(volume))
+            && let Err(err) = handle.set_volume(volume_multiplier(volume)).await
         {
             tracing::warn!(%err, "failed to apply volume change to current track");
         }
@@ -2099,12 +2116,12 @@ mod tests {
             self.uuid
         }
 
-        fn set_volume(&self, multiplier: f32) -> Result<(), String> {
+        async fn set_volume(&self, multiplier: f32) -> Result<(), String> {
             self.state.lock().unwrap().volume = Some(multiplier);
             Ok(())
         }
 
-        fn stop(&self) -> Result<(), String> {
+        async fn stop(&self) -> Result<(), String> {
             let mut state = self.state.lock().unwrap();
             if let Some(message) = state.stop_error.take() {
                 return Err(message);
@@ -2113,12 +2130,12 @@ mod tests {
             Ok(())
         }
 
-        fn pause(&self) -> Result<(), String> {
+        async fn pause(&self) -> Result<(), String> {
             self.state.lock().unwrap().paused = true;
             Ok(())
         }
 
-        fn resume(&self) -> Result<(), String> {
+        async fn resume(&self) -> Result<(), String> {
             self.state.lock().unwrap().paused = false;
             Ok(())
         }
@@ -2181,13 +2198,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl VoiceCall for FakeCall {
-        async fn play(&self, source: AudioSource) -> Arc<dyn VoiceTrack> {
+        async fn play(&self, source: AudioSource) -> Result<Arc<dyn VoiceTrack>, String> {
             let track = FakeTrack::new();
             self.played.lock().unwrap().push(PlayedTrack {
                 video_id: source.video_id,
                 handle: track.clone(),
             });
-            track
+            Ok(track)
         }
     }
 

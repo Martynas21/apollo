@@ -53,6 +53,7 @@ fn to_connection_info(dto: ConnectionInfoDto) -> Result<ConnectionInfo, String> 
 struct TrackEndHandler {
     guild_id: u64,
     track_id: Uuid,
+    audio_path: String,
     events: UnboundedSender<IpcEvent>,
 }
 
@@ -77,7 +78,17 @@ impl SongbirdEventHandler for TrackEndHandler {
             }
         };
         let _ = self.events.send(event);
+        delete_audio_file(&self.audio_path);
         None
+    }
+}
+
+/// The buffer file is on tmpfs (RAM-backed, see `compose.yaml`) and nothing
+/// else ever deletes it — every path that ends a track's life must clean up
+/// after itself here or it leaks for the life of the container.
+fn delete_audio_file(path: &str) {
+    if let Err(err) = std::fs::remove_file(path) {
+        tracing::warn!(%err, %path, "failed to delete buffered audio file");
     }
 }
 
@@ -118,13 +129,20 @@ impl Sessions {
                 events: self.events.clone(),
             },
         );
-        self.guilds.lock().unwrap().insert(
+        let old = self.guilds.lock().unwrap().insert(
             guild_id,
             GuildSession {
                 driver,
                 current: None,
             },
         );
+        // A re-issued Join for a guild that already has a session (e.g. a
+        // second /play while one is already active) must not just drop the
+        // old Driver — that would orphan its track with no End/Error ever
+        // reaching apollo. Tear it down the same way an explicit leave does.
+        if let Some(mut old) = old {
+            old.driver.leave();
+        }
         Ok(())
     }
 
@@ -146,22 +164,30 @@ impl Sessions {
 
     pub fn play(&self, guild_id: u64, track_id: Uuid, audio_path: String) -> Result<(), String> {
         let mut guilds = self.guilds.lock().unwrap();
-        let session = guilds
-            .get_mut(&guild_id)
-            .ok_or_else(|| format!("no active session for guild {guild_id}"))?;
-        let input = SongbirdFile::new(audio_path).into();
+        let Some(session) = guilds.get_mut(&guild_id) else {
+            delete_audio_file(&audio_path);
+            return Err(format!("no active session for guild {guild_id}"));
+        };
+        let input = SongbirdFile::new(audio_path.clone()).into();
         let handle = session.driver.play_input(input);
         let end_handler = TrackEndHandler {
             guild_id,
             track_id,
+            audio_path,
             events: self.events.clone(),
         };
-        handle
-            .add_event(Event::Track(TrackEvent::End), end_handler.clone())
-            .map_err(|e| e.to_string())?;
-        handle
-            .add_event(Event::Track(TrackEvent::Error), end_handler)
-            .map_err(|e| e.to_string())?;
+        // Registration failures are logged, not propagated: the track is
+        // already playing by this point, so returning `Err` here would skip
+        // `session.current` below and leave a live track this `Sessions`
+        // can never look up again to pause/stop/clean up — the same
+        // log-and-continue tradeoff apollo's own (pre-split)
+        // `notify_when_finished` made.
+        if let Err(err) = handle.add_event(Event::Track(TrackEvent::End), end_handler.clone()) {
+            tracing::warn!(%err, "failed to register track-end handler");
+        }
+        if let Err(err) = handle.add_event(Event::Track(TrackEvent::Error), end_handler) {
+            tracing::warn!(%err, "failed to register track-error handler");
+        }
         session.current = Some((track_id, handle));
         Ok(())
     }
@@ -260,7 +286,12 @@ mod tests {
     #[tokio::test]
     async fn play_rejects_a_guild_with_no_join() {
         let sessions = sessions();
-        assert!(sessions.play(1, Uuid::new_v4(), "/dev/null".to_string()).is_err());
+        // A path that doesn't exist: `play`'s failure path tries to delete
+        // it (see `delete_audio_file`), which must not panic when there's
+        // nothing there to remove.
+        assert!(sessions
+            .play(1, Uuid::new_v4(), "/nonexistent/apollo-test.audio".to_string())
+            .is_err());
     }
 
     #[tokio::test]

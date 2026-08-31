@@ -82,9 +82,17 @@ pub async fn handle_connection<R, W>(
     let _ = writer_task.await;
 }
 
+/// Reads request frames and dispatches each on its own spawned task, so a
+/// slow request for one guild (e.g. `Join`'s voice-gateway handshake) never
+/// delays reading — let alone dispatching — a concurrently queued request
+/// for another guild. Responses go back over `outbound_tx` (shared with the
+/// event forwarder), which `run_writer` serializes onto the one socket; the
+/// client correlates them by `id`, not arrival order, so completing out of
+/// request order is fine (see `apollo_ipc::proto::Envelope::Response` and
+/// `Connection::pending` in apollo's `voice/ipc_backend.rs`).
 async fn run_reader<R: AsyncRead + Unpin>(
     mut reader: R,
-    sessions: &Sessions,
+    sessions: &Arc<Sessions>,
     outbound_tx: &mpsc::UnboundedSender<Envelope>,
 ) {
     loop {
@@ -103,13 +111,20 @@ async fn run_reader<R: AsyncRead + Unpin>(
             tracing::warn!("ignoring unexpected non-request envelope from client");
             continue;
         };
-        let response = dispatch(sessions, body).await;
-        if outbound_tx
-            .send(Envelope::Response { id, body: response })
-            .is_err()
-        {
-            return;
-        }
+        let sessions = Arc::clone(sessions);
+        let outbound_tx = outbound_tx.clone();
+        tokio::spawn(async move {
+            // Dispatched on an inner task and joined here so a panic inside
+            // `dispatch` (e.g. a songbird call) still yields an error
+            // response instead of leaving the client's request pending
+            // forever — `dispatch` already reports its own `Err`s over the
+            // wire, this only covers the task-died case.
+            let response = match tokio::spawn(async move { dispatch(&sessions, body).await }).await {
+                Ok(response) => response,
+                Err(join_err) => Err(format!("audio worker task panicked: {join_err}")),
+            };
+            let _ = outbound_tx.send(Envelope::Response { id, body: response });
+        });
     }
 }
 
