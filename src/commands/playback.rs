@@ -27,9 +27,14 @@ const VOLUME_MODAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a public status reply (`reply_public`'s "Queued: ...",
 /// "Skipped.", `/queue` listing, etc.) lingers before this schedules its own
 /// removal — long enough to read, short enough that the channel doesn't
-/// accumulate bot replies forever. `pub(super)` so `library.rs`'s picker
-/// cleanup (a different delete path — see its `schedule_picker_cleanup`)
-/// shares the same window.
+/// accumulate bot replies forever.
+const STATUS_REPLY_CLEANUP_DELAY: Duration = Duration::from_secs(15);
+
+/// How long an interactive prompt (a picker with a select menu, etc.) lingers
+/// before this schedules its own removal — longer than
+/// [`STATUS_REPLY_CLEANUP_DELAY`] since it takes a moment to read the options
+/// and act on one. `pub(super)` so `library.rs`'s picker cleanup (a different
+/// delete path — see its `schedule_picker_cleanup`) shares this window.
 pub(super) const REPLY_CLEANUP_DELAY: Duration = Duration::from_secs(30);
 
 /// Extracts a `YouTube` video ID from a URL, recognizing `youtu.be` short
@@ -375,9 +380,10 @@ pub(super) async fn reply_public(
     Ok(())
 }
 
-/// Deletes `handle`'s message after [`REPLY_CLEANUP_DELAY`], best-effort (the
-/// message may already be gone — e.g. a user deleted it themselves) — keeps
-/// `reply_public`'s confirmations from piling up in the channel forever.
+/// Deletes `handle`'s message after [`STATUS_REPLY_CLEANUP_DELAY`],
+/// best-effort (the message may already be gone — e.g. a user deleted it
+/// themselves) — keeps `reply_public`'s confirmations from piling up in the
+/// channel forever.
 ///
 /// Resolves the message up front: the actual delete runs in a detached task
 /// well past this command's own return, and neither the message nor `ctx`'s
@@ -386,7 +392,7 @@ async fn schedule_cleanup(ctx: Context<'_>, handle: poise::ReplyHandle<'_>) {
     let http = ctx.serenity_context().http.clone();
     if let Ok(message) = handle.into_message().await {
         tokio::spawn(async move {
-            tokio::time::sleep(REPLY_CLEANUP_DELAY).await;
+            tokio::time::sleep(STATUS_REPLY_CLEANUP_DELAY).await;
             let _ = message.delete(http).await;
         });
     }
