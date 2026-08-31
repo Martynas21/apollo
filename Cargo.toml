@@ -1,3 +1,6 @@
+[workspace]
+members = ["ipc", "audio-worker"]
+
 [package]
 name = "apollo"
 version = "0.1.0"
@@ -5,6 +8,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+apollo-ipc = { path = "ipc" }
 tokio = { version = "1.53", features = ["full"] }
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "cache", "voice", "rustls_backend"] }
 songbird = "0.6.0"

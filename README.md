@@ -21,16 +21,24 @@ it (see Prerequisites).
   (`ytsearch<n>:<query>`), a single video's metadata, and playlist
   listings, all via `yt-dlp -j --flat-playlist`/`--no-playlist`. No Google
   Cloud project, API key, or OAuth consent screen needed.
-- **Audio**: actual audio is resolved via songbird's built-in
-  `yt-dlp`-backed input source, which streams straight into songbird's
-  symphonia-based decoder — no separate `ffmpeg` subprocess in the common
-  (Opus-in-WebM) path. `ffmpeg` is still a required dependency: it's
-  checked for at startup since `yt-dlp` itself may shell out to it for some
-  post-processing paths.
+- **Audio, in two processes**: `apollo` resolves a track via songbird's
+  `yt-dlp`-backed input source, fully decodes and buffers it (`yt-dlp` +
+  symphonia — no separate `ffmpeg` subprocess in the common Opus-in-WebM
+  path), and writes it to a shared volume. A separate `apollo-audio-worker`
+  process holds the actual `songbird::Driver`/voice connection and plays
+  that file, isolated into its own OS process (its own container, in
+  Docker) so ordinary load on `apollo` itself — Discord gateway traffic, DB
+  writes, `yt-dlp` spawns — can't starve the mixer's packet-send timing and
+  cause audible stutter. The two talk over a small length-prefixed protocol
+  on a Unix domain socket (`ipc/`); see `src/voice/ipc_backend.rs` and
+  `audio-worker/`. `ffmpeg` is still a required dependency of `apollo`
+  itself: it's checked for at startup since `yt-dlp` itself may shell out to
+  it for some post-processing paths.
 - A local SQLite database (via `sqlx`) persists per-guild playback settings
   (currently just volume) and saved playlists (a named pointer to a
   `YouTube` playlist URL, browsable from the `/player` panel) across
-  restarts.
+  restarts. Only `apollo` touches it — `apollo-audio-worker` has no DB
+  access.
 
 ## Prerequisites
 
@@ -138,18 +146,36 @@ server) — either directly with `cargo run` (or a release build) and a
 same local, single-user setup — Docker here is just a convenience
 wrapper, not a deployment.
 
+`apollo` now needs `apollo-audio-worker` running and reachable to play
+anything — it's a separate process holding the actual voice connection
+(see Architecture above), not an optional extra. `docker compose up` starts
+both. Running directly with `cargo run`, start both binaries yourself, e.g.:
+```sh
+mkdir -p /tmp/apollo-ipc /tmp/apollo-audio-buf
+AUDIO_WORKER_SOCKET=/tmp/apollo-ipc/audio.sock AUDIO_BUFFER_DIR=/tmp/apollo-audio-buf \
+  cargo run --bin apollo-audio-worker &
+AUDIO_WORKER_SOCKET=/tmp/apollo-ipc/audio.sock AUDIO_BUFFER_DIR=/tmp/apollo-audio-buf \
+  cargo run --bin apollo
+```
+(the defaults, `/run/apollo-ipc/audio.sock` and `/audio-buf`, assume a
+container's own root filesystem — override them to a writable path like
+above when running outside Docker.)
+
 For the `.env` route, restrictive file permissions (`chmod 600 .env`) are
 a genuinely sufficient way to hold secrets — there's no multi-tenant
 server or remote attack surface to defend against, so a secrets
 manager/vault would be solving a problem this setup doesn't have.
 
-For Docker: `Dockerfile` builds a release binary and a runtime image with
-`yt-dlp` (upstream's standalone binary, not the often-stale distro
-package), `ffmpeg`, and Deno installed. `compose.yaml` wires it up with a
-volume for `DATABASE_URL`'s SQLite file (so it survives container
-recreation) and reads `.env` for the rest — `docker compose up -d --build`
-is all you need. `.env` is read at runtime, not baked into the image —
-see `.dockerignore`.
+For Docker: `Dockerfile` is a multi-target build producing two images from
+one Cargo workspace — `apollo` (with `yt-dlp`, upstream's standalone
+binary, `ffmpeg`, and Deno installed) and `apollo-audio-worker` (much
+smaller: no `yt-dlp`/`ffmpeg`/Deno, no Discord bot token, no DB access —
+just the audio driver). `compose.yaml` runs both, wired together with a
+Unix domain socket volume and a tmpfs-backed volume for handing off
+pre-buffered audio files, plus the usual volume for `DATABASE_URL`'s
+SQLite file (so it survives container recreation) — `docker compose up -d
+--build` is all you need. `.env` is read at runtime, not baked into the
+image — see `.dockerignore`.
 
 Beyond local `tracing` output to stdout/stderr, no additional
 logging/metrics backend is wired in — reasonable for a local single-user
@@ -166,7 +192,12 @@ setup, and premature before this has even been run live once.
 - `src/youtube/api.rs` — `yt-dlp`-backed search/single-video/playlist client.
 - `src/voice/` — `player.rs` (per-guild queue engine), `panel.rs` (the
   `/player` panel's rendering), `resolve.rs` (yt-dlp-backed audio resolution
-  + startup dependency check), `radio.rs` (Mix listing for radio mode).
+  + startup dependency check), `radio.rs` (Mix listing for radio mode),
+  `ipc_backend.rs` (the `VoiceBackend` that talks to `apollo-audio-worker`).
+- `ipc/` — shared wire protocol/DTOs between `apollo` and
+  `apollo-audio-worker` (a separate workspace crate, `apollo-ipc`).
+- `audio-worker/` — `apollo-audio-worker`: the standalone process holding
+  the actual songbird voice driver (a separate workspace crate).
 - `migrations/` — sqlx SQLite migrations (embedded into the binary at
   compile time).
 - `Dockerfile` / `compose.yaml` — optional local Docker build, see above.

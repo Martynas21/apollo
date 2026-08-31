@@ -1,39 +1,61 @@
 # syntax=docker/dockerfile:1
 
-# ---- build stage ------------------------------------------------------
+# ---- build stage --------------------------------------------------------
+# Builds both `apollo` and `apollo-audio-worker` in one workspace build so
+# they always ship from the same songbird/apollo-ipc versions.
 FROM rust:1-bookworm AS build
 WORKDIR /app
 
 # cmake is required to build libopus_sys (a songbird dependency) from its
-# bundled Opus source — rust:1-bookworm doesn't ship it.
+# bundled Opus source — rust:1-bookworm doesn't ship it. Needed for both
+# binaries, since both link songbird (`apollo` for `join_gateway`,
+# `apollo-audio-worker` for the actual driver).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Dependencies (crates.io deps) are built in their own layer, keyed only on
-# Cargo.toml/Cargo.lock — so editing src/ later doesn't invalidate this and
-# force recompiling the whole dependency graph (~200 crates, including the
-# libopus_sys CMake build) on every change.
+# the three Cargo.toml/Cargo.lock files — so editing src/ later doesn't
+# invalidate this and force recompiling the whole dependency graph (~200
+# crates, including the libopus_sys CMake build) on every change.
 COPY Cargo.toml Cargo.lock ./
+COPY ipc/Cargo.toml ipc/Cargo.toml
+COPY audio-worker/Cargo.toml audio-worker/Cargo.toml
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    mkdir src && echo "fn main() {}" > src/main.rs \
-    && cargo build --release \
-    && rm -rf src
+    mkdir -p src ipc/src audio-worker/src \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "" > ipc/src/lib.rs \
+    && echo "fn main() {}" > audio-worker/src/main.rs \
+    && cargo build --release --workspace \
+    && rm -rf src ipc/src audio-worker/src
 
 # sqlx::migrate! embeds migrations/*.sql into the binary at compile time
 # (see src/db.rs) — nothing extra to copy into the runtime stage for it.
 COPY src ./src
+COPY ipc/src ./ipc/src
+COPY audio-worker/src ./audio-worker/src
 COPY migrations ./migrations
-# /app/target is a cache mount (unavailable in later stages), so the binary
-# is copied out to a normal layer path before this RUN's mount is dropped.
+# /app/target is a cache mount (unavailable in later stages), so both
+# binaries are copied out to a normal layer path before this RUN's mount is
+# dropped.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    touch src/main.rs && cargo build --release \
-    && cp target/release/apollo /app/apollo
+    touch src/main.rs ipc/src/lib.rs audio-worker/src/main.rs \
+    && cargo build --release --workspace \
+    && cp target/release/apollo /app/apollo \
+    && cp target/release/apollo-audio-worker /app/apollo-audio-worker
 
-# ---- runtime stage ------------------------------------------------------
-FROM debian:bookworm-slim
+# A single UID shared by both runtime images below, so the Unix domain
+# socket and buffer files one container creates are readable/writable by
+# the other regardless of which image assigned it — `useradd --system`
+# alone would pick whatever UID happens to be next-free in each image
+# independently, which isn't guaranteed to match.
+ARG APOLLO_UID=10001
+
+# ---- apollo runtime -------------------------------------------------------
+FROM debian:bookworm-slim AS apollo
+ARG APOLLO_UID
 
 # ffmpeg from Debian's repo; yt-dlp as the standalone upstream binary
 # (no Python runtime needed, and it's the build yt-dlp's own maintainers
@@ -45,6 +67,9 @@ FROM debian:bookworm-slim
 # it falls back to a pure-Python solver that intermittently fails
 # ("n challenge solving failed"), which surfaces as random playback
 # failures. See https://github.com/yt-dlp/yt-dlp/wiki/EJS.
+#
+# None of this is needed by `apollo-audio-worker` — it never touches
+# yt-dlp/YouTube, only a pre-resolved file on the shared buffer volume.
 ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg curl unzip \
@@ -65,17 +90,44 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --system --create-home --home-dir /app apollo
+RUN useradd --system --uid ${APOLLO_UID} --create-home --home-dir /app apollo
 WORKDIR /app
 COPY --from=build /app/apollo /usr/local/bin/apollo
 
 # DATABASE_URL should point at a path under a mounted volume (e.g.
 # sqlite:///data/apollo.db with -v apollo-data:/data) so per-guild playback
-# settings survive container recreation — see README.md. Pre-creating and
-# chown'ing it here (rather than leaving Docker to create it root-owned on
-# first mount) lets the non-root `apollo` user below actually write to it.
-RUN mkdir /data && chown apollo:apollo /data
+# settings survive container recreation — see README.md. `/run/apollo-ipc`
+# and `/audio-buf` are the shared volumes this container and
+# `apollo-audio-worker` both mount — see compose.yaml. All three are
+# pre-created and chowned here (rather than leaving Docker to create them
+# root-owned on first mount) so the non-root `apollo` user can actually use
+# them.
+RUN mkdir /data /run/apollo-ipc /audio-buf \
+    && chown apollo:apollo /data /run/apollo-ipc /audio-buf
 USER apollo
 ENV RUST_LOG=info,apollo=info
 
 ENTRYPOINT ["/usr/local/bin/apollo"]
+
+# ---- apollo-audio-worker runtime ------------------------------------------
+# Deliberately minimal: no yt-dlp/ffmpeg/Deno, no Discord bot token, no DB —
+# this process only ever holds songbird `Driver`s and plays already-resolved
+# files from the shared buffer volume. `ca-certificates` is still needed for
+# the voice gateway's TLS websocket handshake.
+FROM debian:bookworm-slim AS audio-worker
+ARG APOLLO_UID
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --system --uid ${APOLLO_UID} --create-home --home-dir /app apollo
+WORKDIR /app
+COPY --from=build /app/apollo-audio-worker /usr/local/bin/apollo-audio-worker
+
+RUN mkdir /run/apollo-ipc /audio-buf \
+    && chown apollo:apollo /run/apollo-ipc /audio-buf
+USER apollo
+ENV RUST_LOG=info,apollo_audio_worker=info
+
+ENTRYPOINT ["/usr/local/bin/apollo-audio-worker"]

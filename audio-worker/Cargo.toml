@@ -1,0 +1,16 @@
+[package]
+name = "apollo-audio-worker"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+apollo-ipc = { path = "../ipc" }
+async-trait = "0.1"
+tokio = { version = "1.53", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
+songbird = { version = "0.6.0", default-features = false, features = ["driver", "rustls", "tungstenite"] }
+symphonia = { version = "0.5", features = ["aac", "isomp4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = "1"

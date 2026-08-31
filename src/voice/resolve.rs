@@ -1,28 +1,37 @@
-//! Resolving a `YouTube` video ID into a playable songbird [`Input`], plus a
-//! pre-flight `yt-dlp` check for user-facing errors on common unplayable
-//! videos (age-restricted, region-locked, private/deleted).
+//! Resolving a `YouTube` video ID into a fully-buffered audio file on disk,
+//! plus a pre-flight `yt-dlp` check for user-facing errors on common
+//! unplayable videos (age-restricted, region-locked, private/deleted).
 //!
 //! Actual stream resolution/decoding is delegated to songbird's built-in
 //! [`songbird::input::YoutubeDl`] source, which shells out to `yt-dlp -j`
 //! itself and streams the resolved URL through symphonia — no separate
-//! `ffmpeg` subprocess needed for playback.
+//! `ffmpeg` subprocess needed here. The fully-decoded bytes are then written
+//! to a file under the shared buffer directory for `apollo-audio-worker` to
+//! play — the worker process has no yt-dlp/network access of its own, so
+//! every track must be fully resolved on this side first (see
+//! [`buffer_track_to_file`]).
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use songbird::input::cached::Memory;
 use songbird::input::{Input, YoutubeDl};
 use tokio::process::Command;
+use uuid::Uuid;
 
 /// Truncation length for the raw `yt-dlp` stderr embedded in
 /// `PlaybackError::Other`, matching `YouTubeApiError`'s convention in
 /// `src/youtube/api.rs`.
 const STDERR_TRUNCATE_LEN: usize = 200;
 
-/// Tracks longer than this (or with no known duration, e.g. livestreams)
-/// skip full pre-buffering and fall back to [`track_input`]'s live-streaming
-/// path, to bound worst-case memory use. See `cached_track_input`.
-const MAX_BUFFERED_TRACK_DURATION: Duration = Duration::from_mins(20);
+/// Tracks longer than this (or with no known duration, e.g. livestreams —
+/// though those are already rejected upstream in `youtube/api.rs`) are
+/// refused outright rather than queued. There is no fallback path for a
+/// track that's too costly to fully buffer: unlike the old in-process design,
+/// `apollo-audio-worker` never touches `yt-dlp`/the network itself, so a
+/// track that can't be resolved and written to disk here simply can't play.
+const MAX_TRACK_DURATION: Duration = Duration::from_hours(3);
 
 /// Timeout for the `yt-dlp` preflight call, matching `YT_DLP_TIMEOUT` in
 /// `src/youtube/api.rs` for the same single-video lookup shape.
@@ -41,6 +50,10 @@ pub enum PlaybackError {
     /// The `yt-dlp` process didn't finish within its allotted timeout and
     /// was killed.
     Timeout,
+    /// The track has no known duration, or is longer than
+    /// [`MAX_TRACK_DURATION`] — too costly to fully buffer, and there's no
+    /// fallback left to fall back to.
+    TooLong,
     /// Any other non-zero exit, carrying a truncated copy of stderr.
     Other(String),
 }
@@ -53,6 +66,7 @@ impl std::fmt::Display for PlaybackError {
             Self::Unavailable => write!(f, "video is unavailable (private or deleted)"),
             Self::YtDlpMissing => write!(f, "yt-dlp is not installed or not on PATH"),
             Self::Timeout => write!(f, "yt-dlp timed out"),
+            Self::TooLong => write!(f, "track is too long to queue (over 3 hours, or a livestream)"),
             Self::Other(message) => write!(f, "yt-dlp failed: {message}"),
         }
     }
@@ -154,15 +168,16 @@ pub async fn preflight_check(
     Err(classify_ytdlp_stderr(&stderr))
 }
 
-/// Builds a lazily-resolved songbird input for a `YouTube` video ID.
-/// The actual `yt-dlp` invocation and stream resolution happens when
-/// songbird's driver plays this input, not here (songbird's `YoutubeDl`
-/// source is lazy by design).
+/// Builds a lazily-resolved songbird input for a `YouTube` video ID, for
+/// [`buffer_track_to_file`] to fully drain into memory. The actual `yt-dlp`
+/// invocation and stream resolution happens once something starts reading
+/// from this (songbird's `YoutubeDl` source is lazy by design) — never
+/// exposed on its own, since nothing plays a lazy `Input` directly anymore
+/// (see the module doc comment).
 ///
 /// `cookies_file`, if set, is forwarded to `yt-dlp` via
 /// [`YoutubeDl::user_args`] — see `Config::yt_dlp_cookies_file`.
-#[allow(dead_code)]
-pub fn track_input(http: reqwest::Client, video_id: &str, cookies_file: Option<&str>) -> Input {
+fn track_input(http: reqwest::Client, video_id: &str, cookies_file: Option<&str>) -> Input {
     let url = format!("https://www.youtube.com/watch?v={video_id}");
     let mut ytdl = YoutubeDl::new(http, url);
     if let Some(cookies_file) = cookies_file {
@@ -171,45 +186,52 @@ pub fn track_input(http: reqwest::Client, video_id: &str, cookies_file: Option<&
     ytdl.into()
 }
 
-/// Builds a fully pre-buffered songbird input: the entire track is
-/// downloaded into memory (via songbird's [`Memory`] cache) before this
-/// returns, so playback never reads from the network. This is what makes
-/// playback immune to network blips — songbird's live-streaming path has
-/// only a small, fixed-size buffer, and a stall long enough to drain it
-/// causes an audible speed-up as the driver's scheduler bursts packets to
-/// catch up (see the plan doc/README for the full root cause).
+/// Fully resolves and downloads a track, writing the decoded bytes to a
+/// fresh file under `buffer_dir` and returning its path. This is what makes
+/// playback immune to network blips — the whole track is in hand before
+/// `apollo-audio-worker` ever starts playing it, rather than reading live off
+/// the network — and, since the worker process has no `yt-dlp`/network
+/// access of its own, it's also the only way a track ever gets to it at all.
 ///
-/// `duration` is used to skip pre-buffering for livestreams (`None` — no
-/// fixed length to download ahead of) and for tracks longer than
-/// [`MAX_BUFFERED_TRACK_DURATION`], to bound memory use; both fall back to
-/// [`track_input`]'s live-streaming behavior and remain exposed to the
-/// original bug.
-pub async fn cached_track_input(
+/// `duration` gates this outright: `None` (livestreams — already rejected
+/// upstream in `youtube/api.rs`, so this shouldn't happen in practice) or
+/// anything past [`MAX_TRACK_DURATION`] is refused rather than attempted,
+/// since there's no cheaper fallback left to attempt it with.
+pub async fn buffer_track_to_file(
     http: reqwest::Client,
     video_id: &str,
     duration: Option<Duration>,
     cookies_file: Option<&str>,
-) -> Result<Input, PlaybackError> {
-    let lazy = track_input(http, video_id, cookies_file);
-
-    let too_long = duration.is_none_or(|d| d > MAX_BUFFERED_TRACK_DURATION);
-    if too_long {
-        return Ok(lazy);
+    buffer_dir: &Path,
+) -> Result<PathBuf, PlaybackError> {
+    if duration.is_none_or(|d| d > MAX_TRACK_DURATION) {
+        return Err(PlaybackError::TooLong);
     }
 
+    let lazy = track_input(http, video_id, cookies_file);
     let memory = Memory::new(lazy)
         .await
         .map_err(|e| PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN)))?;
 
-    // `Memory`/`Catcher` only fill lazily as a consumer reads through them —
-    // drive a cloned handle to read everything up front (it shares the same
-    // backing store) so playback later reads purely from RAM.
-    let mut loader = memory.raw.new_handle();
-    tokio::task::spawn_blocking(move || loader.load_all())
+    // `Memory`/`Catcher` only fills lazily as a consumer reads through it —
+    // draining it into `bytes` here both forces that fill and gets us the
+    // raw bytes to write out, in one pass.
+    let bytes = tokio::task::spawn_blocking(move || {
+        let mut reader = memory.new_handle();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        std::io::Result::Ok(bytes)
+    })
+    .await
+    .map_err(|e| PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN)))?
+    .map_err(|e| PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN)))?;
+
+    let path = buffer_dir.join(format!("{}.audio", Uuid::new_v4()));
+    tokio::fs::write(&path, &bytes)
         .await
         .map_err(|e| PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN)))?;
 
-    Ok(memory.into())
+    Ok(path)
 }
 
 #[cfg(test)]

@@ -5,16 +5,13 @@
 //! decodes the resolved stream via symphonia — no separate `ffmpeg`
 //! subprocess in the playback path itself.
 
+pub mod ipc_backend;
 pub mod panel;
 pub mod player;
 pub mod radio;
 pub mod resolve;
 
-// Not consumed yet — Phase 6 commands wire these into `/play` and friends.
-#[allow(unused_imports)]
-pub use player::{PlayerError, PlayerRegistry, QueueSnapshot, QueuedTrack};
-#[allow(unused_imports)]
-pub use resolve::{PlaybackError, preflight_check, track_input};
+pub use player::{PlayerRegistry, QueuedTrack};
 
 use std::time::Duration;
 

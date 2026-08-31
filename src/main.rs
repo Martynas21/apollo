@@ -4,17 +4,14 @@ mod db;
 mod voice;
 mod youtube;
 
+use anyhow::Context;
 use commands::{Data, Error};
 use poise::serenity_prelude as serenity;
 use songbird::serenity::SerenityInit;
 use tracing_subscriber::EnvFilter;
+use voice::ipc_backend::IpcBackend;
 
-// A bot serving a handful of guilds has no real use for one tokio worker
-// thread per core (the default) -- apollo's workload is I/O-bound, not
-// CPU-bound. Trimming this reduces how many threads compete with the
-// songbird mixer thread for CPU time, which is otherwise a plausible source
-// of the transient stalls behind the sporadic playback speed-up bug.
-#[tokio::main(worker_threads = 4)]
+#[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
@@ -52,9 +49,17 @@ async fn main() -> anyhow::Result<()> {
         config.yt_dlp_cookies_file.clone(),
         config.playlist_track_limit,
     );
-    let player = voice::PlayerRegistry::new(
+    let voice_backend = IpcBackend::connect(
+        &config.audio_worker_socket,
+        std::path::PathBuf::from(&config.audio_buffer_dir),
         songbird.clone(),
         reqwest::Client::new(),
+        config.yt_dlp_cookies_file.clone(),
+    )
+    .await
+    .context("failed to connect to apollo-audio-worker")?;
+    let player = voice::PlayerRegistry::new(
+        std::sync::Arc::new(voice_backend),
         discord_http,
         config.yt_dlp_cookies_file.clone(),
         db_pool.clone(),

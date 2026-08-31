@@ -1,12 +1,53 @@
 services:
   apollo:
-    build: .
+    build:
+      context: .
+      target: apollo
     env_file: .env
     environment:
       DATABASE_URL: sqlite:///data/apollo.db
+      AUDIO_WORKER_SOCKET: /run/apollo-ipc/audio.sock
+      AUDIO_BUFFER_DIR: /audio-buf
     volumes:
       - apollo-data:/data
+      - apollo-ipc:/run/apollo-ipc
+      - apollo-audio-buf:/audio-buf
+    depends_on:
+      - audio-worker
+    restart: unless-stopped
+
+  # Holds the actual songbird voice connection/mixer, isolated into its own
+  # container so ordinary load on the `apollo` service (Discord gateway
+  # traffic, DB writes, yt-dlp subprocess spawns) can no longer starve the
+  # mixer's 20ms packet-send tick and cause audible stutter — see the
+  # split-worker plan doc for the full rationale. Talks to `apollo` only
+  # over the shared `apollo-ipc` socket and `apollo-audio-buf` volume; it
+  # never touches yt-dlp/YouTube, the DB, or a Discord bot token.
+  audio-worker:
+    build:
+      context: .
+      target: audio-worker
+    environment:
+      AUDIO_WORKER_SOCKET: /run/apollo-ipc/audio.sock
+      AUDIO_BUFFER_DIR: /audio-buf
+    volumes:
+      - apollo-ipc:/run/apollo-ipc
+      - apollo-audio-buf:/audio-buf
+    deploy:
+      resources:
+        limits:
+          # A ceiling on the worker's own CPU budget under plain `docker
+          # compose up` (cgroup CPU quota) — real isolation from `apollo`'s
+          # own load still depends on the host actually having spare CPU
+          # capacity; pin both services to disjoint cores with `cpuset` for
+          # a stronger guarantee if the host has cores to spare.
+          cpus: "1.0"
     restart: unless-stopped
 
 volumes:
   apollo-data:
+  apollo-ipc:
+  apollo-audio-buf:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
