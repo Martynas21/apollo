@@ -11,7 +11,7 @@
 //! every track must be fully resolved on this side first (see
 //! [`buffer_track_to_file`]).
 
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -197,6 +197,12 @@ fn track_input(http: reqwest::Client, video_id: &str, cookies_file: Option<&str>
 /// upstream in `youtube/api.rs`, so this shouldn't happen in practice) or
 /// anything past [`MAX_TRACK_DURATION`] is refused rather than attempted,
 /// since there's no cheaper fallback left to attempt it with.
+/// Truncates and wraps any displayable error as [`PlaybackError::Other`] —
+/// the common shape every fallible step in [`buffer_track_to_file`] maps to.
+fn other_err(e: impl std::fmt::Display) -> PlaybackError {
+    PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN))
+}
+
 pub async fn buffer_track_to_file(
     http: reqwest::Client,
     video_id: &str,
@@ -209,27 +215,23 @@ pub async fn buffer_track_to_file(
     }
 
     let lazy = track_input(http, video_id, cookies_file);
-    let memory = Memory::new(lazy)
-        .await
-        .map_err(|e| PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN)))?;
-
-    // `Memory`/`Catcher` only fills lazily as a consumer reads through it —
-    // draining it into `bytes` here both forces that fill and gets us the
-    // raw bytes to write out, in one pass.
-    let bytes = tokio::task::spawn_blocking(move || {
-        let mut reader = memory.new_handle();
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
-        std::io::Result::Ok(bytes)
-    })
-    .await
-    .map_err(|e| PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN)))?
-    .map_err(|e| PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN)))?;
+    let memory = Memory::new(lazy).await.map_err(other_err)?;
 
     let path = buffer_dir.join(format!("{}.audio", Uuid::new_v4()));
-    tokio::fs::write(&path, &bytes)
-        .await
-        .map_err(|e| PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN)))?;
+    let write_path = path.clone();
+    // `Memory`/`Catcher` only fills lazily as a consumer reads through it —
+    // copying it straight into the destination file both forces that fill
+    // and writes it out, without ever holding the whole track in memory a
+    // second time as a `Vec<u8>`.
+    tokio::task::spawn_blocking(move || {
+        let mut reader = memory.new_handle();
+        let mut file = std::fs::File::create(&write_path)?;
+        std::io::copy(&mut reader, &mut file)?;
+        std::io::Result::Ok(())
+    })
+    .await
+    .map_err(other_err)?
+    .map_err(other_err)?;
 
     Ok(path)
 }

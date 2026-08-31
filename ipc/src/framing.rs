@@ -41,14 +41,18 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     envelope: &Envelope,
 ) -> Result<(), FramingError> {
-    let bytes = bincode::serde::encode_to_vec(envelope, bincode::config::standard())
+    let body = bincode::serde::encode_to_vec(envelope, bincode::config::standard())
         .map_err(|e| FramingError::Codec(e.to_string()))?;
-    let len = u32::try_from(bytes.len()).map_err(|_| FramingError::FrameTooLarge(u32::MAX))?;
+    let len = u32::try_from(body.len()).map_err(|_| FramingError::FrameTooLarge(u32::MAX))?;
     if len > MAX_FRAME_LEN {
         return Err(FramingError::FrameTooLarge(len));
     }
-    writer.write_all(&len.to_be_bytes()).await?;
-    writer.write_all(&bytes).await?;
+    // One combined buffer/write rather than two separate `write_all` calls
+    // (and thus syscalls) for the length prefix and body.
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&body);
+    writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
 }

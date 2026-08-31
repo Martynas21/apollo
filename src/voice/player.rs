@@ -295,11 +295,11 @@ struct GuildState {
     now_playing: Option<QueuedTrack>,
     current_handle: Option<Arc<dyn VoiceTrack>>,
     /// `current_handle`'s track uuid, captured at the same time it's set.
-    /// [`TrackEndHandler`] carries the uuid of the track it was registered
-    /// for and `advance` checks it against this before touching state — a
-    /// track that was stopped/skipped/replaced still has an End/Error event
-    /// in flight from songbird's mixer thread, and without this check that
-    /// stale event would land after a *new* track has already started,
+    /// Every track-finished notification carries the uuid of the track it
+    /// fired for, and `advance` checks it against this before touching state
+    /// — a track that was stopped/skipped/replaced still has an End/Error
+    /// event in flight from `apollo-audio-worker`, and without this check
+    /// that stale event would land after a *new* track has already started,
     /// clearing its handle out from under it or layering another track on
     /// top of it (two tracks audibly playing at once).
     current_track_id: Option<Uuid>,
@@ -423,10 +423,11 @@ pub struct PlayerRegistry {
     /// tests — see [`VoiceBackend`].
     voice: Arc<dyn VoiceBackend>,
     /// Used only to edit/delete the live `/player` panel message from
-    /// contexts that aren't already handling a Discord interaction (e.g.
-    /// [`TrackEndHandler`], or a `/skip` slash command refreshing a panel
-    /// message it didn't itself respond to). Unrelated to `http` above,
-    /// which is for yt-dlp/YouTube stream resolution.
+    /// contexts that aren't already handling a Discord interaction (e.g. a
+    /// track-finished notification from `apollo-audio-worker`, or a `/skip`
+    /// slash command refreshing a panel message it didn't itself respond
+    /// to). Unrelated to `http` above, which is for yt-dlp/YouTube stream
+    /// resolution.
     discord_http: Arc<serenity::Http>,
     cookies_file: Option<String>,
     db: sqlx::SqlitePool,
@@ -449,7 +450,7 @@ pub struct PlayerRegistry {
 }
 
 /// [`VoiceEvents`] callbacks land here from whichever backend the registry
-/// was built with, in production always [`SongbirdBackend`].
+/// was built with, in production always [`crate::voice::ipc_backend::IpcBackend`].
 #[async_trait::async_trait]
 impl VoiceEvents for PlayerRegistry {
     async fn track_finished(&self, guild_id: GuildId, track_id: Uuid) {
@@ -1113,8 +1114,10 @@ impl PlayerRegistry {
     }
 
     /// Advances to the next queued track, or — if the queue is empty —
-    /// schedules an idle-timeout disconnect. Called from [`TrackEndHandler`]
-    /// whenever a track ends, whether naturally or via `/skip`/`/stop`.
+    /// schedules an idle-timeout disconnect. Called via
+    /// [`VoiceEvents::track_finished`] (routed from `apollo-audio-worker`'s
+    /// track-end event over IPC — see `crate::voice::ipc_backend`) whenever a
+    /// track ends, whether naturally or via `/skip`/`/stop`.
     ///
     /// `track_id` is the uuid of the track whose End/Error event triggered
     /// this call. It's checked against the guild's `current_track_id` and
@@ -1366,9 +1369,9 @@ impl PlayerRegistry {
 
     /// Skips directly to the upcoming track at `index` (0-based, matching
     /// [`QueueSnapshot::upcoming`]), discarding every track ahead of it.
-    /// Reuses the current track's stop path — [`TrackEndHandler`] advances
-    /// to the new front of the queue exactly as it would on a natural
-    /// track end or a `/skip`.
+    /// Reuses the current track's stop path — the resulting track-finished
+    /// notification advances to the new front of the queue exactly as it
+    /// would on a natural track end or a `/skip`.
     pub async fn jump_to(&self, guild_id: GuildId, index: usize) -> Result<(), PlayerError> {
         let guild_id_str = guild_id.to_string();
         let mut guilds = self.guilds.lock().await;
@@ -2042,11 +2045,14 @@ mod tests {
         /// callers don't commit a state mutation whose preceding `stop()`
         /// failed (see `jump_to_does_not_drain_the_queue_if_stop_fails`).
         stop_error: Option<String>,
-        /// Set by `notify_when_finished`, mirroring the per-track handler
-        /// registration the real `SongbirdTrack` performs. `FakeBackend::
-        /// finish_track` dispatches through this rather than a guild-level
-        /// sink, so a test would catch a regression where playback forgets
-        /// to call `notify_when_finished` on a newly started track.
+        /// Set by `notify_when_finished`, modeling the per-track handler
+        /// registration `VoiceTrack` still declares (the production
+        /// `IpcTrack` implementation is a no-op there, since
+        /// `apollo-audio-worker` routes finish events per-guild instead —
+        /// see its doc comment). `FakeBackend::finish_track` dispatches
+        /// through this rather than a guild-level sink, so a test would
+        /// catch a regression where playback forgets to call
+        /// `notify_when_finished` on a newly started track.
         registered: Option<(GuildId, Arc<dyn VoiceEvents>)>,
     }
 

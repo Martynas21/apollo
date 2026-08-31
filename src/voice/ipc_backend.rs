@@ -42,22 +42,35 @@ struct Connection {
     next_id: AtomicU64,
 }
 
+type PendingRx = oneshot::Receiver<Result<Response, String>>;
+
 impl Connection {
-    async fn request(&self, body: Request) -> Result<Response, String> {
+    /// Writes `body` as a new request and returns a receiver for its
+    /// eventual response, without waiting for it. The write itself still
+    /// happens inline (under `self.write`'s lock) before this returns, so a
+    /// caller that needs the *next* request to reach the worker only after
+    /// this one — e.g. `IpcCall::play` immediately followed by a
+    /// `set_volume` on the resulting handle — can rely on write order being
+    /// preserved even without awaiting this request's response first.
+    async fn send(&self, body: Request) -> Result<PendingRx, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
 
         let envelope = Envelope::Request { id, body };
-        {
-            let mut write = self.write.lock().await;
-            if let Err(e) = write_frame(&mut *write, &envelope).await {
-                self.pending.lock().unwrap().remove(&id);
-                return Err(format!("IPC write failed: {e}"));
-            }
+        let mut write = self.write.lock().await;
+        if let Err(e) = write_frame(&mut *write, &envelope).await {
+            drop(write);
+            self.pending.lock().unwrap().remove(&id);
+            return Err(format!("IPC write failed: {e}"));
         }
+        Ok(rx)
+    }
 
-        rx.await
+    async fn request(&self, body: Request) -> Result<Response, String> {
+        self.send(body)
+            .await?
+            .await
             .map_err(|_| "IPC connection closed before a response arrived".to_string())?
     }
 }
@@ -119,20 +132,10 @@ async fn run_reader(
 
 fn dispatch_event(connection: &Connection, event: IpcEvent) {
     match event {
-        IpcEvent::TrackFinished { guild_id, track_id } => {
-            if let Some(events) = lookup(connection, guild_id) {
-                tokio::spawn(async move {
-                    events.track_finished(GuildId::new(guild_id), track_id).await;
-                });
-            }
-        }
+        IpcEvent::TrackFinished { guild_id, track_id } => notify_finished(connection, guild_id, track_id),
         IpcEvent::TrackErrored { guild_id, track_id, error } => {
             tracing::warn!(%error, "worker reported a track error");
-            if let Some(events) = lookup(connection, guild_id) {
-                tokio::spawn(async move {
-                    events.track_finished(GuildId::new(guild_id), track_id).await;
-                });
-            }
+            notify_finished(connection, guild_id, track_id);
         }
         IpcEvent::ConnectionLost { guild_id } => {
             if let Some(events) = lookup(connection, guild_id) {
@@ -141,6 +144,14 @@ fn dispatch_event(connection: &Connection, event: IpcEvent) {
                 });
             }
         }
+    }
+}
+
+fn notify_finished(connection: &Connection, guild_id: u64, track_id: uuid::Uuid) {
+    if let Some(events) = lookup(connection, guild_id) {
+        tokio::spawn(async move {
+            events.track_finished(GuildId::new(guild_id), track_id).await;
+        });
     }
 }
 
@@ -290,10 +301,30 @@ impl VoiceCall for IpcCall {
             track_id,
             audio_path,
         };
-        if let Err(err) = self.connection.request(request).await {
-            tracing::warn!(video_id = %source.video_id, %err, "failed to start playback on audio worker");
-        } else {
-            tracing::debug!(video_id = %source.video_id, %track_id, "starting track playback");
+        tracing::debug!(video_id = %source.video_id, %track_id, "starting track playback");
+        // `send` (not `request`) so this doesn't block on the worker's round
+        // trip: the write itself still happens inline above, before this
+        // returns, so a caller that immediately does something else with the
+        // resulting handle (e.g. `start_playback` calling `set_volume` right
+        // after) still reaches the worker in the same order.
+        match self.connection.send(request).await {
+            Ok(response) => {
+                let video_id = source.video_id;
+                tokio::spawn(async move {
+                    match response.await {
+                        Ok(Err(err)) => {
+                            tracing::warn!(%video_id, %err, "audio worker rejected playback request");
+                        }
+                        Err(_) => {
+                            tracing::warn!(%video_id, "audio worker connection closed before playback was confirmed");
+                        }
+                        Ok(Ok(_)) => {}
+                    }
+                });
+            }
+            Err(err) => {
+                tracing::warn!(video_id = %source.video_id, %err, "failed to start playback on audio worker");
+            }
         }
         Arc::new(IpcTrack {
             guild_id: self.guild_id,

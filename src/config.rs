@@ -40,10 +40,11 @@ pub struct Config {
 /// `PLAYLIST_TRACK_LIMIT` is unset.
 const DEFAULT_PLAYLIST_TRACK_LIMIT: usize = 500;
 
-/// Defaults for [`Config::audio_worker_socket`]/[`Config::audio_buffer_dir`]
-/// — matches `compose.yaml`'s volume mount points and
-/// `apollo-audio-worker`'s own default socket path.
-const DEFAULT_AUDIO_WORKER_SOCKET: &str = "/run/apollo-ipc/audio.sock";
+/// Default for [`Config::audio_buffer_dir`] — matches `compose.yaml`'s
+/// volume mount point. `audio_worker_socket`'s default
+/// (`apollo_ipc::DEFAULT_SOCKET_PATH`) lives in the shared `apollo-ipc`
+/// crate instead, since `apollo-audio-worker` needs the same default and
+/// isn't a dependent of this crate.
 const DEFAULT_AUDIO_BUFFER_DIR: &str = "/audio-buf";
 
 impl Config {
@@ -69,7 +70,7 @@ impl Config {
             yt_dlp_cookies_file: optional_env_var(&lookup, "YT_DLP_COOKIES_FILE"),
             playlist_track_limit: playlist_track_limit(&lookup)?,
             audio_worker_socket: optional_env_var(&lookup, "AUDIO_WORKER_SOCKET")
-                .unwrap_or_else(|| DEFAULT_AUDIO_WORKER_SOCKET.to_string()),
+                .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_PATH.to_string()),
             audio_buffer_dir: optional_env_var(&lookup, "AUDIO_BUFFER_DIR")
                 .unwrap_or_else(|| DEFAULT_AUDIO_BUFFER_DIR.to_string()),
         })

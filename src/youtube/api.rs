@@ -361,12 +361,10 @@ impl YouTubeClient {
         // `video_id` contains.
         let url = format!("https://www.youtube.com/watch?v={video_id}");
         let stdout = self.run(&["--no-playlist"], &url, YT_DLP_TIMEOUT).await?;
-        let entry = parse_entries(&stdout).next().ok_or_else(|| {
-            YouTubeApiError::YtDlpFailed("no metadata returned for video".to_string())
-        })?;
-        let track = track_from_entry(entry).ok_or_else(|| {
-            YouTubeApiError::YtDlpFailed("no metadata returned for video".to_string())
-        })?;
+        let track = parse_entries(&stdout)
+            .next()
+            .and_then(track_from_entry)
+            .ok_or_else(|| YouTubeApiError::YtDlpFailed("no metadata returned for video".to_string()))?;
         if track.duration.is_none() {
             return Err(YouTubeApiError::LiveStreamNotSupported);
         }

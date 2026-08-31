@@ -47,7 +47,9 @@ fn to_connection_info(dto: ConnectionInfoDto) -> Result<ConnectionInfo, String> 
 /// apollo's own `TrackEndHandler` (`src/voice/player.rs`), just relocated
 /// into this process. Both End and Error are registered (not just End) for
 /// the same reason apollo's does: a track whose input fails mid-stream goes
-/// to `PlayMode::Errored` without ever firing `End` in songbird 0.6.
+/// to `PlayMode::Errored` without ever firing `End` in songbird 0.6 — the
+/// same handler instance (cloned) is registered for both.
+#[derive(Clone)]
 struct TrackEndHandler {
     guild_id: u64,
     track_id: Uuid,
@@ -126,11 +128,10 @@ impl Sessions {
         Ok(())
     }
 
-    pub fn leave(&self, guild_id: u64) -> Result<(), String> {
+    pub fn leave(&self, guild_id: u64) {
         if let Some(mut session) = self.guilds.lock().unwrap().remove(&guild_id) {
             session.driver.leave();
         }
-        Ok(())
     }
 
     /// Leaves every active session — used when the IPC connection to
@@ -150,26 +151,35 @@ impl Sessions {
             .ok_or_else(|| format!("no active session for guild {guild_id}"))?;
         let input = SongbirdFile::new(audio_path).into();
         let handle = session.driver.play_input(input);
-        handle.add_event(
-            Event::Track(TrackEvent::End),
-            TrackEndHandler {
-                guild_id,
-                track_id,
-                events: self.events.clone(),
-            },
-        )
-        .map_err(|e| e.to_string())?;
-        handle.add_event(
-            Event::Track(TrackEvent::Error),
-            TrackEndHandler {
-                guild_id,
-                track_id,
-                events: self.events.clone(),
-            },
-        )
-        .map_err(|e| e.to_string())?;
+        let end_handler = TrackEndHandler {
+            guild_id,
+            track_id,
+            events: self.events.clone(),
+        };
+        handle
+            .add_event(Event::Track(TrackEvent::End), end_handler.clone())
+            .map_err(|e| e.to_string())?;
+        handle
+            .add_event(Event::Track(TrackEvent::Error), end_handler)
+            .map_err(|e| e.to_string())?;
         session.current = Some((track_id, handle));
         Ok(())
+    }
+
+    /// The current track's handle for `guild_id`, if `track_id` is still
+    /// that guild's current track — `Err` for an unknown guild or a
+    /// stale/superseded `track_id`. Shared by every command below, sync
+    /// (`with_current`) or async (`status`), that needs to reach the actual
+    /// `TrackHandle`.
+    fn current_handle(&self, guild_id: u64, track_id: Uuid) -> Result<TrackHandle, String> {
+        let guilds = self.guilds.lock().unwrap();
+        let session = guilds
+            .get(&guild_id)
+            .ok_or_else(|| format!("no active session for guild {guild_id}"))?;
+        match &session.current {
+            Some((current_id, handle)) if *current_id == track_id => Ok(handle.clone()),
+            _ => Err(format!("track {track_id} is not the current track for guild {guild_id}")),
+        }
     }
 
     fn with_current<T>(
@@ -178,14 +188,7 @@ impl Sessions {
         track_id: Uuid,
         f: impl FnOnce(&TrackHandle) -> Result<T, String>,
     ) -> Result<T, String> {
-        let guilds = self.guilds.lock().unwrap();
-        let session = guilds
-            .get(&guild_id)
-            .ok_or_else(|| format!("no active session for guild {guild_id}"))?;
-        match &session.current {
-            Some((current_id, handle)) if *current_id == track_id => f(handle),
-            _ => Err(format!("track {track_id} is not the current track for guild {guild_id}")),
-        }
+        f(&self.current_handle(guild_id, track_id)?)
     }
 
     pub fn pause(&self, guild_id: u64, track_id: Uuid) -> Result<(), String> {
@@ -215,20 +218,7 @@ impl Sessions {
     }
 
     pub async fn status(&self, guild_id: u64, track_id: Uuid) -> Result<TrackStatusDto, String> {
-        let handle = {
-            let guilds = self.guilds.lock().unwrap();
-            let session = guilds
-                .get(&guild_id)
-                .ok_or_else(|| format!("no active session for guild {guild_id}"))?;
-            match &session.current {
-                Some((current_id, handle)) if *current_id == track_id => handle.clone(),
-                _ => {
-                    return Err(format!(
-                        "track {track_id} is not the current track for guild {guild_id}"
-                    ))
-                }
-            }
-        };
+        let handle = self.current_handle(guild_id, track_id)?;
         let state = handle.get_info().await.map_err(|e| e.to_string())?;
         Ok(TrackStatusDto {
             position_ms: u64::try_from(state.position.as_millis()).unwrap_or(u64::MAX),
@@ -291,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn leave_and_leave_all_are_no_ops_on_an_unknown_guild() {
         let sessions = sessions();
-        assert!(sessions.leave(1).is_ok());
+        sessions.leave(1);
         sessions.leave_all();
     }
 }

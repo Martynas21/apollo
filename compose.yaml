@@ -29,9 +29,11 @@ services:
       target: audio-worker
     environment:
       AUDIO_WORKER_SOCKET: /run/apollo-ipc/audio.sock
-      AUDIO_BUFFER_DIR: /audio-buf
     volumes:
       - apollo-ipc:/run/apollo-ipc
+      # Mounted (not read from an env var — the worker just opens whatever
+      # absolute path `apollo` sends in each Play request) so those paths
+      # resolve inside this container too.
       - apollo-audio-buf:/audio-buf
     deploy:
       resources:

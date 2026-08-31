@@ -18,8 +18,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let socket_path =
-        std::env::var("AUDIO_WORKER_SOCKET").unwrap_or_else(|_| "/run/apollo-ipc/audio.sock".to_string());
+    let socket_path = std::env::var("AUDIO_WORKER_SOCKET")
+        .unwrap_or_else(|_| apollo_ipc::DEFAULT_SOCKET_PATH.to_string());
 
     // A previous run's socket file left behind (crash, restart) makes
     // `UnixListener::bind` fail with "address in use" even though nothing is

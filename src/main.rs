@@ -28,14 +28,8 @@ async fn main() -> anyhow::Result<()> {
         "apollo starting up"
     );
 
-    // Fail fast on a missing yt-dlp/ffmpeg rather than a confusing error on
-    // someone's first `/play`.
-    voice::check_playback_dependencies().await?;
-
     let intents = serenity::GatewayIntents::GUILDS | serenity::GatewayIntents::GUILD_VOICE_STATES;
     let guild_id = config.discord_guild_id;
-
-    let db_pool = db::connect(&config.database_url).await?;
 
     // Built here (rather than left to `.register_songbird()`) so the same
     // `Arc<Songbird>` can back both the serenity client and `Data::player`.
@@ -49,15 +43,26 @@ async fn main() -> anyhow::Result<()> {
         config.yt_dlp_cookies_file.clone(),
         config.playlist_track_limit,
     );
-    let voice_backend = IpcBackend::connect(
-        &config.audio_worker_socket,
-        std::path::PathBuf::from(&config.audio_buffer_dir),
-        songbird.clone(),
-        reqwest::Client::new(),
-        config.yt_dlp_cookies_file.clone(),
-    )
-    .await
-    .context("failed to connect to apollo-audio-worker")?;
+
+    // Three independent startup checks/connections — run concurrently
+    // rather than one after another, since none needs another's result.
+    let (_, db_pool, voice_backend) = tokio::try_join!(
+        // Fail fast on a missing yt-dlp/ffmpeg rather than a confusing error
+        // on someone's first `/play`.
+        voice::check_playback_dependencies(),
+        db::connect(&config.database_url),
+        async {
+            IpcBackend::connect(
+                &config.audio_worker_socket,
+                std::path::PathBuf::from(&config.audio_buffer_dir),
+                songbird.clone(),
+                reqwest::Client::new(),
+                config.yt_dlp_cookies_file.clone(),
+            )
+            .await
+            .context("failed to connect to apollo-audio-worker")
+        },
+    )?;
     let player = voice::PlayerRegistry::new(
         std::sync::Arc::new(voice_backend),
         discord_http,
