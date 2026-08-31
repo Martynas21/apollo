@@ -77,6 +77,13 @@ pub enum YouTubeApiError {
     /// The `yt-dlp` process didn't finish within its allotted timeout and
     /// was killed.
     Timeout,
+    /// The requested video has no known duration — in practice, an
+    /// in-progress livestream (see [`Track::duration`]). Rejected rather
+    /// than queued: songbird's HLS path for a live broadcast never stops
+    /// downloading segments if the track is skipped/stopped before the
+    /// broadcast itself ends, leaking a background task for as long as the
+    /// stream stays live.
+    LiveStreamNotSupported,
 }
 
 impl std::fmt::Display for YouTubeApiError {
@@ -86,6 +93,9 @@ impl std::fmt::Display for YouTubeApiError {
             Self::YtDlpFailed(message) => write!(f, "yt-dlp failed: {message}"),
             Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
             Self::Timeout => write!(f, "yt-dlp timed out"),
+            Self::LiveStreamNotSupported => {
+                write!(f, "that's a livestream still in progress — try again once it's finished")
+            }
         }
     }
 }
@@ -146,22 +156,36 @@ fn track_from_entry(entry: YtDlpEntry) -> Option<Track> {
     })
 }
 
-/// Parses `yt-dlp -j`'s (one-JSON-object-per-line) stdout into [`Track`]s,
-/// skipping any line that isn't valid JSON or maps to no usable track —
-/// happens routinely (e.g. deleted-video placeholder entries), so this is
-/// not treated as an error.
+/// Parses `yt-dlp -j`'s (one-JSON-object-per-line) stdout into [`YtDlpEntry`]
+/// values, skipping any line that isn't valid JSON.
+fn parse_entries(stdout: &str) -> impl Iterator<Item = YtDlpEntry> + '_ {
+    stdout.lines().filter_map(|line| {
+        let line = line.trim();
+        if line.is_empty() {
+            None
+        } else {
+            serde_json::from_str(line).ok()
+        }
+    })
+}
+
+/// Parses `yt-dlp -j`'s stdout into [`Track`]s, skipping any entry that isn't
+/// valid JSON, maps to no usable track (e.g. deleted-video placeholder
+/// entries), or has no known duration — silently, none of these are treated
+/// as an error. A missing duration means `yt-dlp` couldn't report one, most
+/// commonly because the video is an in-progress livestream (see
+/// [`Track::duration`]); those are dropped rather than surfaced because
+/// every caller of this (`search`, `list_playlist_items`, `hydrate_videos`)
+/// already tolerates a track going missing from its results, and queuing one
+/// leaks a background download if it's skipped before the broadcast itself
+/// ends (songbird's HLS path never notices — see the removed
+/// `vendor/stream_lib` patch this replaced). `get_video` needs to tell a
+/// caller-picked livestream apart from a missing video, so it checks
+/// [`Track::duration`] itself instead of going through this.
 fn parse_tracks(stdout: &str) -> Vec<Track> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-            serde_json::from_str::<YtDlpEntry>(line)
-                .ok()
-                .and_then(track_from_entry)
-        })
+    parse_entries(stdout)
+        .filter_map(track_from_entry)
+        .filter(|track| track.duration.is_some())
         .collect()
 }
 
@@ -337,9 +361,16 @@ impl YouTubeClient {
         // `video_id` contains.
         let url = format!("https://www.youtube.com/watch?v={video_id}");
         let stdout = self.run(&["--no-playlist"], &url, YT_DLP_TIMEOUT).await?;
-        parse_tracks(&stdout).into_iter().next().ok_or_else(|| {
+        let entry = parse_entries(&stdout).next().ok_or_else(|| {
             YouTubeApiError::YtDlpFailed("no metadata returned for video".to_string())
-        })
+        })?;
+        let track = track_from_entry(entry).ok_or_else(|| {
+            YouTubeApiError::YtDlpFailed("no metadata returned for video".to_string())
+        })?;
+        if track.duration.is_none() {
+            return Err(YouTubeApiError::LiveStreamNotSupported);
+        }
+        Ok(track)
     }
 
     /// Lists every track in a playlist, given either a full playlist URL or
@@ -536,8 +567,8 @@ mod tests {
 
     #[test]
     fn parse_tracks_skips_entries_with_no_usable_id() {
-        let stdout =
-            "{\"id\": null}\n{\"id\": \"real123\", \"title\": \"T\", \"channel\": \"C\"}\n";
+        let stdout = "{\"id\": null}\n\
+             {\"id\": \"real123\", \"title\": \"T\", \"channel\": \"C\", \"duration\": 10}\n";
         let tracks = parse_tracks(stdout);
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].video_id, "real123");
@@ -546,6 +577,15 @@ mod tests {
     #[test]
     fn parse_tracks_empty_stdout_yields_empty_vec() {
         assert_eq!(parse_tracks(""), Vec::new());
+    }
+
+    #[test]
+    fn parse_tracks_drops_entries_with_no_known_duration() {
+        let stdout = "{\"id\": \"live1\", \"title\": \"Live\", \"channel\": \"C\", \"duration\": null}\n\
+             {\"id\": \"vod1\", \"title\": \"VOD\", \"channel\": \"C\", \"duration\": 213}\n";
+        let tracks = parse_tracks(stdout);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].video_id, "vod1");
     }
 
     // ---- first_playlist_title ----

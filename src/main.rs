@@ -19,14 +19,9 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            // stream_lib (songbird's HLS backend) logs a warning for every
-            // segment chunk it can't forward once the consumer is gone —
-            // see vendor/stream_lib/README.md. Our patch there closes the
-            // gap that causes bulk spam, but downgrade the module here too
-            // in case a stray warning still slips through mid-teardown.
-            EnvFilter::new("info,stream_lib::hls=error")
-        }))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let config = config::Config::from_env()?;

@@ -3615,6 +3615,8 @@ dependencies = [
 [[package]]
 name = "songbird"
 version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b9bf4ecb5083685b79a8fc60222f12e4f036e2817c5c341cd2b9ff2b429d237"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -3631,7 +3633,6 @@ dependencies = [
  "enum-map",
  "flume 0.11.1",
  "futures",
- "libc",
  "nohash-hasher",
  "nonmax",
  "opus2",
@@ -3869,6 +3870,8 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stream_lib"
 version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e106dd009a0dfd2cf57777c39cad08f852debd366df6e841b250d956cec3277e"
 dependencies = [
  "bytes",
  "futures-core",

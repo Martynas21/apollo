@@ -27,32 +27,3 @@ anyhow = "1"
 async-trait = "0.1"
 rand = "0.10.2"
 uuid = "1"
-
-# Songbird's HLS backend (used for livestream playback) never notices when
-# songbird drops its reader on track skip/error: it keeps polling the live
-# playlist and downloading segments — for a 24/7 stream, indefinitely —
-# logging a warning on every send into the now-dead channel. vendor/stream_lib
-# is otherwise-pristine upstream 0.5.2 plus vendor/stream_lib-hls-leak.patch;
-# see vendor/stream_lib/README.md for what it does and how to carry it
-# forward on a version bump.
-#
-# Songbird's mixer/pacing thread (driver/scheduler/live.rs) is a plain
-# std::thread with no elevated OS scheduling priority: any ordinary CPU
-# contention on the host can starve it past its 20ms tick — audible to
-# listeners as a playback glitch when it happens. vendor/songbird is
-# otherwise-pristine upstream 0.6.0 plus two additions:
-#  - `Worker::spawn` now requests SCHED_FIFO real-time scheduling for the
-#    mixer thread on startup (falling back to a niceness bump if that's
-#    denied), named "songbird-mixer", to make starvation less likely in the
-#    first place. Needs `sudo setcap 'cap_sys_nice=eip' <binary>` (or an
-#    rtprio limit for the running user) for the elevation to actually take
-#    effect — without it, this is a logged no-op and the thread runs at
-#    default priority as before.
-#  - `_march_deadline` resyncs its fixed-increment deadline to Instant::now()
-#    when it wakes up more than one tick behind, instead of firing every
-#    missed tick back-to-back to catch up (the old behaviour, which bursts
-#    several packets at once — audible as a brief speed-up). A stall that
-#    does slip past the scheduling fix now costs a brief silent gap instead.
-[patch.crates-io]
-stream_lib = { path = "vendor/stream_lib" }
-songbird = { path = "vendor/songbird" }
