@@ -11,7 +11,7 @@ use songbird::serenity::SerenityInit;
 use tracing_subscriber::EnvFilter;
 use voice::ipc_backend::IpcBackend;
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
