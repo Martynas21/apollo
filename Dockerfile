@@ -1,5 +1,15 @@
 # syntax=docker/dockerfile:1
 
+# A single UID shared by both runtime images below, so the Unix domain
+# socket and buffer files one container creates are readable/writable by
+# the other regardless of which image assigned it — `useradd --system`
+# alone would pick whatever UID happens to be next-free in each image
+# independently, which isn't guaranteed to match. Declared before the first
+# `FROM` (global scope) so its default carries into every stage that
+# redeclares `ARG APOLLO_UID` below — an `ARG` declared inside a stage, as
+# this used to be, is scoped to that stage only and won't do that.
+ARG APOLLO_UID=10001
+
 # ---- build stage --------------------------------------------------------
 # Builds both `apollo` and `apollo-audio-worker` in one workspace build so
 # they always ship from the same songbird/apollo-ipc versions.
@@ -45,13 +55,6 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --release --workspace \
     && cp target/release/apollo /app/apollo \
     && cp target/release/apollo-audio-worker /app/apollo-audio-worker
-
-# A single UID shared by both runtime images below, so the Unix domain
-# socket and buffer files one container creates are readable/writable by
-# the other regardless of which image assigned it — `useradd --system`
-# alone would pick whatever UID happens to be next-free in each image
-# independently, which isn't guaranteed to match.
-ARG APOLLO_UID=10001
 
 # ---- apollo runtime -------------------------------------------------------
 FROM debian:bookworm-slim AS apollo
