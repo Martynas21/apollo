@@ -7,7 +7,7 @@ use std::sync::Arc;
 use apollo_ipc::proto::{Envelope, Event as IpcEvent, Request, Response};
 use apollo_ipc::{read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::session::Sessions;
 
@@ -21,7 +21,11 @@ async fn dispatch(sessions: &Sessions, request: Request) -> Result<Response, Str
             sessions.leave(guild_id);
             Ok(Response::Ok)
         }
-        Request::Play { guild_id, track_id, audio_path } => {
+        Request::Play {
+            guild_id,
+            track_id,
+            audio_path,
+        } => {
             sessions.play(guild_id, track_id, audio_path)?;
             Ok(Response::Ok)
         }
@@ -37,13 +41,18 @@ async fn dispatch(sessions: &Sessions, request: Request) -> Result<Response, Str
             sessions.stop(guild_id, track_id)?;
             Ok(Response::Ok)
         }
-        Request::SetVolume { guild_id, track_id, multiplier } => {
+        Request::SetVolume {
+            guild_id,
+            track_id,
+            multiplier,
+        } => {
             sessions.set_volume(guild_id, track_id, multiplier)?;
             Ok(Response::Ok)
         }
-        Request::Status { guild_id, track_id } => {
-            sessions.status(guild_id, track_id).await.map(Response::Status)
-        }
+        Request::Status { guild_id, track_id } => sessions
+            .status(guild_id, track_id)
+            .await
+            .map(Response::Status),
     }
 }
 
@@ -119,7 +128,8 @@ async fn run_reader<R: AsyncRead + Unpin>(
             // response instead of leaving the client's request pending
             // forever — `dispatch` already reports its own `Err`s over the
             // wire, this only covers the task-died case.
-            let response = match tokio::spawn(async move { dispatch(&sessions, body).await }).await {
+            let response = match tokio::spawn(async move { dispatch(&sessions, body).await }).await
+            {
                 Ok(response) => response,
                 Err(join_err) => Err(format!("audio worker task panicked: {join_err}")),
             };
@@ -164,7 +174,12 @@ mod tests {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let sessions = Arc::new(Sessions::new(events_tx));
         let events_rx = Arc::new(Mutex::new(events_rx));
-        tokio::spawn(handle_connection(worker_read, worker_write, sessions, events_rx));
+        tokio::spawn(handle_connection(
+            worker_read,
+            worker_write,
+            sessions,
+            events_rx,
+        ));
 
         (client_write, client_read)
     }
@@ -177,7 +192,10 @@ mod tests {
             &mut write,
             &Envelope::Request {
                 id: 1,
-                body: Request::Status { guild_id: 42, track_id: uuid::Uuid::new_v4() },
+                body: Request::Status {
+                    guild_id: 42,
+                    track_id: uuid::Uuid::new_v4(),
+                },
             },
         )
         .await
@@ -185,7 +203,10 @@ mod tests {
 
         let response = read_frame(&mut read).await.unwrap().unwrap();
         match response {
-            Envelope::Response { id: 1, body: Err(_) } => {}
+            Envelope::Response {
+                id: 1,
+                body: Err(_),
+            } => {}
             other => panic!("expected an error response, got {other:?}"),
         }
     }
@@ -208,7 +229,10 @@ mod tests {
 
         for expected_id in [1_u64, 2, 3] {
             match read_frame(&mut read).await.unwrap().unwrap() {
-                Envelope::Response { id, body: Ok(Response::Ok) } => assert_eq!(id, expected_id),
+                Envelope::Response {
+                    id,
+                    body: Ok(Response::Ok),
+                } => assert_eq!(id, expected_id),
                 other => panic!("unexpected response: {other:?}"),
             }
         }

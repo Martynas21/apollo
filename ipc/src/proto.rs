@@ -9,8 +9,14 @@ use crate::dto::{ConnectionInfoDto, TrackStatusDto};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Envelope {
-    Request { id: u64, body: Request },
-    Response { id: u64, body: Result<Response, String> },
+    Request {
+        id: u64,
+        body: Request,
+    },
+    Response {
+        id: u64,
+        body: Result<Response, String>,
+    },
     Event(Event),
 }
 
@@ -59,7 +65,16 @@ pub enum Response {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
-    TrackFinished { guild_id: u64, track_id: Uuid },
-    TrackErrored { guild_id: u64, track_id: Uuid, error: String },
-    ConnectionLost { guild_id: u64 },
+    TrackFinished {
+        guild_id: u64,
+        track_id: Uuid,
+    },
+    TrackErrored {
+        guild_id: u64,
+        track_id: Uuid,
+        error: String,
+    },
+    ConnectionLost {
+        guild_id: u64,
+    },
 }

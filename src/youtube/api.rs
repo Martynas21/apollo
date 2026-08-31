@@ -94,7 +94,10 @@ impl std::fmt::Display for YouTubeApiError {
             Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
             Self::Timeout => write!(f, "yt-dlp timed out"),
             Self::LiveStreamNotSupported => {
-                write!(f, "that's a livestream still in progress — try again once it's finished")
+                write!(
+                    f,
+                    "that's a livestream still in progress — try again once it's finished"
+                )
             }
         }
     }
@@ -364,7 +367,9 @@ impl YouTubeClient {
         let track = parse_entries(&stdout)
             .next()
             .and_then(track_from_entry)
-            .ok_or_else(|| YouTubeApiError::YtDlpFailed("no metadata returned for video".to_string()))?;
+            .ok_or_else(|| {
+                YouTubeApiError::YtDlpFailed("no metadata returned for video".to_string())
+            })?;
         if track.duration.is_none() {
             return Err(YouTubeApiError::LiveStreamNotSupported);
         }

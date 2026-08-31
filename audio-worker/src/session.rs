@@ -12,8 +12,8 @@ use songbird::id::{ChannelId, GuildId, UserId};
 use songbird::input::File as SongbirdFile;
 use songbird::tracks::{PlayMode, TrackHandle};
 use songbird::{
-    Config, ConnectionInfo, CoreEvent, Driver, Event, EventContext, EventHandler as SongbirdEventHandler,
-    TrackEvent,
+    Config, ConnectionInfo, CoreEvent, Driver, Event, EventContext,
+    EventHandler as SongbirdEventHandler, TrackEvent,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
@@ -204,7 +204,9 @@ impl Sessions {
             .ok_or_else(|| format!("no active session for guild {guild_id}"))?;
         match &session.current {
             Some((current_id, handle)) if *current_id == track_id => Ok(handle.clone()),
-            _ => Err(format!("track {track_id} is not the current track for guild {guild_id}")),
+            _ => Err(format!(
+                "track {track_id} is not the current track for guild {guild_id}"
+            )),
         }
     }
 
@@ -289,9 +291,15 @@ mod tests {
         // A path that doesn't exist: `play`'s failure path tries to delete
         // it (see `delete_audio_file`), which must not panic when there's
         // nothing there to remove.
-        assert!(sessions
-            .play(1, Uuid::new_v4(), "/nonexistent/apollo-test.audio".to_string())
-            .is_err());
+        assert!(
+            sessions
+                .play(
+                    1,
+                    Uuid::new_v4(),
+                    "/nonexistent/apollo-test.audio".to_string()
+                )
+                .is_err()
+        );
     }
 
     #[tokio::test]

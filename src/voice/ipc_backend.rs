@@ -20,16 +20,18 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use apollo_ipc::proto::{Envelope, Event as IpcEvent, Request, Response};
-use apollo_ipc::{read_frame, write_frame, ConnectionInfoDto};
+use apollo_ipc::{ConnectionInfoDto, read_frame, write_frame};
 use async_trait::async_trait;
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, GuildId};
 use songbird::Songbird;
-use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
-use tokio::sync::{oneshot, Mutex};
+use tokio::net::unix::OwnedWriteHalf;
+use tokio::sync::{Mutex, oneshot};
 
-use crate::voice::player::{AudioSource, TrackStatus, VoiceBackend, VoiceCall, VoiceEvents, VoiceTrack};
+use crate::voice::player::{
+    AudioSource, TrackStatus, VoiceBackend, VoiceCall, VoiceEvents, VoiceTrack,
+};
 use crate::voice::resolve::{self, PlaybackError};
 use crate::youtube::api::Track;
 
@@ -165,7 +167,11 @@ impl Connection {
 /// its retries do guilds with a registration get told the connection is
 /// lost (mirroring how a real songbird `DriverDisconnect` is handled) and
 /// in-flight requests get unblocked with an error.
-async fn run_reader(mut read_half: tokio::net::unix::OwnedReadHalf, connection: Arc<Connection>, mut epoch: u64) {
+async fn run_reader(
+    mut read_half: tokio::net::unix::OwnedReadHalf,
+    connection: Arc<Connection>,
+    mut epoch: u64,
+) {
     // The outer loop re-enters the read loop on a freshly reconnected
     // stream; a plain (non-recursive) loop here, rather than this fn calling
     // itself, keeps its future's type from being self-referential.
@@ -235,8 +241,14 @@ async fn run_reader(mut read_half: tokio::net::unix::OwnedReadHalf, connection: 
 
 fn dispatch_event(connection: &Connection, event: IpcEvent) {
     match event {
-        IpcEvent::TrackFinished { guild_id, track_id } => notify_finished(connection, guild_id, track_id),
-        IpcEvent::TrackErrored { guild_id, track_id, error } => {
+        IpcEvent::TrackFinished { guild_id, track_id } => {
+            notify_finished(connection, guild_id, track_id)
+        }
+        IpcEvent::TrackErrored {
+            guild_id,
+            track_id,
+            error,
+        } => {
             tracing::warn!(%error, "worker reported a track error");
             notify_finished(connection, guild_id, track_id);
         }
@@ -253,7 +265,9 @@ fn dispatch_event(connection: &Connection, event: IpcEvent) {
 fn notify_finished(connection: &Connection, guild_id: u64, track_id: uuid::Uuid) {
     if let Some(events) = lookup(connection, guild_id) {
         tokio::spawn(async move {
-            events.track_finished(GuildId::new(guild_id), track_id).await;
+            events
+                .track_finished(GuildId::new(guild_id), track_id)
+                .await;
         });
     }
 }
@@ -338,7 +352,10 @@ impl VoiceBackend for IpcBackend {
         };
         let result = self
             .connection
-            .request(Request::Join { guild_id: guild_id.get(), info: dto })
+            .request(Request::Join {
+                guild_id: guild_id.get(),
+                info: dto,
+            })
             .await
             .and_then(|response| match response {
                 Response::Ok => Ok(()),
@@ -374,7 +391,9 @@ impl VoiceBackend for IpcBackend {
         // tearing down the gateway side below.
         if let Err(err) = self
             .connection
-            .request(Request::Leave { guild_id: guild_id.get() })
+            .request(Request::Leave {
+                guild_id: guild_id.get(),
+            })
             .await
         {
             tracing::debug!(%guild_id, %err, "worker leave request failed (may already be gone)");

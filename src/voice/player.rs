@@ -1060,10 +1060,7 @@ impl PlayerRegistry {
             }
         };
 
-        let handle = call
-            .play(source)
-            .await
-            .map_err(PlayerError::Playback)?;
+        let handle = call.play(source).await.map_err(PlayerError::Playback)?;
         let track_id = handle.uuid();
 
         // Best-effort: a missing/unreadable volume setting shouldn't block

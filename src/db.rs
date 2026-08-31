@@ -658,7 +658,9 @@ pub async fn queue_pop_front(pool: &SqlitePool, guild_id: &str) -> Result<Option
             .await
             .context("failed to remove the popped queue row")?;
 
-        let Some(queued) = queued_track_from_row((video_id, title, channel, duration_secs, requested_by)) else {
+        let Some(queued) =
+            queued_track_from_row((video_id, title, channel, duration_secs, requested_by))
+        else {
             tracing::warn!(guild_id, position, "skipping unparsable queue row");
             continue;
         };

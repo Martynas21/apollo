@@ -7,7 +7,7 @@ pub mod framing;
 pub mod proto;
 
 pub use dto::{ConnectionInfoDto, TrackStatusDto};
-pub use framing::{read_frame, write_frame, FramingError};
+pub use framing::{FramingError, read_frame, write_frame};
 pub use proto::{Envelope, Event, Request, Response};
 
 /// Default Unix domain socket path for the `apollo` <-> `apollo-audio-worker`

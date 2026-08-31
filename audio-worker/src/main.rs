@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use apollo_ipc::proto::Event as IpcEvent;
 use tokio::net::UnixListener;
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, Mutex};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{Mutex, mpsc};
 use tracing_subscriber::EnvFilter;
 
 use session::Sessions;
@@ -23,8 +23,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let socket_path = apollo_ipc::optional_env_var(&|key| std::env::var(key), "AUDIO_WORKER_SOCKET")
-        .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_PATH.to_string());
+    let socket_path =
+        apollo_ipc::optional_env_var(&|key| std::env::var(key), "AUDIO_WORKER_SOCKET")
+            .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_PATH.to_string());
 
     // A previous run's socket file left behind (crash, restart) makes
     // `UnixListener::bind` fail with "address in use" even though nothing is

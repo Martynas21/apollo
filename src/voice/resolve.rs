@@ -66,7 +66,10 @@ impl std::fmt::Display for PlaybackError {
             Self::Unavailable => write!(f, "video is unavailable (private or deleted)"),
             Self::YtDlpMissing => write!(f, "yt-dlp is not installed or not on PATH"),
             Self::Timeout => write!(f, "yt-dlp timed out"),
-            Self::TooLong => write!(f, "track is too long to queue (over 3 hours, or a livestream)"),
+            Self::TooLong => write!(
+                f,
+                "track is too long to queue (over 3 hours, or a livestream)"
+            ),
             Self::Other(message) => write!(f, "yt-dlp failed: {message}"),
         }
     }

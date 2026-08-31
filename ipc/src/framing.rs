@@ -96,7 +96,10 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let decoded = read_frame(&mut cursor).await.unwrap().unwrap();
         match decoded {
-            Envelope::Request { id, body: Request::Leave { guild_id } } => {
+            Envelope::Request {
+                id,
+                body: Request::Leave { guild_id },
+            } => {
                 assert_eq!(id, 42);
                 assert_eq!(guild_id, 7);
             }
