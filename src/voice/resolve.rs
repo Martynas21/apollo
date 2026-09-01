@@ -31,7 +31,7 @@ const STDERR_TRUNCATE_LEN: usize = 200;
 /// track that's too costly to fully buffer: unlike the old in-process design,
 /// `apollo-audio-worker` never touches `yt-dlp`/the network itself, so a
 /// track that can't be resolved and written to disk here simply can't play.
-const MAX_TRACK_DURATION: Duration = Duration::from_hours(3);
+const MAX_TRACK_DURATION: Duration = Duration::from_hours(14);
 
 /// Timeout for the `yt-dlp` preflight call, matching `YT_DLP_TIMEOUT` in
 /// `src/youtube/api.rs` for the same single-video lookup shape.
@@ -68,7 +68,7 @@ impl std::fmt::Display for PlaybackError {
             Self::Timeout => write!(f, "yt-dlp timed out"),
             Self::TooLong => write!(
                 f,
-                "track is too long to queue (over 3 hours, or a livestream)"
+                "track is too long to queue (over 14 hours, or a livestream)"
             ),
             Self::Other(message) => write!(f, "yt-dlp failed: {message}"),
         }
