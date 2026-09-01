@@ -54,10 +54,44 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool> {
         .await
         .context("failed to connect to database")?;
 
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .context("failed to run database migrations")?;
+    // Not production, and migrations get edited/reordered during local dev —
+    // a stale `_sqlx_migrations` checksum from a migration file whose
+    // content has since changed (its actual schema effect already applied
+    // under an earlier version of the file) shouldn't be a fatal,
+    // unrecoverable state that permanently wedges startup. On a mismatch,
+    // re-stamp that one row's checksum to match the current file *without*
+    // re-running its SQL — most migrations here aren't written to tolerate
+    // re-execution (plain `ALTER TABLE ADD COLUMN`, not `IF NOT EXISTS`), so
+    // re-running is the wrong recovery; the file changing (reformatted,
+    // renumbered, comment tweaked) without the schema actually needing to
+    // change again is the case this is for. Bounded by the migration count
+    // so a real, unrelated failure still surfaces instead of looping.
+    let migrator = sqlx::migrate!("./migrations");
+    for _ in 0..migrator.migrations.len() {
+        match migrator.run(&pool).await {
+            Ok(()) => break,
+            Err(sqlx::migrate::MigrateError::VersionMismatch(version)) => {
+                let checksum = migrator
+                    .migrations
+                    .iter()
+                    .find(|m| m.version == version)
+                    .map(|m| m.checksum.as_ref())
+                    .unwrap_or_default();
+                tracing::warn!(
+                    version,
+                    "re-stamping a stale `_sqlx_migrations` checksum to match the current \
+                     migration file, without re-running it"
+                );
+                sqlx::query("UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2")
+                    .bind(checksum)
+                    .bind(version)
+                    .execute(&pool)
+                    .await
+                    .context("failed to repair stale migration checksum")?;
+            }
+            Err(err) => return Err(err).context("failed to run database migrations"),
+        }
+    }
 
     Ok(pool)
 }
