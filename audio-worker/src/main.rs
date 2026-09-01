@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 use session::Sessions;
 
-#[tokio::main(worker_threads = 1)]
+#[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Same as `apollo`'s own `main.rs`: tolerate a missing `.env` (e.g. under
     // Docker, where config arrives via the environment directly).
