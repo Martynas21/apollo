@@ -41,10 +41,11 @@ services:
     # volume mount path to match.
     healthcheck:
       test: ["CMD", "nc", "-Uz", "/run/apollo-ipc/audio.sock"]
-      interval: 2s
+      interval: 30s
       timeout: 2s
       retries: 15
       start_period: 5s
+      start_interval: 2s
     deploy:
       resources:
         limits:
