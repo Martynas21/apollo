@@ -108,6 +108,25 @@ fn panel_components(
     volume: u8,
     radio_enabled: bool,
 ) -> Vec<serenity::CreateActionRow> {
+    let mut rows = vec![
+        playback_row(snapshot, paused, radio_enabled),
+        controls_row(snapshot, volume),
+    ];
+
+    if let Some(select_row) = queue_select_row(snapshot) {
+        rows.push(select_row);
+    }
+
+    rows
+}
+
+// At Discord's 5-button-per-row cap with `radio_toggle` included — a future
+// addition here needs its own row.
+fn playback_row(
+    snapshot: &QueueSnapshot,
+    paused: Option<bool>,
+    radio_enabled: bool,
+) -> serenity::CreateActionRow {
     let has_now_playing = snapshot.now_playing.is_some();
 
     let toggle = match paused {
@@ -133,9 +152,7 @@ fn panel_components(
             .style(serenity::ButtonStyle::Secondary)
     };
 
-    // At Discord's 5-button-per-row cap with `radio_toggle` included — a
-    // future addition here needs its own row.
-    let playback_row = serenity::CreateActionRow::Buttons(vec![
+    serenity::CreateActionRow::Buttons(vec![
         toggle,
         serenity::CreateButton::new("player:skip")
             .label("⏭ Skip")
@@ -150,14 +167,16 @@ fn panel_components(
             .style(serenity::ButtonStyle::Secondary)
             .disabled(snapshot.upcoming.len() < 2),
         radio_toggle,
-    ]);
+    ])
+}
 
-    // Volume (a single button, rather than the old step +/- pair, so the
-    // exact level is one tap — opening a type-in modal — away instead of
-    // several) alongside the library entry point and Clear Queue, all on one
-    // row — `playback_row` above is already at Discord's 5-button cap, so
-    // Clear Queue (a queue op, like Shuffle) lands here instead.
-    let controls_row = serenity::CreateActionRow::Buttons(vec![
+// Volume (a single button, rather than the old step +/- pair, so the exact
+// level is one tap — opening a type-in modal — away instead of several)
+// alongside the library entry point and Clear Queue, all on one row —
+// `playback_row` is already at Discord's 5-button cap, so Clear Queue (a
+// queue op, like Shuffle) lands here instead.
+fn controls_row(snapshot: &QueueSnapshot, volume: u8) -> serenity::CreateActionRow {
+    serenity::CreateActionRow::Buttons(vec![
         serenity::CreateButton::new("player:volume")
             .label(format!("{} {volume}%", volume_glyph(volume)))
             .style(serenity::ButtonStyle::Secondary),
@@ -171,32 +190,32 @@ fn panel_components(
             .label("🗑 Clear Queue")
             .style(serenity::ButtonStyle::Danger)
             .disabled(snapshot.upcoming.is_empty()),
-    ]);
+    ])
+}
 
-    let mut rows = vec![playback_row, controls_row];
-
-    if !snapshot.upcoming.is_empty() {
-        let options = snapshot
-            .upcoming
-            .iter()
-            .take(QUEUE_SELECT_LIMIT)
-            .enumerate()
-            .map(|(i, queued)| {
-                serenity::CreateSelectMenuOption::new(
-                    truncate_label(&format!("{}. {}", i + 1, queued.track.title)),
-                    i.to_string(),
-                )
-            })
-            .collect();
-        let select = serenity::CreateSelectMenu::new(
-            "player:jump",
-            serenity::CreateSelectMenuKind::String { options },
-        )
-        .placeholder("Jump to a track in the queue...");
-        rows.push(serenity::CreateActionRow::SelectMenu(select));
+fn queue_select_row(snapshot: &QueueSnapshot) -> Option<serenity::CreateActionRow> {
+    if snapshot.upcoming.is_empty() {
+        return None;
     }
 
-    rows
+    let options = snapshot
+        .upcoming
+        .iter()
+        .take(QUEUE_SELECT_LIMIT)
+        .enumerate()
+        .map(|(i, queued)| {
+            serenity::CreateSelectMenuOption::new(
+                truncate_label(&format!("{}. {}", i + 1, queued.track.title)),
+                i.to_string(),
+            )
+        })
+        .collect();
+    let select = serenity::CreateSelectMenu::new(
+        "player:jump",
+        serenity::CreateSelectMenuKind::String { options },
+    )
+    .placeholder("Jump to a track in the queue...");
+    Some(serenity::CreateActionRow::SelectMenu(select))
 }
 
 /// Renders the full panel for `guild_id` from [`PlayerRegistry`]'s current

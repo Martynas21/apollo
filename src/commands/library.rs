@@ -17,7 +17,7 @@ use super::{Context, Data, Error};
 use crate::db::SavedPlaylist;
 use crate::voice::QueuedTrack;
 use crate::voice::panel::{format_duration, truncate_label};
-use crate::youtube::api::{Track, YouTubeApiError};
+use crate::youtube::api::{PlaylistListing, Track, YouTubeApiError};
 
 /// Max results shown by `/add_to_queue` when browsing (no `number` given).
 const ADD_TO_QUEUE_DISPLAY_LIMIT: usize = 5;
@@ -512,6 +512,67 @@ async fn handle_playlist_refresh_button(
 /// their voice channel first if the bot isn't already connected. Falls back
 /// to a live fetch (populating the cache) if it's somehow still empty at
 /// this point, rather than reporting a spurious "empty playlist".
+async fn load_tracks_for_playlist_play(
+    data: &Data,
+    playlist: &SavedPlaylist,
+) -> Result<Vec<Track>, String> {
+    match crate::db::get_playlist_tracks(&data.db, playlist.id).await {
+        Ok(tracks) if !tracks.is_empty() => Ok(tracks),
+        Ok(_) => fetch_and_cache_playlist_tracks(data, playlist).await,
+        Err(err) => Err(format!("Failed to load playlist: {err}")),
+    }
+}
+
+async fn ensure_connected_for_playlist_play(
+    ctx: &serenity::Context,
+    component: &serenity::ComponentInteraction,
+    data: &Data,
+    guild_id: serenity::GuildId,
+) -> Result<bool, String> {
+    if data.player.is_connected(guild_id) {
+        return Ok(true);
+    }
+
+    let Some(channel_id) = voice_channel_of(ctx, guild_id, component.user.id) else {
+        return Err("Join a voice channel first, or use `/join`.".to_string());
+    };
+    if let Err(err) = data.player.join(guild_id, channel_id).await {
+        return Err(format!("Failed to join voice channel: {err}"));
+    }
+    Ok(true)
+}
+
+async fn enqueue_playlist_tracks(
+    data: &Data,
+    guild_id: serenity::GuildId,
+    requested_by: serenity::UserId,
+    playlist_name: &str,
+    tracks: Vec<Track>,
+) -> Result<String, String> {
+    let total = tracks.len();
+    let queued: Vec<QueuedTrack> = tracks
+        .into_iter()
+        .map(|track| QueuedTrack {
+            track,
+            requested_by,
+        })
+        .collect();
+    let queued_count = data
+        .player
+        .enqueue_many(guild_id, queued)
+        .await
+        .map_err(|err| format!("Failed to queue tracks: {err}"))?;
+
+    Ok(if queued_count == total {
+        format!("Queued {queued_count} track(s) from **{playlist_name}**.")
+    } else {
+        format!(
+            "Queued {queued_count}/{total} track(s) from **{playlist_name}** ({} failed).",
+            total - queued_count
+        )
+    })
+}
+
 async fn handle_playlist_play_button(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -527,70 +588,27 @@ async fn handle_playlist_play_button(
         Err(message) => return update_picker(ctx, component, message).await,
     };
 
-    let tracks = match crate::db::get_playlist_tracks(&data.db, playlist.id).await {
+    let tracks = match load_tracks_for_playlist_play(data, &playlist).await {
         Ok(tracks) if !tracks.is_empty() => tracks,
-        Ok(_) => match fetch_and_cache_playlist_tracks(data, &playlist).await {
-            Ok(tracks) => tracks,
-            Err(message) => return update_picker(ctx, component, message).await,
-        },
-        Err(err) => {
-            return update_picker(ctx, component, format!("Failed to load playlist: {err}")).await;
-        }
-    };
-
-    if tracks.is_empty() {
-        return update_picker(
-            ctx,
-            component,
-            "That playlist is empty (or couldn't be found).",
-        )
-        .await;
-    }
-
-    if !data.player.is_connected(guild_id) {
-        let Some(channel_id) = voice_channel_of(ctx, guild_id, component.user.id) else {
+        Ok(_) => {
             return update_picker(
                 ctx,
                 component,
-                "Join a voice channel first, or use `/join`.",
-            )
-            .await;
-        };
-        if let Err(err) = data.player.join(guild_id, channel_id).await {
-            return update_picker(
-                ctx,
-                component,
-                format!("Failed to join voice channel: {err}"),
+                "That playlist is empty (or couldn't be found).",
             )
             .await;
         }
+        Err(message) => return update_picker(ctx, component, message).await,
+    };
+
+    if let Err(message) = ensure_connected_for_playlist_play(ctx, component, data, guild_id).await {
+        return update_picker(ctx, component, message).await;
     }
 
-    let total = tracks.len();
-    let queued: Vec<QueuedTrack> = tracks
-        .into_iter()
-        .map(|track| QueuedTrack {
-            track,
-            requested_by: component.user.id,
-        })
-        .collect();
-    let queued_count = match data.player.enqueue_many(guild_id, queued).await {
-        Ok(count) => count,
-        Err(err) => {
-            return update_picker(ctx, component, format!("Failed to queue tracks: {err}")).await;
-        }
-    };
-
-    let content = if queued_count == total {
-        format!("Queued {queued_count} track(s) from **{}**.", playlist.name)
-    } else {
-        format!(
-            "Queued {queued_count}/{total} track(s) from **{}** ({} failed).",
-            playlist.name,
-            total - queued_count
-        )
-    };
-    update_picker(ctx, component, content).await
+    match enqueue_playlist_tracks(data, guild_id, component.user.id, &playlist.name, tracks).await {
+        Ok(content) => update_picker(ctx, component, content).await,
+        Err(message) => update_picker(ctx, component, message).await,
+    }
 }
 
 /// Handles a detail view's `library:playlist_view:<id>` button: re-opens
@@ -964,14 +982,11 @@ async fn handle_playlist_import_button(
 
 /// Handles the Playlists picker's import modal once submitted: validates the
 /// URL resolves to a non-empty playlist, then saves it for this guild.
-async fn handle_playlist_import_modal_submit(
+async fn fetch_playlist_for_import(
     ctx: &serenity::Context,
     modal: &serenity::ModalInteraction,
-    guild_id: serenity::GuildId,
     data: &Data,
-) -> Result<(), Error> {
-    modal.defer_ephemeral(&ctx.http).await?;
-
+) -> Result<Option<(String, PlaylistListing)>, Error> {
     let Some(url) = modal_field(&modal.data, "url") else {
         modal
             .edit_response(
@@ -979,7 +994,7 @@ async fn handle_playlist_import_modal_submit(
                 serenity::EditInteractionResponse::new().content("Enter a playlist URL."),
             )
             .await?;
-        return Ok(());
+        return Ok(None);
     };
 
     let listing = match data.youtube.list_playlist_items(&url).await {
@@ -992,7 +1007,7 @@ async fn handle_playlist_import_modal_submit(
                         .content(format!("Failed to load that playlist: {err}")),
                 )
                 .await?;
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -1004,23 +1019,26 @@ async fn handle_playlist_import_modal_submit(
                     .content("That playlist is empty (or couldn't be found)."),
             )
             .await?;
-        return Ok(());
+        return Ok(None);
     }
 
-    // Prefer what the user typed; otherwise fall back to the playlist's own
-    // YouTube title (reliably present on a flat-playlist listing) rather
-    // than the raw URL, so a blank-name import still shows something
-    // readable in the saved-playlists list.
-    let name = modal_field(&modal.data, "name")
-        .or_else(|| listing.title.clone())
-        .unwrap_or_else(|| url.clone());
-    let tracks = listing.tracks;
+    Ok(Some((url, listing)))
+}
 
+async fn save_imported_playlist(
+    ctx: &serenity::Context,
+    modal: &serenity::ModalInteraction,
+    data: &Data,
+    guild_id: serenity::GuildId,
+    name: &str,
+    url: &str,
+    tracks: &[Track],
+) -> Result<Option<i64>, Error> {
     let id = match crate::db::save_guild_playlist(
         &data.db,
         &guild_id.to_string(),
-        &name,
-        &url,
+        name,
+        url,
         &modal.user.id.to_string(),
     )
     .await
@@ -1034,19 +1052,37 @@ async fn handle_playlist_import_modal_submit(
                         .content(format!("Failed to save playlist: {err}")),
                 )
                 .await?;
-            return Ok(());
+            return Ok(None);
         }
     };
 
-    let track_count = tracks.len();
-    // Best-effort: the playlist itself is already saved either way — a
-    // caching hiccup here just means the detail view below shows "cached
-    // never" and self-heals on next view (see `show_playlist_details`)
-    // rather than blocking the import on it.
-    if let Err(err) = crate::db::replace_playlist_tracks(&data.db, id, &tracks).await {
+    if let Err(err) = crate::db::replace_playlist_tracks(&data.db, id, tracks).await {
         tracing::warn!(%err, playlist_id = id, "failed to cache playlist tracks after import");
     }
 
+    Ok(Some(id))
+}
+
+struct ImportedPlaylistSummary {
+    id: i64,
+    name: String,
+    url: String,
+    track_count: usize,
+}
+
+async fn reply_with_saved_playlist(
+    ctx: &serenity::Context,
+    modal: &serenity::ModalInteraction,
+    data: &Data,
+    guild_id: serenity::GuildId,
+    summary: ImportedPlaylistSummary,
+) -> Result<(), Error> {
+    let ImportedPlaylistSummary {
+        id,
+        name,
+        url,
+        track_count,
+    } = summary;
     let playlist = match crate::db::get_guild_playlist(&data.db, &guild_id.to_string(), id).await {
         Ok(Some(playlist)) => playlist,
         _ => SavedPlaylist {
@@ -1067,6 +1103,44 @@ async fn handle_playlist_import_modal_submit(
         )
         .await?;
     Ok(())
+}
+
+async fn handle_playlist_import_modal_submit(
+    ctx: &serenity::Context,
+    modal: &serenity::ModalInteraction,
+    guild_id: serenity::GuildId,
+    data: &Data,
+) -> Result<(), Error> {
+    modal.defer_ephemeral(&ctx.http).await?;
+
+    let Some((url, listing)) = fetch_playlist_for_import(ctx, modal, data).await? else {
+        return Ok(());
+    };
+
+    let name = modal_field(&modal.data, "name")
+        .or_else(|| listing.title.clone())
+        .unwrap_or_else(|| url.clone());
+    let tracks = listing.tracks;
+    let track_count = tracks.len();
+
+    let Some(id) = save_imported_playlist(ctx, modal, data, guild_id, &name, &url, &tracks).await?
+    else {
+        return Ok(());
+    };
+
+    reply_with_saved_playlist(
+        ctx,
+        modal,
+        data,
+        guild_id,
+        ImportedPlaylistSummary {
+            id,
+            name,
+            url,
+            track_count,
+        },
+    )
+    .await
 }
 
 /// Determines the voice channel to auto-join into, if the bot isn't already
@@ -1119,9 +1193,15 @@ async fn ensure_connected(ctx: Context<'_>, guild_id: serenity::GuildId) -> Resu
 /// Auto-joins if needed, enqueues `track`, and sends the public confirmation
 /// reply. Shared by every `*play`/`*queue` command below.
 async fn join_and_enqueue(ctx: Context<'_>, track: Track) -> Result<(), Error> {
-    // guild_only guarantees a guild context; ctx.guild_id() still returns
-    // Option per poise's API, so unwrap with an expect documenting why.
-    let guild_id = ctx.guild_id().expect("guild_only command has a guild id");
+    let Some(guild_id) = ctx.guild_id() else {
+        ctx.send(
+            poise::CreateReply::default()
+                .content("This command can only be used in a server.")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    };
 
     if !ensure_connected(ctx, guild_id).await? {
         return Ok(());
@@ -1158,7 +1238,15 @@ pub(super) async fn join_and_enqueue_all(
     label: &str,
     tracks: Vec<Track>,
 ) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().expect("guild_only command has a guild id");
+    let Some(guild_id) = ctx.guild_id() else {
+        ctx.send(
+            poise::CreateReply::default()
+                .content("This command can only be used in a server.")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    };
 
     if !ensure_connected(ctx, guild_id).await? {
         return Ok(());
@@ -1216,9 +1304,15 @@ pub async fn add_to_queue(
     // (see `join_and_enqueue`), which works fine as its own followup.
     ctx.defer_ephemeral().await?;
 
-    // guild_only guarantees a guild context; ctx.guild_id() still returns
-    // Option per poise's API, so unwrap with an expect documenting why.
-    let guild_id = ctx.guild_id().expect("guild_only command has a guild id");
+    let Some(guild_id) = ctx.guild_id() else {
+        ctx.send(
+            poise::CreateReply::default()
+                .content("This command can only be used in a server.")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    };
     let results = match search_with_cache(ctx.data(), guild_id, &query).await {
         Ok(results) => results,
         Err(err) => {
@@ -1233,33 +1327,7 @@ pub async fn add_to_queue(
     };
 
     let Some(number) = number else {
-        if results.is_empty() {
-            ctx.send(
-                poise::CreateReply::default()
-                    .content("No results found.")
-                    .ephemeral(true),
-            )
-            .await?;
-            return Ok(());
-        }
-
-        let listing = format_track_list(&results, ADD_TO_QUEUE_DISPLAY_LIMIT);
-        let handle = ctx
-            .send(
-                poise::CreateReply::default()
-                    .content(format!(
-                        "Search results for \"{query}\":\n{listing}\n\nSelect one below to queue it, \
-                         or run `/add_to_queue {query} <number>` to do the same without the menu."
-                    ))
-                    .components(vec![track_select_menu(
-                        &results,
-                        ADD_TO_QUEUE_DISPLAY_LIMIT,
-                    )])
-                    .ephemeral(true),
-            )
-            .await?;
-        schedule_picker_cleanup(ctx, handle).await;
-        return Ok(());
+        return present_search_results(ctx, &query, &results).await;
     };
 
     let Some(track) = select_by_number(&results, number) else {
@@ -1273,6 +1341,37 @@ pub async fn add_to_queue(
     };
 
     join_and_enqueue(ctx, track).await
+}
+
+async fn present_search_results(
+    ctx: Context<'_>,
+    query: &str,
+    results: &[Track],
+) -> Result<(), Error> {
+    if results.is_empty() {
+        ctx.send(
+            poise::CreateReply::default()
+                .content("No results found.")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let listing = format_track_list(results, ADD_TO_QUEUE_DISPLAY_LIMIT);
+    let handle = ctx
+        .send(
+            poise::CreateReply::default()
+                .content(format!(
+                    "Search results for \"{query}\":\n{listing}\n\nSelect one below to queue it, \
+                     or run `/add_to_queue {query} <number>` to do the same without the menu."
+                ))
+                .components(vec![track_select_menu(results, ADD_TO_QUEUE_DISPLAY_LIMIT)])
+                .ephemeral(true),
+        )
+        .await?;
+    schedule_picker_cleanup(ctx, handle).await;
+    Ok(())
 }
 
 /// Checks the guild's cached playlist tracks for `query` before shelling out

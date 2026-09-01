@@ -1,6 +1,7 @@
 //! Shared types for the `apollo` \<-\> `apollo-audio-worker` IPC boundary —
 //! see the crate's sibling `audio-worker/` for the worker binary and
 //! `apollo`'s `src/voice/ipc_backend.rs` for the client side.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod dto;
 pub mod framing;

@@ -104,13 +104,19 @@ impl Connection {
     async fn try_send(self: &Arc<Self>, body: Request) -> Result<PendingRx, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, tx);
 
         let envelope = Envelope::Request { id, body };
         let mut write = self.write.lock().await;
         if let Err(e) = write_frame(&mut *write, &envelope).await {
             drop(write);
-            self.pending.lock().unwrap().remove(&id);
+            self.pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
             return Err(format!("IPC write failed: {e}"));
         }
         Ok(rx)
@@ -190,7 +196,12 @@ async fn run_reader(
             };
             match envelope {
                 Envelope::Response { id, body } => {
-                    if let Some(tx) = connection.pending.lock().unwrap().remove(&id) {
+                    if let Some(tx) = connection
+                        .pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&id)
+                    {
                         let _ = tx.send(body);
                     }
                 }
@@ -219,13 +230,20 @@ async fn run_reader(
         }
     }
 
-    // Reconnecting is exhausted — the worker is really gone. Every guild
-    // that had a registration needs to be told, the same way a real
-    // `DriverDisconnectHandler` would report a lost voice connection. Any
-    // request still awaiting a response also needs to be unblocked with an
-    // error rather than hanging forever.
+    handle_reader_exit(&connection);
+}
+
+// Reconnecting is exhausted — the worker is really gone. Every guild that
+// had a registration needs to be told, the same way a real
+// `DriverDisconnectHandler` would report a lost voice connection. Any
+// request still awaiting a response also needs to be unblocked with an
+// error rather than hanging forever.
+fn handle_reader_exit(connection: &Connection) {
     let guild_events: Vec<(GuildId, Arc<dyn VoiceEvents>)> = {
-        let mut map = connection.guild_events.lock().unwrap();
+        let mut map = connection
+            .guild_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.drain().collect()
     };
     for (guild_id, events) in guild_events {
@@ -233,7 +251,12 @@ async fn run_reader(
             events.connection_lost(guild_id).await;
         });
     }
-    let pending: Vec<_> = connection.pending.lock().unwrap().drain().collect();
+    let pending: Vec<_> = connection
+        .pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .collect();
     for (_, tx) in pending {
         let _ = tx.send(Err("apollo-audio-worker connection closed".to_string()));
     }
@@ -276,7 +299,7 @@ fn lookup(connection: &Connection, guild_id: u64) -> Option<Arc<dyn VoiceEvents>
     connection
         .guild_events
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&GuildId::new(guild_id))
         .cloned()
 }
@@ -339,7 +362,7 @@ impl VoiceBackend for IpcBackend {
         self.connection
             .guild_events
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(guild_id, events);
 
         let dto = ConnectionInfoDto {
@@ -370,7 +393,7 @@ impl VoiceBackend for IpcBackend {
             self.connection
                 .guild_events
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&guild_id);
             if let Err(cleanup_err) = self.songbird.remove(guild_id).await {
                 tracing::warn!(%guild_id, %cleanup_err, "failed to undo songbird join after a failed IPC Join");
@@ -384,7 +407,7 @@ impl VoiceBackend for IpcBackend {
         self.connection
             .guild_events
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&guild_id);
         // Best-effort: the worker may already be gone (which is exactly why
         // this guild is being removed), so a failure here doesn't block

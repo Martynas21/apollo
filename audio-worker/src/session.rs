@@ -129,13 +129,17 @@ impl Sessions {
                 events: self.events.clone(),
             },
         );
-        let old = self.guilds.lock().unwrap().insert(
-            guild_id,
-            GuildSession {
-                driver,
-                current: None,
-            },
-        );
+        let old = self
+            .guilds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                guild_id,
+                GuildSession {
+                    driver,
+                    current: None,
+                },
+            );
         // A re-issued Join for a guild that already has a session (e.g. a
         // second /play while one is already active) must not just drop the
         // old Driver — that would orphan its track with no End/Error ever
@@ -147,7 +151,12 @@ impl Sessions {
     }
 
     pub fn leave(&self, guild_id: u64) {
-        if let Some(mut session) = self.guilds.lock().unwrap().remove(&guild_id) {
+        if let Some(mut session) = self
+            .guilds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&guild_id)
+        {
             session.driver.leave();
         }
     }
@@ -156,14 +165,20 @@ impl Sessions {
     /// `apollo` drops, since nothing will ever consume further events or
     /// send further commands once that happens.
     pub fn leave_all(&self) {
-        let mut guilds = self.guilds.lock().unwrap();
+        let mut guilds = self
+            .guilds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, mut session) in guilds.drain() {
             session.driver.leave();
         }
     }
 
     pub fn play(&self, guild_id: u64, track_id: Uuid, audio_path: String) -> Result<(), String> {
-        let mut guilds = self.guilds.lock().unwrap();
+        let mut guilds = self
+            .guilds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guilds.get_mut(&guild_id) else {
             delete_audio_file(&audio_path);
             return Err(format!("no active session for guild {guild_id}"));
@@ -198,7 +213,10 @@ impl Sessions {
     /// (`with_current`) or async (`status`), that needs to reach the actual
     /// `TrackHandle`.
     fn current_handle(&self, guild_id: u64, track_id: Uuid) -> Result<TrackHandle, String> {
-        let guilds = self.guilds.lock().unwrap();
+        let guilds = self
+            .guilds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let session = guilds
             .get(&guild_id)
             .ok_or_else(|| format!("no active session for guild {guild_id}"))?;

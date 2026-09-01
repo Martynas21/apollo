@@ -99,6 +99,29 @@ locally before pushing:
   (`cargo install cargo-llvm-cov`). Add `--open` instead of
   `--summary-only` for an HTML report per source line.
 
+## Code style
+
+`clippy.toml` and the workspace `[lints]` table (`Cargo.toml`) enforce most of
+this — see `cargo clippy` in Development above:
+
+- No recursion — use iteration.
+- Every loop needs either a statically-visible bound (fixed range,
+  decrementing counter, capped retry count) or must be one of the small set
+  of intentional long-running service loops: `apollo-audio-worker`'s driver
+  loop, the IPC accept/read loops (`src/voice/ipc_backend.rs`,
+  `audio-worker/src/rpc.rs`), and the DB migration-retry loop (`src/db.rs`).
+  A new unbounded loop outside that list needs explicit justification in
+  review.
+- Functions stay under ~60 lines (`clippy::too_many_lines`) — split by
+  sub-step, not by arbitrary line count.
+- No `unwrap()`/`expect()`/`panic!()` outside tests
+  (`clippy::unwrap_used`/`expect_used`/`panic`, exempted under `#[cfg(test)]`
+  via each crate root) — propagate `anyhow::Result` instead. A poisoned
+  `Mutex` is the one common exception: recover with
+  `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)` rather than
+  propagating, since poisoning here doesn't indicate corrupted state worth
+  crashing over.
+
 ## Environment variables
 
 See `.env.example` for the full list and inline docs:

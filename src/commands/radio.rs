@@ -11,9 +11,15 @@ use super::{Context, Error};
 /// [`crate::voice::PlayerRegistry::toggle_radio`].
 #[poise::command(slash_command, guild_only)]
 pub async fn radio(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .expect("guild_only commands always have a guild");
+    let Some(guild_id) = ctx.guild_id() else {
+        ctx.send(
+            poise::CreateReply::default()
+                .content("This command can only be used in a server.")
+                .ephemeral(true),
+        )
+        .await?;
+        return Ok(());
+    };
 
     let enabled = ctx.data().player.toggle_radio(guild_id).await;
     reply_public(ctx, radio_status_message(enabled)).await

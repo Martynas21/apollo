@@ -1,11 +1,20 @@
 [workspace]
 members = ["ipc", "audio-worker"]
 
+[workspace.lints.clippy]
+too_many_lines = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
 [package]
 name = "apollo"
 version = "0.1.0"
 edition = "2024"
 publish = false
+
+[lints]
+workspace = true
 
 [dependencies]
 apollo-ipc = { path = "ipc" }

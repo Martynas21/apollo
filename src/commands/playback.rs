@@ -137,10 +137,27 @@ pub async fn handle_component(
         return library::handle_playlists_button(ctx, component, data).await;
     }
     if custom_id == "volume" {
-        return handle_volume_button(ctx, component, data).await;
+        return handle_volume_button(ctx, component, guild_id, data).await;
     }
 
-    let result: Result<(), PlayerError> = match custom_id {
+    let Some(result) = apply_component_action(custom_id, component, guild_id, data).await else {
+        return Ok(());
+    };
+    respond_to_component_action(ctx, component, guild_id, data, result).await
+}
+
+/// Applies the [`crate::voice::PlayerRegistry`] mutation for a `player:*`
+/// custom id that isn't one of the up-front special cases in
+/// [`handle_component`]. `None` if `custom_id` isn't recognized at all —
+/// distinct from `Some(Ok(()))`, since an unrecognized id shouldn't trigger
+/// the panel re-render/edit that follows a real mutation.
+async fn apply_component_action(
+    custom_id: &str,
+    component: &serenity::ComponentInteraction,
+    guild_id: serenity::GuildId,
+    data: &Data,
+) -> Option<Result<(), PlayerError>> {
+    Some(match custom_id {
         "toggle" => match data.player.is_paused(guild_id).await {
             Some(true) => data.player.resume(guild_id).await,
             Some(false) => data.player.pause(guild_id).await,
@@ -163,9 +180,22 @@ pub async fn handle_component(
             }
             _ => Err(PlayerError::InvalidSelection),
         },
-        _ => return Ok(()),
-    };
+        _ => return None,
+    })
+}
 
+/// Turns the outcome of [`apply_component_action`] into the actual
+/// interaction response: an ephemeral error message on `Err`, or on `Ok` a
+/// rebuilt panel edited in place for zero-latency feedback on the click
+/// itself (`PlayerRegistry` also pushes this same rendering to the panel on
+/// its own after the mutation).
+async fn respond_to_component_action(
+    ctx: &serenity::Context,
+    component: &serenity::ComponentInteraction,
+    guild_id: serenity::GuildId,
+    data: &Data,
+    result: Result<(), PlayerError>,
+) -> Result<(), Error> {
     if let Err(err) = result {
         component
             .create_response(
@@ -265,18 +295,16 @@ fn modal_volume(data: &serenity::ModalInteractionData) -> Option<u8> {
     })
 }
 
-/// Handles the panel's `player:volume` button: shows a one-field modal for a
-/// typed volume level, applies it, then acknowledges the modal submission
-/// with no visible change — [`crate::voice::PlayerRegistry::set_volume`]
-/// already refreshes the live panel on its own.
-async fn handle_volume_button(
+/// Shows the `player:volume` button's one-field modal and waits for it to be
+/// submitted. `None` on timeout.
+///
+/// The modal's custom id is namespaced with the clicking interaction's own
+/// id so concurrent volume edits (different users, or the same user opening
+/// it twice) don't cross-collect each other's submissions.
+async fn await_volume_modal(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
-    data: &Data,
-) -> Result<(), Error> {
-    let guild_id = component
-        .guild_id
-        .expect("checked by handle_component before dispatch");
+) -> Result<Option<serenity::ModalInteraction>, Error> {
     let modal_custom_id = format!("player:volume_modal:{}", component.id);
 
     component
@@ -298,16 +326,24 @@ async fn handle_volume_button(
         .await?;
 
     let user_id = component.user.id;
-    let Some(modal) = serenity::ModalInteractionCollector::new(&ctx.shard)
+    Ok(serenity::ModalInteractionCollector::new(&ctx.shard)
         .filter(move |submission| {
             submission.data.custom_id == modal_custom_id && submission.user.id == user_id
         })
         .timeout(VOLUME_MODAL_TIMEOUT)
-        .await
-    else {
-        return Ok(());
-    };
+        .await)
+}
 
+/// Validates and applies a submitted volume modal, then acknowledges it —
+/// with no visible change on success, since
+/// [`crate::voice::PlayerRegistry::set_volume`] already refreshes the live
+/// panel on its own.
+async fn apply_volume_modal(
+    ctx: &serenity::Context,
+    modal: &serenity::ModalInteraction,
+    guild_id: serenity::GuildId,
+    data: &Data,
+) -> Result<(), Error> {
     let Some(level) = modal_volume(&modal.data) else {
         modal
             .create_response(
@@ -340,6 +376,20 @@ async fn handle_volume_button(
         .create_response(&ctx.http, serenity::CreateInteractionResponse::Acknowledge)
         .await?;
     Ok(())
+}
+
+/// Handles the panel's `player:volume` button: shows a one-field modal for a
+/// typed volume level and applies it.
+async fn handle_volume_button(
+    ctx: &serenity::Context,
+    component: &serenity::ComponentInteraction,
+    guild_id: serenity::GuildId,
+    data: &Data,
+) -> Result<(), Error> {
+    let Some(modal) = await_volume_modal(ctx, component).await? else {
+        return Ok(());
+    };
+    apply_volume_modal(ctx, &modal, guild_id, data).await
 }
 
 /// The invoking user's current voice channel in this guild, if any.
@@ -408,6 +458,85 @@ async fn reply_error(ctx: Context<'_>, content: impl Into<String>) -> Result<(),
     Ok(())
 }
 
+/// The invoking guild, for a `guild_only` command. Every command in this
+/// file has that attribute, so poise's own check already guarantees this —
+/// but that guarantee lives in the framework rather than the type system, so
+/// this still surfaces a normal user-facing error instead of unwrapping it.
+fn require_guild_id(ctx: Context<'_>) -> Result<serenity::GuildId, Error> {
+    ctx.guild_id()
+        .ok_or_else(|| "this command can only be used in a server.".into())
+}
+
+/// Fetches `query` as a playlist and queues every track in it, in order.
+/// Assumes the caller already confirmed `query` looks like a playlist link.
+async fn play_playlist(ctx: Context<'_>, query: &str) -> Result<(), Error> {
+    let tracks = match ctx.data().youtube.list_playlist_items(query).await {
+        Ok(listing) => listing.tracks,
+        Err(err) => return reply_error(ctx, err.to_string()).await,
+    };
+    if tracks.is_empty() {
+        return reply_error(ctx, "that playlist is empty (or couldn't be found).").await;
+    }
+    library::join_and_enqueue_all(ctx, query, tracks).await
+}
+
+/// If the caller is in a voice channel, joins it — moving there if the bot
+/// is already connected elsewhere in this guild, since a single bot identity
+/// can only ever hold one voice connection per guild (a Discord platform
+/// limit, not something apollo can route around). A caller with no voice
+/// channel of their own just queues into wherever the bot's already
+/// playing, if anywhere; that's an error only if the bot isn't playing
+/// anywhere either.
+async fn join_for_play(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result<(), Error> {
+    match voice_channel_of(ctx) {
+        Some(channel_id) => ctx
+            .data()
+            .player
+            .join(guild_id, channel_id)
+            .await
+            .map_err(|err| err.to_string().into()),
+        None if !ctx.data().player.is_connected(guild_id) => {
+            Err("join a voice channel first, or use `/join`.".into())
+        }
+        None => Ok(()),
+    }
+}
+
+/// Resolves `query`/`video_id` (as already parsed by [`play`]) to the single
+/// track to queue: the looked-up video if `video_id` is `Some`, otherwise
+/// the top search result. `Ok(None)` if resolution failed and an error reply
+/// was already sent.
+///
+/// `/play` with free text takes only the top hit for convenience — unlike
+/// `/add_to_queue`, which shows an interactive multi-result picker.
+async fn resolve_track(
+    ctx: Context<'_>,
+    query: &str,
+    video_id: Option<String>,
+) -> Result<Option<Track>, Error> {
+    if let Some(video_id) = video_id {
+        return match ctx.data().youtube.get_video(&video_id).await {
+            Ok(track) => Ok(Some(track)),
+            Err(err) => {
+                reply_error(ctx, err.to_string()).await?;
+                Ok(None)
+            }
+        };
+    }
+
+    match ctx.data().youtube.search(query).await {
+        Ok(results) if results.is_empty() => {
+            reply_error(ctx, format!("no results found for '{query}'")).await?;
+            Ok(None)
+        }
+        Ok(mut results) => Ok(Some(results.remove(0))),
+        Err(err) => {
+            reply_error(ctx, err.to_string()).await?;
+            Ok(None)
+        }
+    }
+}
+
 /// Plays a video/playlist link, or searches and queues the top result.
 ///
 /// Given a `YouTube` video URL or video ID, plays that video. Given a
@@ -418,9 +547,7 @@ pub async fn play(
     ctx: Context<'_>,
     #[description = "YouTube URL/video ID, or a search query"] query: String,
 ) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .expect("guild_only commands always have a guild");
+    let guild_id = require_guild_id(ctx)?;
 
     // The video/playlist lookup below and `join`'s voice-gateway handshake
     // can both easily exceed Discord's 3-second ack deadline (cold-start
@@ -431,59 +558,15 @@ pub async fn play(
 
     let video_id = extract_video_id(&query);
     if video_id.is_none() && looks_like_playlist_url(&query) {
-        let tracks = match ctx.data().youtube.list_playlist_items(&query).await {
-            Ok(listing) => listing.tracks,
-            Err(err) => return reply_error(ctx, err.to_string()).await,
-        };
-        if tracks.is_empty() {
-            return reply_error(ctx, "that playlist is empty (or couldn't be found).").await;
-        }
-        return library::join_and_enqueue_all(ctx, &query, tracks).await;
+        return play_playlist(ctx, &query).await;
     }
 
-    // If the caller is in a voice channel, join it — moving there if the bot
-    // is already connected elsewhere in this guild, since a single bot
-    // identity can only ever hold one voice connection per guild (a Discord
-    // platform limit, not something apollo can route around). A caller with
-    // no voice channel of their own just queues into wherever the bot's
-    // already playing, if anywhere.
-    match voice_channel_of(ctx) {
-        Some(channel_id) => {
-            if let Err(err) = ctx.data().player.join(guild_id, channel_id).await {
-                reply_error(ctx, err.to_string()).await?;
-                return Ok(());
-            }
-        }
-        None if !ctx.data().player.is_connected(guild_id) => {
-            reply_error(ctx, "join a voice channel first, or use `/join`.").await?;
-            return Ok(());
-        }
-        None => {}
+    if let Err(err) = join_for_play(ctx, guild_id).await {
+        return reply_error(ctx, err.to_string()).await;
     }
 
-    let track = if let Some(video_id) = video_id {
-        match ctx.data().youtube.get_video(&video_id).await {
-            Ok(track) => track,
-            Err(err) => {
-                reply_error(ctx, err.to_string()).await?;
-                return Ok(());
-            }
-        }
-    } else {
-        // `/play` with free text takes only the top hit for convenience —
-        // unlike `/add_to_queue`, which shows an interactive multi-result
-        // picker.
-        match ctx.data().youtube.search(&query).await {
-            Ok(results) if results.is_empty() => {
-                reply_error(ctx, format!("no results found for '{query}'")).await?;
-                return Ok(());
-            }
-            Ok(mut results) => results.remove(0),
-            Err(err) => {
-                reply_error(ctx, err.to_string()).await?;
-                return Ok(());
-            }
-        }
+    let Some(track) = resolve_track(ctx, &query, video_id).await? else {
+        return Ok(());
     };
 
     let queued = QueuedTrack {
@@ -500,9 +583,7 @@ pub async fn play(
 /// Shows the current queue.
 #[poise::command(slash_command, guild_only)]
 pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .expect("guild_only commands always have a guild");
+    let guild_id = require_guild_id(ctx)?;
     let snapshot = ctx.data().player.queue_snapshot(guild_id).await;
 
     let mut lines = Vec::new();
@@ -530,9 +611,7 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
 /// Skips the currently playing track.
 #[poise::command(slash_command, guild_only)]
 pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .expect("guild_only commands always have a guild");
+    let guild_id = require_guild_id(ctx)?;
 
     match ctx.data().player.skip(guild_id).await {
         Ok(()) => reply_public(ctx, "Skipped.").await,
@@ -544,9 +623,7 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
 /// Pauses the currently playing track.
 #[poise::command(slash_command, guild_only)]
 pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .expect("guild_only commands always have a guild");
+    let guild_id = require_guild_id(ctx)?;
 
     match ctx.data().player.pause(guild_id).await {
         Ok(()) => reply_public(ctx, "Paused.").await,
@@ -558,9 +635,7 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
 /// Resumes a paused track.
 #[poise::command(slash_command, guild_only)]
 pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .expect("guild_only commands always have a guild");
+    let guild_id = require_guild_id(ctx)?;
 
     match ctx.data().player.resume(guild_id).await {
         Ok(()) => reply_public(ctx, "Resumed.").await,
@@ -572,9 +647,7 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
 /// Stops playback and clears the queue.
 #[poise::command(slash_command, guild_only)]
 pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .expect("guild_only commands always have a guild");
+    let guild_id = require_guild_id(ctx)?;
 
     match ctx.data().player.stop(guild_id).await {
         Ok(()) => reply_public(ctx, "Stopped and cleared the queue.").await,
@@ -596,9 +669,7 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
 /// posting a duplicate.
 #[poise::command(slash_command, guild_only)]
 pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .expect("guild_only commands always have a guild");
+    let guild_id = require_guild_id(ctx)?;
 
     // `claim_panel_slot` makes the "does a panel already exist" check and
     // the "reserve the right to post one" decision atomic under the
@@ -616,39 +687,7 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
             .await?;
             return Ok(());
         }
-        PanelClaim::Reserved => {
-            let (content, embed, components) =
-                crate::voice::panel::render(&ctx.data().player, guild_id).await;
-            let mut reply = poise::CreateReply::default()
-                .content(content)
-                .components(components);
-            if let Some(embed) = embed {
-                reply = reply.embed(embed);
-            }
-
-            // Release the reservation on any failure to post, so a wedged
-            // `/player` doesn't block every future `/player` in this guild.
-            let posted: Result<_, Error> = async {
-                let handle = ctx.send(reply).await?;
-                let message = handle.message().await?;
-                Ok((message.channel_id, message.id))
-            }
-            .await;
-
-            match posted {
-                Ok((channel_id, message_id)) => {
-                    ctx.data()
-                        .player
-                        .set_panel(guild_id, channel_id, message_id)
-                        .await;
-                    return Ok(());
-                }
-                Err(err) => {
-                    ctx.data().player.release_panel_slot(guild_id).await;
-                    return Err(err);
-                }
-            }
-        }
+        PanelClaim::Reserved => return post_new_panel(ctx, guild_id).await,
     };
 
     let link = message_id.link(channel_id, Some(guild_id));
@@ -661,12 +700,46 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Renders and posts a brand new player panel for a slot this call already
+/// reserved via `claim_panel_slot`, then records it as the guild's live
+/// panel — or, on any failure to post, releases the reservation so a wedged
+/// `/player` doesn't block every future `/player` in this guild.
+async fn post_new_panel(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result<(), Error> {
+    let (content, embed, components) =
+        crate::voice::panel::render(&ctx.data().player, guild_id).await;
+    let mut reply = poise::CreateReply::default()
+        .content(content)
+        .components(components);
+    if let Some(embed) = embed {
+        reply = reply.embed(embed);
+    }
+
+    let posted: Result<_, Error> = async {
+        let handle = ctx.send(reply).await?;
+        let message = handle.message().await?;
+        Ok((message.channel_id, message.id))
+    }
+    .await;
+
+    match posted {
+        Ok((channel_id, message_id)) => {
+            ctx.data()
+                .player
+                .set_panel(guild_id, channel_id, message_id)
+                .await;
+            Ok(())
+        }
+        Err(err) => {
+            ctx.data().player.release_panel_slot(guild_id).await;
+            Err(err)
+        }
+    }
+}
+
 /// Shuffles the upcoming queue. Leaves the currently playing track alone.
 #[poise::command(slash_command, guild_only)]
 pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .expect("guild_only commands always have a guild");
+    let guild_id = require_guild_id(ctx)?;
 
     match ctx.data().player.shuffle(guild_id).await {
         Ok(()) => reply_public(ctx, "Shuffled the queue.").await,
@@ -680,9 +753,7 @@ pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
 /// Clears the upcoming queue. Leaves the currently playing track alone.
 #[poise::command(slash_command, guild_only)]
 pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .expect("guild_only commands always have a guild");
+    let guild_id = require_guild_id(ctx)?;
 
     match ctx.data().player.clear_queue(guild_id).await {
         Ok(()) => reply_public(ctx, "Cleared the queue.").await,
@@ -701,9 +772,7 @@ pub async fn volume(
     #[max = 100]
     level: u8,
 ) -> Result<(), Error> {
-    let guild_id = ctx
-        .guild_id()
-        .expect("guild_only commands always have a guild");
+    let guild_id = require_guild_id(ctx)?;
 
     match ctx.data().player.set_volume(guild_id, level).await {
         Ok(()) => reply_public(ctx, format!("Volume set to {level}.")).await,

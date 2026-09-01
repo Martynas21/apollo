@@ -562,80 +562,21 @@ impl PlayerRegistry {
     /// requested track correctly lands *behind* the resumed queue instead of
     /// jumping ahead of it.
     async fn restore_session_if_new(&self, guild_id: GuildId, call: Arc<dyn VoiceCall>) {
-        {
-            let guilds = self.guilds.lock().await;
-            if guilds.contains_key(&guild_id) {
-                return;
-            }
+        if self.guild_state_exists(guild_id).await {
+            return;
         }
 
         let guild_id_str = guild_id.to_string();
-        let session = match db::load_guild_session(&self.db, &guild_id_str).await {
-            Ok(Some(session)) => session,
-            Ok(None) => return,
-            Err(err) => {
-                tracing::warn!(%guild_id, %err, "failed to load persisted session");
-                return;
-            }
+        let Some(session) = self.load_persisted_session(guild_id, &guild_id_str).await else {
+            return;
         };
 
-        let (already_racing, mut candidate) = {
-            let mut guilds = self.guilds.lock().await;
-            let state = guilds.entry(guild_id).or_default();
-            // Lost a race against a concurrent `join`/`enqueue` that landed
-            // between the check above and now — don't clobber real state
-            // with a stale restore. `now_playing.is_some()` alone is a
-            // sufficient guard: whenever a concurrent `enqueue`/
-            // `enqueue_many` has actually started something, it always sets
-            // `now_playing` synchronously (under this same lock) before
-            // doing anything else — there's no "queue non-empty but
-            // now_playing still None" state reachable via those paths.
-            if state.now_playing.is_some() {
-                (true, None)
-            } else {
-                state.radio_enabled = session.radio_enabled;
-                state.radio_requested_by = session
-                    .radio_requested_by
-                    .as_deref()
-                    .and_then(|id| id.parse().ok())
-                    .map(UserId::new);
-                state.radio_history = session.radio_history.into();
-                state.now_playing = session.now_playing.and_then(|(track, requested_by)| {
-                    requested_by.parse().ok().map(|id| QueuedTrack {
-                        track,
-                        requested_by: UserId::new(id),
-                    })
-                });
-                // Determined in this same critical section, not a separate
-                // re-lock afterward — releasing the lock between setting
-                // `now_playing` above and reading it back here would open a
-                // window for a concurrent `/play` to set its own
-                // `now_playing` and start its own track, only for this
-                // restore to then read (and start) that same track too,
-                // racing two songbird tracks for the guild.
-                if state.now_playing.is_none() {
-                    // Nothing was actively playing when this was persisted
-                    // (or its `requested_by` failed to parse) — but the DB
-                    // queue is the live upcoming-queue table regardless of
-                    // what got restored above, so pop its front as the
-                    // resumed `now_playing` if anything's there. Inlined
-                    // rather than calling `promote_next` (which re-acquires
-                    // this same lock and would deadlock here).
-                    let next = match db::queue_pop_front(&self.db, &guild_id_str).await {
-                        Ok(next) => next,
-                        Err(err) => {
-                            tracing::warn!(%guild_id, %err, "failed to pop the next queued track");
-                            None
-                        }
-                    };
-                    state.now_playing = next.clone();
-                }
-                (false, state.now_playing.clone())
-            }
-        };
-        if already_racing {
+        let Some(mut candidate) = self
+            .apply_restored_session(guild_id, &guild_id_str, session)
+            .await
+        else {
             return;
-        }
+        };
 
         // Mirrors `enqueue_many`'s start-and-retry loop: walk past restored
         // tracks that fail to start instead of stalling on the first one.
@@ -661,6 +602,83 @@ impl PlayerRegistry {
         }
 
         self.refresh_panel(guild_id).await;
+    }
+
+    async fn guild_state_exists(&self, guild_id: GuildId) -> bool {
+        let guilds = self.guilds.lock().await;
+        guilds.contains_key(&guild_id)
+    }
+
+    async fn load_persisted_session(
+        &self,
+        guild_id: GuildId,
+        guild_id_str: &str,
+    ) -> Option<db::PersistedSession> {
+        match db::load_guild_session(&self.db, guild_id_str).await {
+            Ok(Some(session)) => Some(session),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(%guild_id, %err, "failed to load persisted session");
+                None
+            }
+        }
+    }
+
+    // Lost a race against a concurrent `join`/`enqueue` that landed between
+    // `guild_state_exists` and now — don't clobber real state with a stale
+    // restore. `now_playing.is_some()` alone is a sufficient guard: whenever
+    // a concurrent `enqueue`/`enqueue_many` has actually started something,
+    // it always sets `now_playing` synchronously (under this same lock)
+    // before doing anything else — there's no "queue non-empty but
+    // now_playing still None" state reachable via those paths. Returns
+    // `None` when that race was lost, `Some(candidate)` otherwise, where
+    // `candidate` is determined in this same critical section, not a
+    // separate re-lock afterward — releasing the lock between setting
+    // `now_playing` and reading it back would open a window for a
+    // concurrent `/play` to set its own `now_playing` and start its own
+    // track, only for this restore to then read (and start) that same track
+    // too, racing two songbird tracks for the guild.
+    async fn apply_restored_session(
+        &self,
+        guild_id: GuildId,
+        guild_id_str: &str,
+        session: db::PersistedSession,
+    ) -> Option<Option<QueuedTrack>> {
+        let mut guilds = self.guilds.lock().await;
+        let state = guilds.entry(guild_id).or_default();
+        if state.now_playing.is_some() {
+            return None;
+        }
+        state.radio_enabled = session.radio_enabled;
+        state.radio_requested_by = session
+            .radio_requested_by
+            .as_deref()
+            .and_then(|id| id.parse().ok())
+            .map(UserId::new);
+        state.radio_history = session.radio_history.into();
+        state.now_playing = session.now_playing.and_then(|(track, requested_by)| {
+            requested_by.parse().ok().map(|id| QueuedTrack {
+                track,
+                requested_by: UserId::new(id),
+            })
+        });
+        if state.now_playing.is_none() {
+            // Nothing was actively playing when this was persisted (or its
+            // `requested_by` failed to parse) — but the DB queue is the live
+            // upcoming-queue table regardless of what got restored above, so
+            // pop its front as the resumed `now_playing` if anything's
+            // there. Inlined rather than calling `promote_next` (which
+            // re-acquires this same lock and would deadlock here).
+            let next = match db::queue_pop_front(&self.db, guild_id_str).await {
+                Ok(next) => next,
+                Err(err) => {
+                    tracing::warn!(%guild_id, %err, "failed to pop the next queued track");
+                    None
+                }
+            };
+            state.now_playing = next.clone();
+        }
+        Some(state.now_playing.clone())
     }
 
     /// Snapshots this guild's radio/now-playing state to the database, so a
@@ -1552,129 +1570,158 @@ impl PlayerRegistry {
     /// remains the safety net if the queue stays empty.
     fn maybe_spawn_radio_refill(&self, guild_id: GuildId) {
         let registry = self.clone();
-        tokio::spawn(async move {
-            let (enabled, history, requested_by, played, epoch) = {
-                let guilds = registry.guilds.lock().await;
-                let Some(state) = guilds.get(&guild_id) else {
-                    return;
-                };
-                if state.radio_exhausted {
-                    // Already established there's nothing left to pull from
-                    // this mix — don't re-run the whole yt-dlp listing plus
-                    // hydration on every queue drain just to find that out
-                    // again. Cleared by a radio toggle or a hand-queued track.
-                    return;
-                }
-                (
-                    state.radio_enabled,
-                    Vec::from(state.radio_history.clone()),
-                    state.radio_requested_by,
-                    state.radio_played.clone(),
-                    state.epoch,
-                )
-            };
-            let (true, Some(requested_by)) = (enabled, requested_by) else {
-                return;
-            };
-            let Some(seed) = pick_radio_seed(&history, &mut rand::rng()) else {
-                return;
-            };
+        tokio::spawn(async move { registry.run_radio_refill(guild_id).await });
+    }
 
-            let mix_ids =
-                match radio::list_mix_video_ids(seed, registry.cookies_file.as_deref()).await {
-                    Ok(ids) => ids,
-                    Err(err) => {
-                        tracing::warn!(%guild_id, %seed, %err, "radio refill: failed to list mix");
-                        return;
-                    }
-                };
+    async fn run_radio_refill(&self, guild_id: GuildId) {
+        let Some((history, requested_by, played, epoch)) =
+            self.radio_refill_snapshot(guild_id).await
+        else {
+            return;
+        };
+        let Some(seed) = pick_radio_seed(&history, &mut rand::rng()) else {
+            return;
+        };
 
-            // A wider pool than `RADIO_REFILL_BATCH` needs, then shuffled:
-            // taking a strict prefix would always follow YouTube's single
-            // "most related" ordering, so every refill off the same seed
-            // would pick the same tracks in the same order.
-            let mut candidates: Vec<&str> = mix_ids
-                .iter()
-                .map(String::as_str)
-                .filter(|id| {
-                    !history.iter().any(|played_id| played_id == id) && !played.contains(*id)
-                })
-                .take(10)
-                .collect();
-            if candidates.is_empty() {
-                tracing::warn!(
-                    %guild_id, %seed,
-                    "radio refill: mix exhausted, no unplayed candidates left"
-                );
-                let mut guilds = registry.guilds.lock().await;
-                if let Some(state) = guilds.get_mut(&guild_id)
-                    && state.epoch == epoch
-                {
-                    state.radio_exhausted = true;
-                }
+        let mix_ids = match radio::list_mix_video_ids(seed, self.cookies_file.as_deref()).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(%guild_id, %seed, %err, "radio refill: failed to list mix");
                 return;
             }
-            candidates.shuffle(&mut rand::rng());
-            candidates.truncate(RADIO_REFILL_BATCH);
+        };
 
-            let hydrated = match registry.youtube.hydrate_videos(&candidates).await {
-                Ok(tracks) => tracks,
-                Err(err) => {
-                    tracing::warn!(%guild_id, %err, "radio refill: failed to hydrate mix candidates");
-                    return;
-                }
-            };
-            if hydrated.is_empty() {
-                tracing::warn!(%guild_id, %seed, "radio refill: hydration returned no tracks");
+        let Some(candidates) = self
+            .radio_refill_candidates(guild_id, seed, epoch, &mix_ids, &history, &played)
+            .await
+        else {
+            return;
+        };
+
+        let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let hydrated = match self.youtube.hydrate_videos(&candidate_refs).await {
+            Ok(tracks) => tracks,
+            Err(err) => {
+                tracing::warn!(%guild_id, %err, "radio refill: failed to hydrate mix candidates");
                 return;
             }
+        };
+        if hydrated.is_empty() {
+            tracing::warn!(%guild_id, %seed, "radio refill: hydration returned no tracks");
+            return;
+        }
 
-            let pushed = {
-                let mut guilds = registry.guilds.lock().await;
-                // `state.epoch == epoch` rejects a refill that a `/stop`
-                // overtook while the (unbounded-latency) mix listing and
-                // hydration above were in flight: pushing now would
-                // resurrect a queue behind a stopped player, leaving an
-                // entry that either sits inert or gets quietly eaten by the
-                // idle disconnect `stop` already scheduled. The DB push
-                // below happens while still holding this same lock — the
-                // whole point of the epoch check is that nothing can
-                // invalidate this decision between checking it and
-                // committing, which is only true if the write lands inside
-                // the same critical section (see the `guilds` field's doc
-                // comment).
-                match guilds.get_mut(&guild_id) {
-                    Some(state) if state.radio_enabled && state.epoch == epoch => {
-                        let to_queue: Vec<QueuedTrack> = hydrated
-                            .into_iter()
-                            .map(|track| {
-                                state.radio_played.insert(track.video_id.clone());
-                                QueuedTrack {
-                                    track,
-                                    requested_by,
-                                }
-                            })
-                            .collect();
-                        let count = to_queue.len();
-                        match db::queue_push_many(&registry.db, &guild_id.to_string(), &to_queue)
-                            .await
-                        {
-                            Ok(()) => count,
-                            Err(err) => {
-                                tracing::warn!(%guild_id, %err, "radio refill: failed to persist refilled tracks");
-                                0
-                            }
+        let pushed = self
+            .push_radio_refill(guild_id, epoch, requested_by, hydrated)
+            .await;
+
+        if pushed > 0 {
+            self.refresh_panel(guild_id).await;
+            self.persist_session(guild_id).await;
+        }
+    }
+
+    async fn radio_refill_snapshot(
+        &self,
+        guild_id: GuildId,
+    ) -> Option<(Vec<String>, UserId, HashSet<String>, u64)> {
+        let guilds = self.guilds.lock().await;
+        let state = guilds.get(&guild_id)?;
+        if state.radio_exhausted {
+            // Already established there's nothing left to pull from this
+            // mix — don't re-run the whole yt-dlp listing plus hydration on
+            // every queue drain just to find that out again. Cleared by a
+            // radio toggle or a hand-queued track.
+            return None;
+        }
+        let (true, Some(requested_by)) = (state.radio_enabled, state.radio_requested_by) else {
+            return None;
+        };
+        Some((
+            Vec::from(state.radio_history.clone()),
+            requested_by,
+            state.radio_played.clone(),
+            state.epoch,
+        ))
+    }
+
+    // A wider pool than `RADIO_REFILL_BATCH` needs, then shuffled: taking a
+    // strict prefix would always follow YouTube's single "most related"
+    // ordering, so every refill off the same seed would pick the same
+    // tracks in the same order.
+    async fn radio_refill_candidates(
+        &self,
+        guild_id: GuildId,
+        seed: &str,
+        epoch: u64,
+        mix_ids: &[String],
+        history: &[String],
+        played: &HashSet<String>,
+    ) -> Option<Vec<String>> {
+        let mut candidates: Vec<String> = mix_ids
+            .iter()
+            .filter(|id| !history.iter().any(|played_id| played_id == *id) && !played.contains(*id))
+            .take(10)
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            tracing::warn!(
+                %guild_id, %seed,
+                "radio refill: mix exhausted, no unplayed candidates left"
+            );
+            let mut guilds = self.guilds.lock().await;
+            if let Some(state) = guilds.get_mut(&guild_id)
+                && state.epoch == epoch
+            {
+                state.radio_exhausted = true;
+            }
+            return None;
+        }
+        candidates.shuffle(&mut rand::rng());
+        candidates.truncate(RADIO_REFILL_BATCH);
+        Some(candidates)
+    }
+
+    // `state.epoch == epoch` rejects a refill that a `/stop` overtook while
+    // the (unbounded-latency) mix listing and hydration above were in
+    // flight: pushing now would resurrect a queue behind a stopped player,
+    // leaving an entry that either sits inert or gets quietly eaten by the
+    // idle disconnect `stop` already scheduled. The DB push below happens
+    // while still holding this same lock — the whole point of the epoch
+    // check is that nothing can invalidate this decision between checking
+    // it and committing, which is only true if the write lands inside the
+    // same critical section (see the `guilds` field's doc comment).
+    async fn push_radio_refill(
+        &self,
+        guild_id: GuildId,
+        epoch: u64,
+        requested_by: UserId,
+        hydrated: Vec<Track>,
+    ) -> usize {
+        let mut guilds = self.guilds.lock().await;
+        match guilds.get_mut(&guild_id) {
+            Some(state) if state.radio_enabled && state.epoch == epoch => {
+                let to_queue: Vec<QueuedTrack> = hydrated
+                    .into_iter()
+                    .map(|track| {
+                        state.radio_played.insert(track.video_id.clone());
+                        QueuedTrack {
+                            track,
+                            requested_by,
                         }
+                    })
+                    .collect();
+                let count = to_queue.len();
+                match db::queue_push_many(&self.db, &guild_id.to_string(), &to_queue).await {
+                    Ok(()) => count,
+                    Err(err) => {
+                        tracing::warn!(%guild_id, %err, "radio refill: failed to persist refilled tracks");
+                        0
                     }
-                    _ => 0,
                 }
-            };
-
-            if pushed > 0 {
-                registry.refresh_panel(guild_id).await;
-                registry.persist_session(guild_id).await;
             }
-        });
+            _ => 0,
+        }
     }
 
     pub async fn queue_snapshot(&self, guild_id: GuildId) -> QueueSnapshot {

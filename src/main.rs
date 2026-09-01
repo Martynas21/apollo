@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 mod commands;
 mod config;
 mod db;
@@ -14,38 +16,47 @@ use voice::ipc_backend::IpcBackend;
 #[tokio::main(worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    init_tracing();
 
     let config = config::Config::from_env()?;
-
     tracing::info!(
         discord_application_id = %config.discord_application_id,
         "apollo starting up"
     );
 
-    let intents = serenity::GatewayIntents::GUILDS | serenity::GatewayIntents::GUILD_VOICE_STATES;
-    let guild_id = config.discord_guild_id;
-
     // Built here (rather than left to `.register_songbird()`) so the same
     // `Arc<Songbird>` can back both the serenity client and `Data::player`.
     let songbird = songbird::Songbird::serenity();
-    // Independent of the gateway `Client` (built further down) so
-    // `PlayerRegistry` can use it to push `/player` panel edits from
-    // contexts that aren't already handling a Discord interaction, e.g. the
-    // track-end handler that drives auto-advance.
-    let discord_http = std::sync::Arc::new(serenity::Http::new(&config.discord_token));
-    let youtube_client = youtube::api::YouTubeClient::new(
-        config.yt_dlp_cookies_file.clone(),
-        config.playlist_track_limit,
-    );
+    let (db_pool, voice_backend) = connect_backends(&config, songbird.clone()).await?;
+    let data = build_data(&config, db_pool, voice_backend);
 
-    // Three independent startup checks/connections — run concurrently
-    // rather than one after another, since none needs another's result.
+    let framework = build_framework(config.discord_guild_id, data);
+
+    let intents = serenity::GatewayIntents::GUILDS | serenity::GatewayIntents::GUILD_VOICE_STATES;
+    let mut client = serenity::ClientBuilder::new(config.discord_token.clone(), intents)
+        .framework(framework)
+        .register_songbird_with(songbird)
+        .await?;
+
+    client.start().await?;
+
+    Ok(())
+}
+
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+}
+
+// Three independent startup checks/connections — run concurrently rather
+// than one after another, since none needs another's result.
+async fn connect_backends(
+    config: &config::Config,
+    songbird: std::sync::Arc<songbird::Songbird>,
+) -> anyhow::Result<(sqlx::SqlitePool, IpcBackend)> {
     let (_, db_pool, voice_backend) = tokio::try_join!(
         // Fail fast on a missing yt-dlp/ffmpeg rather than a confusing error
         // on someone's first `/play`.
@@ -55,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
             IpcBackend::connect(
                 &config.audio_worker_socket,
                 std::path::PathBuf::from(&config.audio_buffer_dir),
-                songbird.clone(),
+                songbird,
                 reqwest::Client::new(),
                 config.yt_dlp_cookies_file.clone(),
             )
@@ -63,6 +74,23 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to connect to apollo-audio-worker")
         },
     )?;
+    Ok((db_pool, voice_backend))
+}
+
+fn build_data(
+    config: &config::Config,
+    db_pool: sqlx::SqlitePool,
+    voice_backend: IpcBackend,
+) -> Data {
+    // Independent of the gateway `Client` (built further down in `main`) so
+    // `PlayerRegistry` can use it to push `/player` panel edits from
+    // contexts that aren't already handling a Discord interaction, e.g. the
+    // track-end handler that drives auto-advance.
+    let discord_http = std::sync::Arc::new(serenity::Http::new(&config.discord_token));
+    let youtube_client = youtube::api::YouTubeClient::new(
+        config.yt_dlp_cookies_file.clone(),
+        config.playlist_track_limit,
+    );
     let player = voice::PlayerRegistry::new(
         std::sync::Arc::new(voice_backend),
         discord_http,
@@ -71,13 +99,15 @@ async fn main() -> anyhow::Result<()> {
         youtube_client.clone(),
     );
 
-    let data = Data {
+    Data {
         youtube: youtube_client,
         player,
         db: db_pool,
-    };
+    }
+}
 
-    let framework = poise::Framework::builder()
+fn build_framework(guild_id: Option<u64>, data: Data) -> poise::Framework<Data, Error> {
+    poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: commands::commands(),
             event_handler: |ctx, event, _framework, data| Box::pin(event_handler(ctx, event, data)),
@@ -105,16 +135,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(data)
             })
         })
-        .build();
-
-    let mut client = serenity::ClientBuilder::new(config.discord_token, intents)
-        .framework(framework)
-        .register_songbird_with(songbird)
-        .await?;
-
-    client.start().await?;
-
-    Ok(())
+        .build()
 }
 
 async fn event_handler(
