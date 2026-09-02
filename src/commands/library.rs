@@ -1343,7 +1343,9 @@ pub async fn add_to_queue(
     join_and_enqueue(ctx, track).await
 }
 
-async fn present_search_results(
+/// Shared with `/play`'s free-text path (see `playback::play`), which shows
+/// this same picker instead of guessing a top result.
+pub(super) async fn present_search_results(
     ctx: Context<'_>,
     query: &str,
     results: &[Track],
@@ -1379,7 +1381,9 @@ async fn present_search_results(
 /// playlist. Falls back to [`YouTubeClient::search`] (exactly as before this
 /// existed) if the cache has no matches, or if the cache lookup itself
 /// fails — a cache read failing must never block search from working.
-async fn search_with_cache(
+///
+/// Shared with `/play`'s free-text path (see `playback::play`).
+pub(super) async fn search_with_cache(
     data: &Data,
     guild_id: serenity::GuildId,
     query: &str,

@@ -1,22 +1,19 @@
-//! Resolving a `YouTube` video ID into a fully-buffered audio file on disk,
-//! plus a pre-flight `yt-dlp` check for user-facing errors on common
-//! unplayable videos (age-restricted, region-locked, private/deleted).
+//! Resolving a `YouTube` video ID into a downloaded audio file on disk, plus
+//! a pre-flight `yt-dlp` check for user-facing errors on common unplayable
+//! videos (age-restricted, region-locked, private/deleted).
 //!
-//! Actual stream resolution/decoding is delegated to songbird's built-in
-//! [`songbird::input::YoutubeDl`] source, which shells out to `yt-dlp -j`
-//! itself and streams the resolved URL through symphonia — no separate
-//! `ffmpeg` subprocess needed here. The fully-decoded bytes are then written
-//! to a file under the shared buffer directory for `apollo-audio-worker` to
-//! play — the worker process has no yt-dlp/network access of its own, so
-//! every track must be fully resolved on this side first (see
-//! [`buffer_track_to_file`]).
+//! `yt-dlp` downloads the track's best audio-only stream straight to a file
+//! under the shared buffer directory (see [`buffer_track_to_file`]) — no
+//! decode happens in this process; the compressed bytes land on disk exactly
+//! as `yt-dlp` produces them, and `apollo-audio-worker` (which has no
+//! yt-dlp/network access of its own, so every track must be fully resolved
+//! on this side first) decodes them itself via songbird's format-probing
+//! `File` source when it actually plays the track.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use songbird::input::cached::Memory;
-use songbird::input::{Input, YoutubeDl};
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -36,6 +33,18 @@ const MAX_TRACK_DURATION: Duration = Duration::from_hours(14);
 /// Timeout for the `yt-dlp` preflight call, matching `YT_DLP_TIMEOUT` in
 /// `src/youtube/api.rs` for the same single-video lookup shape.
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounds the `yt-dlp` download subprocess in [`buffer_track_to_file`]. This
+/// step is network-bound (a direct compressed-stream download, no in-process
+/// decode), not CPU-decode-bound, so it doesn't need to scale with
+/// `MAX_TRACK_DURATION` — it exists to fail a stalled/throttled fetch fast
+/// with a user-visible error instead of leaving a deferred `/play`
+/// interaction "thinking..." forever.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(15);
+
+/// Audio-only format selection, matching what songbird's own `YoutubeDl`
+/// source used before this module took over downloading directly.
+const AUDIO_FORMAT_SELECTOR: &str = "ba[abr>0][vcodec=none]/best";
 
 #[derive(Debug)]
 pub enum PlaybackError {
@@ -171,43 +180,67 @@ pub async fn preflight_check(
     Err(classify_ytdlp_stderr(&stderr))
 }
 
-/// Builds a lazily-resolved songbird input for a `YouTube` video ID, for
-/// [`buffer_track_to_file`] to fully drain into memory. The actual `yt-dlp`
-/// invocation and stream resolution happens once something starts reading
-/// from this (songbird's `YoutubeDl` source is lazy by design) — never
-/// exposed on its own, since nothing plays a lazy `Input` directly anymore
-/// (see the module doc comment).
-///
-/// `cookies_file`, if set, is forwarded to `yt-dlp` via
-/// [`YoutubeDl::user_args`] — see `Config::yt_dlp_cookies_file`.
-fn track_input(http: reqwest::Client, video_id: &str, cookies_file: Option<&str>) -> Input {
-    let url = format!("https://www.youtube.com/watch?v={video_id}");
-    let mut ytdl = YoutubeDl::new(http, url);
-    if let Some(cookies_file) = cookies_file {
-        ytdl = ytdl.user_args(vec!["--cookies".to_string(), cookies_file.to_string()]);
-    }
-    ytdl.into()
-}
-
-/// Fully resolves and downloads a track, writing the decoded bytes to a
-/// fresh file under `buffer_dir` and returning its path. This is what makes
-/// playback immune to network blips — the whole track is in hand before
-/// `apollo-audio-worker` ever starts playing it, rather than reading live off
-/// the network — and, since the worker process has no `yt-dlp`/network
-/// access of its own, it's also the only way a track ever gets to it at all.
-///
-/// `duration` gates this outright: `None` (livestreams — already rejected
-/// upstream in `youtube/api.rs`, so this shouldn't happen in practice) or
-/// anything past [`MAX_TRACK_DURATION`] is refused rather than attempted,
-/// since there's no cheaper fallback left to attempt it with.
 /// Truncates and wraps any displayable error as [`PlaybackError::Other`] —
 /// the common shape every fallible step in [`buffer_track_to_file`] maps to.
 fn other_err(e: impl std::fmt::Display) -> PlaybackError {
     PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN))
 }
 
+/// Best-effort cleanup of whatever `yt-dlp`/`ffmpeg` left behind under
+/// `stem` on a failed/timed-out download — `buffer_dir` is a size-unbounded
+/// tmpfs mount (see `compose.yaml`), so leaked partial files accumulate in
+/// RAM over time. `stem` is a fresh UUID per call (see
+/// [`buffer_track_to_file`]), so every file it prefixes belongs to this
+/// attempt alone — safe to sweep without matching an exact name, which
+/// varies across the download's `.part` file and the post-remux output.
+async fn cleanup_stem(buffer_dir: &Path, stem: &str) {
+    let Ok(mut entries) = tokio::fs::read_dir(buffer_dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name().to_string_lossy().starts_with(stem) {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
+/// Finds the file `buffer_track_to_file`'s `yt-dlp` invocation produced for
+/// `stem` — its extension isn't known ahead of time (it's whatever
+/// `--audio-format best` decides the source codec's native container is,
+/// e.g. `.opus`), so this scans for it by prefix instead of predicting it.
+async fn find_output_file(buffer_dir: &Path, stem: &str) -> Option<PathBuf> {
+    let prefix = format!("{stem}.");
+    let mut entries = tokio::fs::read_dir(buffer_dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// Downloads a track's best audio-only stream to a fresh file under
+/// `buffer_dir` and returns its path. This is what makes playback immune to
+/// network blips — the whole track is in hand before `apollo-audio-worker`
+/// ever starts playing it, rather than reading live off the network — and,
+/// since the worker process has no `yt-dlp`/network access of its own, it's
+/// also the only way a track ever gets to it at all.
+///
+/// `duration` gates this outright: `None` (livestreams — already rejected
+/// upstream in `youtube/api.rs`, so this shouldn't happen in practice) or
+/// anything past [`MAX_TRACK_DURATION`] is refused rather than attempted,
+/// since there's no cheaper fallback left to attempt it with.
+///
+/// `-x --audio-format best` forces the download through an `ffmpeg` remux
+/// pass (no re-encode — `best` keeps the source codec) rather than handing
+/// `apollo-audio-worker` yt-dlp's raw download directly: a long-running
+/// video (an archived livestream especially) commonly comes down as several
+/// concatenated stream fragments, which `ffmpeg`'s demuxer tolerates but
+/// songbird's `symphonia` one doesn't — it silently stops decoding at the
+/// first fragment boundary instead of erroring, which reads as the track
+/// ending seconds after it started. The remux rebuilds it as one clean
+/// container first.
 pub async fn buffer_track_to_file(
-    http: reqwest::Client,
     video_id: &str,
     duration: Option<Duration>,
     cookies_file: Option<&str>,
@@ -217,26 +250,47 @@ pub async fn buffer_track_to_file(
         return Err(PlaybackError::TooLong);
     }
 
-    let lazy = track_input(http, video_id, cookies_file);
-    let memory = Memory::new(lazy).await.map_err(other_err)?;
+    let url = format!("https://www.youtube.com/watch?v={video_id}");
+    let stem = Uuid::new_v4().to_string();
+    let output_template = buffer_dir.join(format!("{stem}.%(ext)s"));
 
-    let path = buffer_dir.join(format!("{}.audio", Uuid::new_v4()));
-    let write_path = path.clone();
-    // `Memory`/`Catcher` only fills lazily as a consumer reads through it —
-    // copying it straight into the destination file both forces that fill
-    // and writes it out, without ever holding the whole track in memory a
-    // second time as a `Vec<u8>`.
-    tokio::task::spawn_blocking(move || {
-        let mut reader = memory.new_handle();
-        let mut file = std::fs::File::create(&write_path)?;
-        std::io::copy(&mut reader, &mut file)?;
-        std::io::Result::Ok(())
+    let mut command = Command::new("yt-dlp");
+    command.kill_on_drop(true);
+    command.args([
+        "-f",
+        AUDIO_FORMAT_SELECTOR,
+        "--no-playlist",
+        "-x",
+        "--audio-format",
+        "best",
+        "-o",
+    ]);
+    command.arg(&output_template);
+    if let Some(cookies_file) = cookies_file {
+        command.args(["--cookies", cookies_file]);
+    }
+    command.arg(&url);
+
+    let output = match tokio::time::timeout(DOWNLOAD_TIMEOUT, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) if e.kind() == ErrorKind::NotFound => return Err(PlaybackError::YtDlpMissing),
+        Ok(Err(e)) => return Err(other_err(e)),
+        Err(_elapsed) => {
+            cleanup_stem(buffer_dir, &stem).await;
+            return Err(PlaybackError::Timeout);
+        }
+    };
+
+    if !output.status.success() {
+        cleanup_stem(buffer_dir, &stem).await;
+        return Err(classify_ytdlp_stderr(&String::from_utf8_lossy(
+            &output.stderr,
+        )));
+    }
+
+    find_output_file(buffer_dir, &stem).await.ok_or_else(|| {
+        PlaybackError::Other("yt-dlp reported success but produced no output file".to_string())
     })
-    .await
-    .map_err(other_err)?
-    .map_err(other_err)?;
-
-    Ok(path)
 }
 
 #[cfg(test)]

@@ -502,34 +502,13 @@ async fn join_for_play(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result<
     }
 }
 
-/// Resolves `query`/`video_id` (as already parsed by [`play`]) to the single
-/// track to queue: the looked-up video if `video_id` is `Some`, otherwise
-/// the top search result. `Ok(None)` if resolution failed and an error reply
-/// was already sent.
-///
-/// `/play` with free text takes only the top hit for convenience — unlike
-/// `/add_to_queue`, which shows an interactive multi-result picker.
-async fn resolve_track(
-    ctx: Context<'_>,
-    query: &str,
-    video_id: Option<String>,
-) -> Result<Option<Track>, Error> {
-    if let Some(video_id) = video_id {
-        return match ctx.data().youtube.get_video(&video_id).await {
-            Ok(track) => Ok(Some(track)),
-            Err(err) => {
-                reply_error(ctx, err.to_string()).await?;
-                Ok(None)
-            }
-        };
-    }
-
-    match ctx.data().youtube.search(query).await {
-        Ok(results) if results.is_empty() => {
-            reply_error(ctx, format!("no results found for '{query}'")).await?;
-            Ok(None)
-        }
-        Ok(mut results) => Ok(Some(results.remove(0))),
+/// Looks up a single video by id (as already parsed by [`play`] from a
+/// direct URL/video-id query — no ambiguity to resolve, so no picker needed
+/// here). `Ok(None)` if the lookup failed and an error reply was already
+/// sent.
+async fn resolve_track(ctx: Context<'_>, video_id: &str) -> Result<Option<Track>, Error> {
+    match ctx.data().youtube.get_video(video_id).await {
+        Ok(track) => Ok(Some(track)),
         Err(err) => {
             reply_error(ctx, err.to_string()).await?;
             Ok(None)
@@ -537,11 +516,13 @@ async fn resolve_track(
     }
 }
 
-/// Plays a video/playlist link, or searches and queues the top result.
+/// Plays a video/playlist link directly, or shows a picker for free text.
 ///
 /// Given a `YouTube` video URL or video ID, plays that video. Given a
 /// playlist link, queues every track in it, in order. Given free text,
-/// searches and queues the top result.
+/// searches and shows the same picker `/add_to_queue` does — reusing it
+/// rather than guessing a top result, since a guess is often not what was
+/// meant and there was previously no way to pick a different one.
 #[poise::command(slash_command, guild_only)]
 pub async fn play(
     ctx: Context<'_>,
@@ -549,23 +530,35 @@ pub async fn play(
 ) -> Result<(), Error> {
     let guild_id = require_guild_id(ctx)?;
 
-    // The video/playlist lookup below and `join`'s voice-gateway handshake
-    // can both easily exceed Discord's 3-second ack deadline (cold-start
-    // yt-dlp, a slow guild join) — deferred here, before either, so a slow
-    // response doesn't drop the interaction. `/play`'s success reply is
-    // public, so a matching (non-ephemeral) defer.
-    ctx.defer().await?;
-
     let video_id = extract_video_id(&query);
     if video_id.is_none() && looks_like_playlist_url(&query) {
+        ctx.defer().await?;
         return play_playlist(ctx, &query).await;
     }
+
+    let Some(video_id) = video_id else {
+        // Deferred ephemeral to match `/add_to_queue`'s own browsing entry
+        // point, which this delegates to directly.
+        ctx.defer_ephemeral().await?;
+        let results = match library::search_with_cache(ctx.data(), guild_id, &query).await {
+            Ok(results) => results,
+            Err(err) => return reply_error(ctx, format!("Search failed: {err}")).await,
+        };
+        return library::present_search_results(ctx, &query, &results).await;
+    };
+
+    // The video lookup below and `join`'s voice-gateway handshake can both
+    // easily exceed Discord's 3-second ack deadline (cold-start yt-dlp, a
+    // slow guild join) — deferred here, before either, so a slow response
+    // doesn't drop the interaction. `/play`'s success reply is public, so a
+    // matching (non-ephemeral) defer.
+    ctx.defer().await?;
 
     if let Err(err) = join_for_play(ctx, guild_id).await {
         return reply_error(ctx, err.to_string()).await;
     }
 
-    let Some(track) = resolve_track(ctx, &query, video_id).await? else {
+    let Some(track) = resolve_track(ctx, &video_id).await? else {
         return Ok(());
     };
 
@@ -574,10 +567,36 @@ pub async fn play(
         requested_by: ctx.author().id,
     };
 
-    match ctx.data().player.enqueue(guild_id, queued).await {
-        Ok(()) => reply_public(ctx, format!("Queued: {}", format_track(&track))).await,
-        Err(err) => reply_error(ctx, err.to_string()).await,
+    // `enqueue` can take real time before it returns — a long track has to
+    // fully download before it's playable (see `voice::resolve`) — during
+    // which "thinking..." looks identical to a hang. This gives it a
+    // visible status, then edits the same message into the final result
+    // rather than leaving it behind alongside a second reply.
+    let handle = ctx
+        .send(
+            poise::CreateReply::default()
+                .content(format!("Fetching: {}...", format_track(&track)))
+                .allowed_mentions(serenity::CreateAllowedMentions::new()),
+        )
+        .await?;
+
+    let result = ctx.data().player.enqueue(guild_id, queued).await;
+    let content = match &result {
+        Ok(()) => format!("Queued: {}", format_track(&track)),
+        Err(err) => err.to_string(),
+    };
+    handle
+        .edit(
+            ctx,
+            poise::CreateReply::default()
+                .content(content)
+                .allowed_mentions(serenity::CreateAllowedMentions::new()),
+        )
+        .await?;
+    if result.is_ok() {
+        schedule_cleanup(ctx, handle).await;
     }
+    Ok(())
 }
 
 /// Shows the current queue.

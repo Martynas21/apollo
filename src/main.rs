@@ -67,7 +67,6 @@ async fn connect_backends(
                 &config.audio_worker_socket,
                 std::path::PathBuf::from(&config.audio_buffer_dir),
                 songbird,
-                reqwest::Client::new(),
                 config.yt_dlp_cookies_file.clone(),
             )
             .await

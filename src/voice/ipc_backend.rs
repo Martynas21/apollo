@@ -306,7 +306,6 @@ fn lookup(connection: &Connection, guild_id: u64) -> Option<Arc<dyn VoiceEvents>
 
 pub struct IpcBackend {
     songbird: Arc<Songbird>,
-    http: reqwest::Client,
     cookies_file: Option<String>,
     buffer_dir: PathBuf,
     connection: Arc<Connection>,
@@ -320,7 +319,6 @@ impl IpcBackend {
         socket_path: &str,
         buffer_dir: PathBuf,
         songbird: Arc<Songbird>,
-        http: reqwest::Client,
         cookies_file: Option<String>,
     ) -> std::io::Result<Self> {
         let stream = UnixStream::connect(socket_path).await?;
@@ -337,7 +335,6 @@ impl IpcBackend {
         tokio::spawn(run_reader(read_half, connection.clone(), 0));
         Ok(Self {
             songbird,
-            http,
             cookies_file,
             buffer_dir,
             connection,
@@ -437,7 +434,6 @@ impl VoiceBackend for IpcBackend {
 
     async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError> {
         let path = resolve::buffer_track_to_file(
-            self.http.clone(),
             &track.video_id,
             track.duration,
             self.cookies_file.as_deref(),

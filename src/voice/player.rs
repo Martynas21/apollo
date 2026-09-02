@@ -873,7 +873,13 @@ impl PlayerRegistry {
             (call, should_start)
         };
 
-        if should_start && let Err(err) = self.start_playback(guild_id, call, queued, None).await {
+        let result = if should_start {
+            self.start_playback(guild_id, call, queued, None).await
+        } else {
+            Ok(())
+        };
+
+        if should_start && result.is_err() {
             // `state.now_playing` was set speculatively above, before the
             // resolve/play attempt above was known to succeed. Roll it back
             // on failure — otherwise it's left pointing at a track with no
@@ -885,12 +891,17 @@ impl PlayerRegistry {
             if let Some(state) = guilds.get_mut(&guild_id) {
                 state.now_playing = None;
             }
-            return Err(err);
         }
 
+        // Unconditional, including on failure: `queue_snapshot` only
+        // surfaces `now_playing` once `current_track_id` confirms it, so a
+        // failed/still-resolving attempt won't show up here — but the panel
+        // still needs telling either way, or it's left showing whatever was
+        // true before this call (stale on failure, or missing the promotion
+        // that just happened on success).
         self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
-        Ok(())
+        result
     }
 
     /// Enqueues many tracks at once — for `/play`'s playlist branch, queuing
@@ -1726,7 +1737,18 @@ impl PlayerRegistry {
 
     pub async fn queue_snapshot(&self, guild_id: GuildId) -> QueueSnapshot {
         let guilds = self.guilds.lock().await;
-        let now_playing = guilds.get(&guild_id).and_then(|s| s.now_playing.clone());
+        // `now_playing` is claimed speculatively (see `enqueue`/`enqueue_many`
+        // /`advance`/`restore_session_if_new`) before the resolve/download/
+        // play attempt behind it is known to succeed. Surfacing it here
+        // before `current_track_id` confirms a track is actually playing
+        // would show a panel/`/queue` for a track no audio has played from
+        // yet — including one stuck mid-download that never starts at all.
+        let now_playing = guilds.get(&guild_id).and_then(|s| {
+            s.current_track_id
+                .is_some()
+                .then(|| s.now_playing.clone())
+                .flatten()
+        });
         let upcoming = db::queue_all(&self.db, &guild_id.to_string())
             .await
             .unwrap_or_else(|err| {
