@@ -24,6 +24,15 @@ const RADIO_HISTORY_CAP: usize = 5;
 
 const RADIO_REFILL_BATCH: usize = 3;
 
+fn discard_prefetch(prefetch: Prefetch) {
+    prefetch.abort();
+    tokio::spawn(async move {
+        if let Ok(Ok(source)) = prefetch.await {
+            let _ = tokio::fs::remove_file(&source.path).await;
+        }
+    });
+}
+
 fn volume_multiplier(volume: u8) -> f32 {
     f32::from(volume.min(MAX_VOLUME)) / 100.0
 }
@@ -451,7 +460,7 @@ impl PlayerRegistry {
     ) -> Option<(ChannelId, MessageId)> {
         let mut removed = guilds.remove(&guild_id);
         if let Some(prefetch) = removed.as_mut().and_then(|state| state.prefetch.take()) {
-            prefetch.abort();
+            discard_prefetch(prefetch);
         }
         removed.and_then(|state| state.panel)
     }
@@ -765,7 +774,7 @@ impl PlayerRegistry {
             state.current_track_id = None;
             state.epoch = state.epoch.wrapping_add(1);
             if let Some(prefetch) = state.prefetch.take() {
-                prefetch.abort();
+                discard_prefetch(prefetch);
             }
             let handle = state.current_handle.take();
             if let Err(err) = db::queue_clear(&self.db, &guild_id.to_string()).await {
@@ -880,7 +889,7 @@ impl PlayerRegistry {
             match guilds.get_mut(&guild_id) {
                 Some(state) => {
                     if let Some(prefetch) = state.prefetch.take() {
-                        prefetch.abort();
+                        discard_prefetch(prefetch);
                     }
                     state.radio_enabled
                 }
@@ -936,7 +945,7 @@ impl PlayerRegistry {
 
     fn restart_prefetch(&self, state: &mut GuildState, next: Option<QueuedTrack>) {
         if let Some(old) = state.prefetch.take() {
-            old.abort();
+            discard_prefetch(old);
         }
         if let Some(next) = next {
             let registry = self.clone();
