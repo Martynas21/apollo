@@ -24,8 +24,6 @@ async fn main() -> anyhow::Result<()> {
         "apollo starting up"
     );
 
-    // Built here (rather than left to `.register_songbird()`) so the same
-    // `Arc<Songbird>` can back both the serenity client and `Data::player`.
     let songbird = songbird::Songbird::serenity();
     let (db_pool, voice_backend) = connect_backends(&config, songbird.clone()).await?;
     let data = build_data(&config, db_pool, voice_backend);
@@ -51,15 +49,11 @@ fn init_tracing() {
         .init();
 }
 
-// Three independent startup checks/connections — run concurrently rather
-// than one after another, since none needs another's result.
 async fn connect_backends(
     config: &config::Config,
     songbird: std::sync::Arc<songbird::Songbird>,
 ) -> anyhow::Result<(sqlx::SqlitePool, IpcBackend)> {
     let (_, db_pool, voice_backend) = tokio::try_join!(
-        // Fail fast on a missing yt-dlp/ffmpeg rather than a confusing error
-        // on someone's first `/play`.
         voice::check_playback_dependencies(),
         db::connect(&config.database_url),
         async {
@@ -81,10 +75,6 @@ fn build_data(
     db_pool: sqlx::SqlitePool,
     voice_backend: IpcBackend,
 ) -> Data {
-    // Independent of the gateway `Client` (built further down in `main`) so
-    // `PlayerRegistry` can use it to push `/player` panel edits from
-    // contexts that aren't already handling a Discord interaction, e.g. the
-    // track-end handler that drives auto-advance.
     let discord_http = std::sync::Arc::new(serenity::Http::new(&config.discord_token));
     let youtube_client = youtube::api::YouTubeClient::new(
         config.yt_dlp_cookies_file.clone(),
@@ -114,9 +104,6 @@ fn build_framework(guild_id: Option<u64>, data: Data) -> poise::Framework<Data, 
         })
         .setup(move |ctx, _ready, framework| {
             Box::pin(async move {
-                // Guild-scoped registration propagates near-instantly, which
-                // is what you want while iterating locally; global
-                // registration can take up to an hour to show up everywhere.
                 match guild_id {
                     Some(id) => {
                         poise::builtins::register_in_guild(

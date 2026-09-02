@@ -1,16 +1,8 @@
-//! Length-prefixed framing for [`crate::proto::Envelope`]: a big-endian
-//! `u32` byte length followed by a `bincode`-encoded envelope. Small, fixed
-//! control messages only — the audio payload itself never crosses this
-//! channel (see the shared buffer volume apollo/audio-worker use instead).
-
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proto::Envelope;
 
-/// Sanity bound on a single frame's encoded size — control envelopes are a
-/// handful of fields; anything near this is a corrupt length prefix, not a
-/// legitimate message.
-const MAX_FRAME_LEN: u32 = 1 << 20; // 1 MiB
+const MAX_FRAME_LEN: u32 = 1 << 20;
 
 #[derive(Debug)]
 pub enum FramingError {
@@ -47,8 +39,6 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     if len > MAX_FRAME_LEN {
         return Err(FramingError::FrameTooLarge(len));
     }
-    // One combined buffer/write rather than two separate `write_all` calls
-    // (and thus syscalls) for the length prefix and body.
     let mut frame = Vec::with_capacity(4 + body.len());
     frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(&body);
@@ -57,8 +47,6 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Reads one frame. `Ok(None)` on a clean EOF at a frame boundary (the
-/// remote closed the connection between frames, not mid-frame).
 pub async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<Envelope>, FramingError> {
@@ -132,7 +120,7 @@ mod tests {
         let mut buf = Vec::new();
         let envelope = Envelope::Event(Event::ConnectionLost { guild_id: 1 });
         write_frame(&mut buf, &envelope).await.unwrap();
-        buf.truncate(buf.len() - 1); // chop the last byte of the payload
+        buf.truncate(buf.len() - 1);
         let mut cursor = std::io::Cursor::new(buf);
         assert!(read_frame(&mut cursor).await.is_err());
     }

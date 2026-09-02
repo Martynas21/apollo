@@ -1,14 +1,3 @@
-//! `/add_to_queue`: searching `YouTube` and queuing tracks
-//! from a search result or a playlist URL/ID.
-//!
-//! `/add_to_queue` pairs its numbered text with a select-menu picker, so the
-//! common path is one click rather than noting a number and re-running a
-//! command with it. The numbered form still works too, for anyone who'd
-//! rather type it directly. A picker click never needs cross-invocation
-//! state — its value is a stable video id, cheap to re-look-up when
-//! clicked, rather than a "last results" cache keyed per-user that would
-//! need its own expiry/cleanup.
-
 use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
@@ -19,19 +8,12 @@ use crate::voice::QueuedTrack;
 use crate::voice::panel::{format_duration, truncate_label};
 use crate::youtube::api::{PlaylistListing, Track, YouTubeApiError};
 
-/// Max results shown by `/add_to_queue` when browsing (no `number` given).
 const ADD_TO_QUEUE_DISPLAY_LIMIT: usize = 5;
 
-/// Discord select menus cap out at 25 options.
 const PLAYLIST_SELECT_LIMIT: usize = 25;
 
-/// How long the Playlists picker's Import button waits for its URL modal to
-/// be submitted before giving up — matches `playback::SEARCH_MODAL_TIMEOUT`.
 const PLAYLIST_IMPORT_MODAL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Formats one line of a numbered track listing: `N. Title — Channel (mm:ss)`
-/// (or `h:mm:ss` past an hour), omitting the duration parens entirely when
-/// unknown.
 fn format_track_line(index: usize, track: &Track) -> String {
     match track.duration {
         Some(duration) => format!(
@@ -44,8 +26,6 @@ fn format_track_line(index: usize, track: &Track) -> String {
     }
 }
 
-/// Renders a numbered, length-capped track listing with a trailing
-/// truncation note if there were more results than `limit`.
 fn format_track_list(tracks: &[Track], limit: usize) -> String {
     let mut lines: Vec<String> = tracks
         .iter()
@@ -61,12 +41,6 @@ fn format_track_list(tracks: &[Track], limit: usize) -> String {
     lines.join("\n")
 }
 
-/// Builds a `library:queue` select menu offering up to `limit` (and never
-/// more than Discord's 25-option cap) of `tracks`, so a result can be
-/// queued with one click instead of noting its number and re-running the
-/// command with it. The clicked option's value is the track's video id —
-/// enough on its own for [`handle_component`] to re-look-up and queue it,
-/// with no per-invocation "last results" state to keep around.
 fn track_select_menu(tracks: &[Track], limit: usize) -> serenity::CreateActionRow {
     let options = tracks
         .iter()
@@ -88,9 +62,6 @@ fn track_select_menu(tracks: &[Track], limit: usize) -> serenity::CreateActionRo
     )
 }
 
-/// The voice channel `user_id` is currently in, if any — the
-/// component-interaction counterpart to [`author_voice_channel`], which
-/// needs a `poise::Context` this handler doesn't have.
 fn voice_channel_of(
     ctx: &serenity::Context,
     guild_id: serenity::GuildId,
@@ -104,14 +75,6 @@ fn voice_channel_of(
     })
 }
 
-/// Deletes `handle`'s ephemeral picker message (search results + a
-/// [`track_select_menu`]) after [`super::playback::REPLY_CLEANUP_DELAY`],
-/// best-effort. `/add_to_queue`'s browsing reply always lands as a followup
-/// (it's already `defer_ephemeral`'d by the time it's sent), so cleanup goes
-/// through the interaction's followup-delete endpoint rather than a plain
-/// channel-level message delete, which fails for ephemeral messages — see
-/// `playback::schedule_cleanup` for the public-reply counterpart, which can
-/// use the simpler path.
 async fn schedule_picker_cleanup(ctx: Context<'_>, handle: poise::ReplyHandle<'_>) {
     let Context::Application(app_ctx) = ctx else {
         return;
@@ -128,11 +91,6 @@ async fn schedule_picker_cleanup(ctx: Context<'_>, handle: poise::ReplyHandle<'_
     });
 }
 
-/// Deletes `modal`'s picker message after
-/// [`super::playback::REPLY_CLEANUP_DELAY`], best-effort. Unlike
-/// [`schedule_picker_cleanup`], [`handle_search_modal_submit`] always edits
-/// the original deferred response rather than sending a followup, so cleanup
-/// goes through `delete_response` instead.
 fn schedule_modal_picker_cleanup(ctx: &serenity::Context, modal: &serenity::ModalInteraction) {
     let modal = modal.clone();
     let http = ctx.http.clone();
@@ -142,12 +100,6 @@ fn schedule_modal_picker_cleanup(ctx: &serenity::Context, modal: &serenity::Moda
     });
 }
 
-/// Edits the picker message in place with a plain-text result and drops
-/// its select menu — used for both the success confirmation and any error
-/// along the way, since the picker is single-use per click either way.
-///
-/// Edits (not a fresh [`CreateInteractionResponse`]) because every caller
-/// has already deferred via [`handle_component`] — see its comment for why.
 async fn update_picker(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -164,25 +116,6 @@ async fn update_picker(
     Ok(())
 }
 
-/// Routes a `library:*` component interaction to its handler:
-/// `library:queue` (queue one search result), `library:playlist_select`
-/// (open a saved playlist's detail view), `library:playlist_play:<id>`
-/// (queue it), `library:playlist_refresh:<id>` (re-pull it from `YouTube`),
-/// `library:playlist_remove:<id>` (show a remove confirmation),
-/// `library:playlist_remove_confirm:<id>` (actually remove it),
-/// `library:playlist_view:<id>` (back out of the remove confirmation to the
-/// detail view), `library:playlist_back` (return to the saved-playlists
-/// list), or `library:playlist_import` (open the import URL modal). Any
-/// other custom id is ignored.
-///
-/// Every id but `playlist_import` defers immediately (before the `YouTube`
-/// lookup, voice join, or track resolution) rather than letting the handler
-/// send its own first response: Discord invalidates a component interaction
-/// if nothing acknowledges it within 3 seconds, and those steps routinely
-/// take longer than that — deferring buys the standard 15-minute follow-up
-/// window instead, which the handler then fulfils with an edit.
-/// `playlist_import` can't defer first — its first response has to be the
-/// modal itself.
 pub async fn handle_component(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -230,10 +163,6 @@ pub async fn handle_component(
     Ok(())
 }
 
-/// Handles a `library:queue` select-menu click from [`track_select_menu`]:
-/// re-looks-up the chosen video (the picker only carries a video id, not
-/// full track data) and queues it for the clicking user, auto-joining
-/// their voice channel first if the bot isn't already connected.
 async fn handle_queue_track(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -286,12 +215,6 @@ async fn handle_queue_track(
     }
 }
 
-/// Looks up one of a guild's saved playlists by the raw id string carried in
-/// a component's value/custom-id suffix (a select-menu option value for
-/// [`handle_playlist_select`], or the `<id>` embedded in a
-/// `library:playlist_play:<id>`/`library:playlist_refresh:<id>` custom id).
-/// A user-displayable error message on any failure — bad id, no such
-/// playlist (deleted or wrong guild), or a database error.
 async fn load_owned_playlist(
     data: &Data,
     guild_id: serenity::GuildId,
@@ -308,10 +231,6 @@ async fn load_owned_playlist(
     }
 }
 
-/// Re-pulls a saved playlist's tracks from `YouTube` and overwrites its
-/// cache — the shared core of both the panel's per-playlist Refresh button
-/// and the self-heal fetch [`show_playlist_details`] does for a legacy,
-/// never-cached row. A user-displayable error message on failure.
 async fn fetch_and_cache_playlist_tracks(
     data: &Data,
     playlist: &SavedPlaylist,
@@ -329,9 +248,6 @@ async fn fetch_and_cache_playlist_tracks(
     Ok(listing.tracks)
 }
 
-/// Formats a playlist's `cached_at` (unix seconds) as a short relative note
-/// for the detail view — `"just now"`, `"5m ago"`, `"3h ago"`, `"2d ago"` —
-/// or `"never"` if it's never been cached.
 fn format_relative_time(cached_at: Option<i64>) -> String {
     let Some(cached_at) = cached_at else {
         return "never".to_string();
@@ -352,10 +268,6 @@ fn format_relative_time(cached_at: Option<i64>) -> String {
     }
 }
 
-/// Renders a saved playlist's detail view: name, cached track count and
-/// freshness, and Play/Refresh/Back/Remove buttons — shown after picking one
-/// from [`playlist_select_menu`], after a Refresh, and right after
-/// importing.
 fn render_playlist_details(
     playlist: &SavedPlaylist,
     track_count: usize,
@@ -377,10 +289,6 @@ fn render_playlist_details(
         serenity::CreateButton::new("library:playlist_back")
             .label("⬅ Back")
             .style(serenity::ButtonStyle::Secondary),
-        // Last and styled `Danger` so it reads as distinct/deliberate from
-        // the other three — and still gated behind its own confirmation
-        // screen (`render_playlist_remove_confirm`) rather than deleting on
-        // a single misclick.
         serenity::CreateButton::new(format!("library:playlist_remove:{}", playlist.id))
             .label("🗑 Remove")
             .style(serenity::ButtonStyle::Danger),
@@ -389,10 +297,6 @@ fn render_playlist_details(
     (content, vec![buttons])
 }
 
-/// Renders the confirmation screen for removing a saved playlist — shown by
-/// [`handle_playlist_remove_button`] before [`handle_playlist_remove_confirm_button`]
-/// actually deletes anything, so a misclick on the detail view's Remove
-/// button can't destroy a saved playlist outright.
 fn render_playlist_remove_confirm(
     playlist: &SavedPlaylist,
 ) -> (String, Vec<serenity::CreateActionRow>) {
@@ -413,10 +317,6 @@ fn render_playlist_remove_confirm(
     (content, vec![buttons])
 }
 
-/// Edits the picker in place to `playlist`'s detail view. Self-heals a
-/// never-cached row (`cached_at` is `None` — a playlist saved before track
-/// caching existed) by fetching it live first, rather than showing an empty,
-/// confusing screen the user would have to know to hit Refresh on.
 async fn show_playlist_details(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -430,8 +330,6 @@ async fn show_playlist_details(
         return update_picker(ctx, component, message).await;
     }
 
-    // Re-read rather than reusing `playlist`: the fetch above (if it ran)
-    // stamped a fresh `cached_at` this copy doesn't know about.
     let playlist = match crate::db::get_guild_playlist(&data.db, &guild_id.to_string(), playlist.id)
         .await
     {
@@ -460,8 +358,6 @@ async fn show_playlist_details(
     Ok(())
 }
 
-/// Handles a `library:playlist_select` select-menu click from
-/// [`playlist_select_menu`]: opens the chosen saved playlist's detail view.
 async fn handle_playlist_select(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -481,10 +377,6 @@ async fn handle_playlist_select(
     }
 }
 
-/// Handles a detail view's `library:playlist_refresh:<id>` button: force
-/// re-pulls the playlist from `YouTube` (unlike [`show_playlist_details`]'s
-/// self-heal, this always re-fetches, even if already cached), then
-/// re-renders the detail view with the updated count and freshness.
 async fn handle_playlist_refresh_button(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -507,11 +399,6 @@ async fn handle_playlist_refresh_button(
     show_playlist_details(ctx, component, data, guild_id, playlist).await
 }
 
-/// Handles a detail view's `library:playlist_play:<id>` button: queues the
-/// playlist's cached tracks in order for the clicking user, auto-joining
-/// their voice channel first if the bot isn't already connected. Falls back
-/// to a live fetch (populating the cache) if it's somehow still empty at
-/// this point, rather than reporting a spurious "empty playlist".
 async fn load_tracks_for_playlist_play(
     data: &Data,
     playlist: &SavedPlaylist,
@@ -611,10 +498,6 @@ async fn handle_playlist_play_button(
     }
 }
 
-/// Handles a detail view's `library:playlist_view:<id>` button: re-opens
-/// that playlist's detail view — currently only reachable as the remove
-/// confirmation's Cancel button, but handled generically the same way
-/// [`handle_playlist_select`] is.
 async fn handle_playlist_view_button(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -631,8 +514,6 @@ async fn handle_playlist_view_button(
     }
 }
 
-/// Handles a detail view's `library:playlist_remove:<id>` button: shows
-/// [`render_playlist_remove_confirm`] rather than deleting immediately.
 async fn handle_playlist_remove_button(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -660,9 +541,6 @@ async fn handle_playlist_remove_button(
     Ok(())
 }
 
-/// Handles the remove confirmation's `library:playlist_remove_confirm:<id>`
-/// button: actually deletes the playlist (and its cached tracks) and lands
-/// back on the saved-playlists list, prefixed with a "Removed" note.
 async fn handle_playlist_remove_confirm_button(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -704,9 +582,6 @@ async fn handle_playlist_remove_confirm_button(
     Ok(())
 }
 
-/// Extracts a submitted modal field's value by its input custom id, trimmed,
-/// or `None` if it was left empty/whitespace-only (or isn't present at all)
-/// — matches `playback::parse_volume_input`'s trim-before-checking.
 fn modal_field(data: &serenity::ModalInteractionData, custom_id: &str) -> Option<String> {
     data.components.iter().find_map(|row| {
         row.components.iter().find_map(|component| match component {
@@ -721,17 +596,10 @@ fn modal_field(data: &serenity::ModalInteractionData, custom_id: &str) -> Option
     })
 }
 
-/// Extracts the submitted `query` field's value from a modal submission
-/// built by [`super::playback::handle_search_button`], or `None` if it was
-/// left empty.
 fn modal_query(data: &serenity::ModalInteractionData) -> Option<String> {
     modal_field(data, "query")
 }
 
-/// Handles the `/player` panel's Search flow once its modal is submitted:
-/// runs the query and replies with a [`track_select_menu`] to queue one —
-/// the same shape as `/add_to_queue`'s no-`number` branch, just reached via
-/// a modal instead of a slash-command argument.
 pub(super) async fn handle_search_modal_submit(
     ctx: &serenity::Context,
     modal: &serenity::ModalInteraction,
@@ -796,10 +664,6 @@ pub(super) async fn handle_search_modal_submit(
     Ok(())
 }
 
-/// Builds a `library:playlist_play` select menu offering up to
-/// [`PLAYLIST_SELECT_LIMIT`] of a guild's saved playlists — the playlist
-/// counterpart to [`track_select_menu`]. The clicked option's value is the
-/// playlist's row id, re-looked-up by [`handle_play_saved_playlist`].
 fn playlist_select_menu(playlists: &[SavedPlaylist]) -> serenity::CreateActionRow {
     let options = playlists
         .iter()
@@ -821,9 +685,6 @@ fn playlist_select_menu(playlists: &[SavedPlaylist]) -> serenity::CreateActionRo
     )
 }
 
-/// The Import button row, appended under the playlist select menu (or shown
-/// alone when there are no saved playlists yet) — its own function since
-/// both [`render_playlists_list`] and its error fallback need it.
 fn import_button_row() -> serenity::CreateActionRow {
     serenity::CreateActionRow::Buttons(vec![
         serenity::CreateButton::new("library:playlist_import")
@@ -832,11 +693,6 @@ fn import_button_row() -> serenity::CreateActionRow {
     ])
 }
 
-/// Renders the saved-playlists list view: a [`playlist_select_menu`] (if
-/// there are any) plus [`import_button_row`] — shared by
-/// [`handle_playlists_button`] (the panel's initial entry point, via a fresh
-/// response) and [`handle_playlist_back`] (returning from a detail view, via
-/// an edit). A user-displayable error message on a database failure.
 async fn render_playlists_list(
     data: &Data,
     guild_id: serenity::GuildId,
@@ -860,9 +716,6 @@ async fn render_playlists_list(
     Ok((content, components))
 }
 
-/// Handles the `/player` panel's `player:playlists` button: shows this
-/// guild's saved playlists as a picker (if any), alongside an Import button
-/// to save a new one via [`handle_playlist_import_button`].
 pub(super) async fn handle_playlists_button(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -891,9 +744,6 @@ pub(super) async fn handle_playlists_button(
     Ok(())
 }
 
-/// Handles a detail view's `library:playlist_back` button: returns to the
-/// saved-playlists list, same content [`handle_playlists_button`] shows,
-/// just via an edit instead of a fresh response.
 async fn handle_playlist_back(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -919,12 +769,6 @@ async fn handle_playlist_back(
     Ok(())
 }
 
-/// Handles the Playlists picker's `library:playlist_import` button: shows a
-/// two-field modal (URL, optional name), waits for it to be submitted, then
-/// hands it off to [`handle_playlist_import_modal_submit`].
-///
-/// The modal's custom id is namespaced with the clicking interaction's own
-/// id, same reasoning as `playback::handle_search_button`'s search modal.
 async fn handle_playlist_import_button(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -972,16 +816,12 @@ async fn handle_playlist_import_button(
         .timeout(PLAYLIST_IMPORT_MODAL_TIMEOUT)
         .await
     else {
-        // Nobody submitted before the timeout — nothing to clean up, the
-        // modal just closes itself client-side.
         return Ok(());
     };
 
     handle_playlist_import_modal_submit(ctx, &modal, guild_id, data).await
 }
 
-/// Handles the Playlists picker's import modal once submitted: validates the
-/// URL resolves to a non-empty playlist, then saves it for this guild.
 async fn fetch_playlist_for_import(
     ctx: &serenity::Context,
     modal: &serenity::ModalInteraction,
@@ -1143,10 +983,6 @@ async fn handle_playlist_import_modal_submit(
     .await
 }
 
-/// Determines the voice channel to auto-join into, if the bot isn't already
-/// connected in this guild. `ctx.guild()` returns a cache guard (`GuildRef`)
-/// that isn't `Send` and can't be held across an `.await`, so the owned
-/// channel ID is extracted in one expression before any `.await` point.
 fn author_voice_channel(ctx: Context<'_>) -> Option<serenity::ChannelId> {
     ctx.guild().and_then(|guild| {
         guild
@@ -1156,13 +992,6 @@ fn author_voice_channel(ctx: Context<'_>) -> Option<serenity::ChannelId> {
     })
 }
 
-/// Ensures the bot is connected to a voice channel in this guild. If the
-/// invoking user is in a voice channel, joins it — moving there if the bot
-/// is already connected elsewhere in this guild, since a single bot
-/// identity can only ever hold one voice connection per guild. If the user
-/// isn't in a voice channel, falls back to whatever the bot's already
-/// connected to, if anything. Replies ephemerally and returns `Ok(false)` if
-/// neither is available (the expected "can't queue" case, not a real error).
 async fn ensure_connected(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result<bool, Error> {
     let Some(channel_id) = author_voice_channel(ctx) else {
         if ctx.data().player.is_connected(guild_id) {
@@ -1190,8 +1019,6 @@ async fn ensure_connected(ctx: Context<'_>, guild_id: serenity::GuildId) -> Resu
     Ok(true)
 }
 
-/// Auto-joins if needed, enqueues `track`, and sends the public confirmation
-/// reply. Shared by every `*play`/`*queue` command below.
 async fn join_and_enqueue(ctx: Context<'_>, track: Track) -> Result<(), Error> {
     let Some(guild_id) = ctx.guild_id() else {
         ctx.send(
@@ -1227,12 +1054,6 @@ async fn join_and_enqueue(ctx: Context<'_>, track: Track) -> Result<(), Error> {
     super::playback::reply_public(ctx, format!("Queued: **{title}** — {channel}")).await
 }
 
-/// Auto-joins if needed, enqueues every track in `tracks` in order, and
-/// sends one public confirmation reply summarizing how many were queued.
-/// Unlike [`join_and_enqueue`], a per-track enqueue failure doesn't abort
-/// the rest — it's tallied and reported alongside the successes, since one
-/// bad track (e.g. region-locked) shouldn't block queuing the rest of a
-/// playlist.
 pub(super) async fn join_and_enqueue_all(
     ctx: Context<'_>,
     label: &str,
@@ -1284,10 +1105,6 @@ pub(super) async fn join_and_enqueue_all(
     super::playback::reply_public(ctx, content).await
 }
 
-/// Searches `YouTube` for `query` and shows the top 5 matches, or queues one.
-///
-/// Call with no `number` to see the top 5 matches; call again with the same
-/// `query` plus a `number` from that list to queue one.
 #[poise::command(slash_command, guild_only)]
 pub async fn add_to_queue(
     ctx: Context<'_>,
@@ -1296,12 +1113,6 @@ pub async fn add_to_queue(
         u8,
     >,
 ) -> Result<(), Error> {
-    // `youtube.search` shells out to yt-dlp and can easily exceed Discord's
-    // 3-second ack deadline (cold-start especially) — deferred before it so
-    // a slow response doesn't drop the interaction. Ephemeral to match the
-    // no-`number` browsing branch below, the common entry point into this
-    // command; the `number`-given success path replies publicly regardless
-    // (see `join_and_enqueue`), which works fine as its own followup.
     ctx.defer_ephemeral().await?;
 
     let Some(guild_id) = ctx.guild_id() else {
@@ -1343,8 +1154,6 @@ pub async fn add_to_queue(
     join_and_enqueue(ctx, track).await
 }
 
-/// Shared with `/play`'s free-text path (see `playback::play`), which shows
-/// this same picker instead of guessing a top result.
 pub(super) async fn present_search_results(
     ctx: Context<'_>,
     query: &str,
@@ -1376,13 +1185,6 @@ pub(super) async fn present_search_results(
     Ok(())
 }
 
-/// Checks the guild's cached playlist tracks for `query` before shelling out
-/// to `yt-dlp` — a fast, local hit for anything already known from a saved
-/// playlist. Falls back to [`YouTubeClient::search`] (exactly as before this
-/// existed) if the cache has no matches, or if the cache lookup itself
-/// fails — a cache read failing must never block search from working.
-///
-/// Shared with `/play`'s free-text path (see `playback::play`).
 pub(super) async fn search_with_cache(
     data: &Data,
     guild_id: serenity::GuildId,
@@ -1406,8 +1208,6 @@ pub(super) async fn search_with_cache(
     data.youtube.search(query).await
 }
 
-/// 1-indexes into `items` by a `u8` selection, returning a clone. `None` for
-/// 0 or out-of-range.
 fn select_by_number<T: Clone>(items: &[T], number: u8) -> Option<T> {
     if number == 0 {
         return None;
@@ -1452,10 +1252,6 @@ mod tests {
 
     #[test]
     fn formats_line_with_duration_past_an_hour_rolls_over() {
-        // Regression: this used to render as the raw minute count (e.g.
-        // "1477:03") instead of rolling over into hours, since this
-        // function computed mm:ss itself instead of using
-        // `panel::format_duration`.
         let t = track("Long Mix", "Channel", Some(Duration::from_secs(88_623)));
         assert_eq!(format_track_line(1, &t), "1. Long Mix — Channel (24:37:03)");
     }
@@ -1494,8 +1290,6 @@ mod tests {
         assert_eq!(out.lines().count(), 3);
     }
 
-    // ---- track_select_menu ----
-
     fn select_options_json(tracks: &[Track], limit: usize) -> serde_json::Value {
         let row = track_select_menu(tracks, limit);
         let json = serde_json::to_value(&row).expect("action row should serialize");
@@ -1524,8 +1318,6 @@ mod tests {
         let options = select_options_json(&many_tracks, 30);
         assert_eq!(options.as_array().unwrap().len(), 25);
     }
-
-    // ---- format_relative_time ----
 
     fn seconds_ago(secs: i64) -> i64 {
         let now = std::time::SystemTime::now()
@@ -1560,8 +1352,6 @@ mod tests {
         assert_eq!(format_relative_time(Some(seconds_ago(259_200))), "3d ago");
     }
 
-    // ---- playlist_select_menu ----
-
     fn saved_playlist(id: i64, name: &str) -> SavedPlaylist {
         SavedPlaylist {
             id,
@@ -1583,8 +1373,6 @@ mod tests {
         assert_eq!(json["components"][0]["options"][0]["value"], "7");
         assert_eq!(json["components"][0]["options"][0]["label"], "Chill Mix");
     }
-
-    // ---- render_playlist_details ----
 
     #[test]
     fn playlist_details_buttons_carry_the_playlist_id() {
@@ -1635,8 +1423,6 @@ mod tests {
         );
     }
 
-    // ---- render_playlist_remove_confirm ----
-
     #[test]
     fn remove_confirm_content_names_the_playlist() {
         let playlist = saved_playlist(1, "Chill Mix");
@@ -1657,12 +1443,6 @@ mod tests {
         assert_eq!(buttons[1]["custom_id"], "library:playlist_view:42");
     }
 
-    // ---- modal_field ----
-
-    /// Builds a single-field submitted modal, round-tripped through JSON the
-    /// same way `panel.rs`'s tests round-trip `CreateEmbed` — `serenity`'s
-    /// receive-side modal types implement `Deserialize` but have no public
-    /// constructor.
     fn modal_data_with_field(custom_id: &str, value: &str) -> serenity::ModalInteractionData {
         serde_json::from_value(serde_json::json!({
             "custom_id": "test_modal",

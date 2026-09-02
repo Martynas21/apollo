@@ -1,27 +1,3 @@
-//! Per-guild playback state: a SQLite-backed upcoming queue driven by
-//! songbird's track-end event, plus idle auto-disconnect.
-//!
-//! [`PlayerRegistry`] is the single shared entry point commands use — it
-//! owns the voice backend handle and all per-guild state, so every command
-//! (`/play`, `/skip`, `/queue`, ...) goes through the same state rather than
-//! each reaching into songbird directly. The upcoming queue itself lives in
-//! `guild_session_queue` (see `db.rs`'s `queue_*` functions), not in memory
-//! — only what can't be persisted (live track handles, panel pointers, radio
-//! bookkeeping) stays in [`GuildState`]. See the `guilds` field's doc
-//! comment on [`PlayerRegistry`] for the locking discipline that keeps queue
-//! mutations correct without a live in-memory copy.
-//!
-//! Songbird itself sits behind the [`VoiceBackend`]/[`VoiceCall`]/
-//! [`VoiceTrack`] traits, whose production implementation
-//! ([`crate::voice::ipc_backend::IpcBackend`]) talks to the actual mixer
-//! over IPC in a separate `apollo-audio-worker` process rather than driving
-//! songbird in-process — see that module's doc comment. The trait seam
-//! predates that split (it originally existed just so the queue state
-//! machine below could be unit-tested without a live voice connection) and
-//! is deliberately no wider than the calls this file needs to make.
-//!
-//! Constructed once in `main.rs` and shared via `Data::player`.
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,48 +14,20 @@ use crate::voice::radio;
 use crate::voice::resolve::{self, PlaybackError};
 use crate::youtube::api::{Track, YouTubeClient};
 
-/// A background pre-buffer for the track that's up next in the queue,
-/// started as soon as the current track begins playing so its download
-/// finishes (or is well underway) by the time it's actually needed. See
-/// `cached_track_input`.
 type Prefetch = JoinHandle<Result<AudioSource, PlaybackError>>;
 
-/// How long an empty, drained queue waits before the bot leaves the voice
-/// channel on its own. Re-checked when the timer fires (not just scheduled
-/// once) so a track queued in the meantime cancels the disconnect.
 const IDLE_DISCONNECT: Duration = Duration::from_secs(150);
 
-/// Highest accepted `/volume` percentage. Songbird's volume is an unbounded
-/// gain multiplier, so anything above 100% is amplification (and clipping),
-/// not "louder".
 const MAX_VOLUME: u8 = 100;
 
-/// How many recently-started tracks `GuildState::radio_history` remembers.
-/// Refills pick a seed from this window (weighted toward the most recent —
-/// see `pick_radio_seed`) instead of always reseeding off the single latest
-/// track, so a long radio session doesn't commit 100% to wherever the Mix
-/// chain wandered off to.
 const RADIO_HISTORY_CAP: usize = 5;
 
-/// How many mix candidates a single radio refill hydrates and queues at
-/// once. Refills only run when the queue has drained to empty (see
-/// `maybe_spawn_radio_refill`'s caller), so queuing several at a time — not
-/// just one — means several tracks play before the next `yt-dlp` spawn plus
-/// Data API hydration round-trip, instead of paying that cost every track.
 const RADIO_REFILL_BATCH: usize = 3;
 
-/// Converts a 0-100 volume percentage into songbird's gain multiplier,
-/// clamping out-of-range input rather than trusting it.
 fn volume_multiplier(volume: u8) -> f32 {
     f32::from(volume.min(MAX_VOLUME)) / 100.0
 }
 
-/// Picks a radio-refill seed from `history` (oldest first, newest last),
-/// weighting linearly toward the most recent entries — position `i` (0 =
-/// oldest) gets weight `i + 1` — rather than always reseeding off the single
-/// latest track. Keeps a long radio session from committing 100% to
-/// wherever the Mix chain happened to wander, while still mostly following
-/// "whatever just played". `None` only if `history` is empty.
 fn pick_radio_seed<'a>(history: &'a [String], rng: &mut impl rand::Rng) -> Option<&'a str> {
     use rand::seq::IndexedRandom;
 
@@ -92,9 +40,6 @@ fn pick_radio_seed<'a>(history: &'a [String], rng: &mut impl rand::Rng) -> Optio
         .map(|(_, id)| id.as_str())
 }
 
-/// Picks the more informative of a playback resolution failure and a
-/// [`resolve::preflight_check`] classification of the same video: an opaque
-/// `Other` yields to a named cause, anything already named wins.
 fn better_playback_error(
     original: PlaybackError,
     preflight: Option<PlaybackError>,
@@ -108,25 +53,13 @@ fn better_playback_error(
     }
 }
 
-/// Why a panel edit failed, reduced to the only distinction its callers act
-/// on. Carrying this instead of `serenity::Error` also keeps that (large)
-/// type out of a `Result` the hot paths return.
 enum PanelEditFailure {
-    /// The message is genuinely gone — deleted out from under the stored
-    /// pointer. The only case that justifies forgetting the panel.
     Gone,
-    /// Anything else: a network blip, a 5xx, a rate-limit give-up. The
-    /// panel presumably still exists, so the pointer is kept.
     Transient(String),
 }
 
 impl PanelEditFailure {
-    /// Classifies a failed `edit_message`. Treating *every* failure as
-    /// "gone" (the old behaviour) makes a single transient blip forget a
-    /// panel that's still on screen, so the next `/player` posts a duplicate
-    /// one next to it.
     fn classify(err: &serenity::Error) -> Self {
-        /// Discord's JSON error code for "Unknown Message".
         const UNKNOWN_MESSAGE: isize = 10008;
 
         let serenity::Error::Http(serenity::HttpError::UnsuccessfulRequest(response)) = err else {
@@ -142,7 +75,6 @@ impl PanelEditFailure {
     }
 }
 
-/// A track paired with who queued it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedTrack {
     pub track: Track,
@@ -151,20 +83,13 @@ pub struct QueuedTrack {
 
 #[derive(Debug)]
 pub enum PlayerError {
-    /// No active voice connection for this guild (caller should `/play` first).
     NotConnected,
-    /// `/skip`, `/pause`, `/resume`, or `/stop` with nothing currently playing.
     NothingPlaying,
-    /// `/shuffle` with fewer than two upcoming tracks to shuffle.
     NothingToShuffle,
-    /// `/clear` (or the panel's Clear Queue button) with nothing queued.
     QueueEmpty,
-    /// A queue-jump selection that's out of range, e.g. because the queue
-    /// changed between the panel being rendered and the click landing.
     InvalidSelection,
     Join(String),
     Playback(String),
-    /// Persisting a `/volume` change to the database failed.
     Storage(String),
 }
 
@@ -190,57 +115,25 @@ impl std::fmt::Display for PlayerError {
 
 impl std::error::Error for PlayerError {}
 
-/// A resolved, playable audio source paired with the video id it was built
-/// from.
-///
-/// Opaque to the state machine — it only ever travels from
-/// [`VoiceBackend::buffered_source`] into [`VoiceCall::play`] — but the id
-/// rides along for logging, since the path alone doesn't say what it is.
-/// `path` points at a fully-buffered audio file under the shared buffer
-/// directory `apollo-audio-worker` reads from — not a live songbird
-/// [`Input`], since that can't cross the IPC boundary to the worker
-/// process. Fields are `pub(crate)` so [`crate::voice::ipc_backend`] (a
-/// sibling module, not this file) can build and read one.
 pub struct AudioSource {
     pub(crate) video_id: String,
     pub(crate) path: std::path::PathBuf,
 }
 
-/// Live playback state of a track, as [`VoiceTrack::status`] reports it.
 pub struct TrackStatus {
     pub position: Duration,
     pub paused: bool,
 }
 
-/// The callbacks a [`VoiceBackend`] makes when songbird reports something
-/// happening on its own rather than in response to a command.
-///
-/// Implemented by [`PlayerRegistry`] and handed to the backend at each
-/// registration point rather than stored on it, so a backend can be built
-/// before the registry that owns it exists.
 #[async_trait::async_trait]
 pub trait VoiceEvents: Send + Sync + 'static {
-    /// A track reached its end, or errored out mid-stream. `track_id` says
-    /// *which* track, since a stale event can land after the track it belongs
-    /// to has already been superseded — see [`PlayerRegistry::advance`].
     async fn track_finished(&self, guild_id: GuildId, track_id: Uuid);
 
-    /// The voice connection went away underneath us — kicked, disconnected by
-    /// a moderator, or a reconnect that ran out of retries.
     async fn connection_lost(&self, guild_id: GuildId);
 }
 
-/// The slice of songbird this state machine actually drives: joining and
-/// dropping calls, and turning a [`Track`] into something playable.
-///
-/// Every method here corresponds to a songbird call this file already made;
-/// it is a seam for testing, not a general songbird façade. Errors are
-/// stringified at the boundary because that's all their callers ever do with
-/// them.
 #[async_trait::async_trait]
 pub trait VoiceBackend: Send + Sync + 'static {
-    /// Joins (or moves to) a voice channel, registering `events` to be told
-    /// if the connection later goes away.
     async fn join(
         &self,
         guild_id: GuildId,
@@ -248,47 +141,26 @@ pub trait VoiceBackend: Send + Sync + 'static {
         events: Arc<dyn VoiceEvents>,
     ) -> Result<(), String>;
 
-    /// Drops the guild's call entirely, not just its voice connection — see
-    /// [`PlayerRegistry::leave_under_lock`] for why the distinction matters.
     async fn remove(&self, guild_id: GuildId) -> Result<(), String>;
 
-    /// The guild's live call, if it has one. `None` is exactly the "not
-    /// connected" the commands report.
     fn call(&self, guild_id: GuildId) -> Option<Arc<dyn VoiceCall>>;
 
-    /// Fully resolves and pre-buffers `track` before returning
-    /// (network-bound) — see [`resolve::buffer_track_to_file`]. No fallback
-    /// exists if this fails: the audio-worker process has no `yt-dlp`/network
-    /// access of its own, so a track that can't be resolved here just can't
-    /// play.
     async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError>;
 }
 
-/// One guild's live voice connection.
 #[async_trait::async_trait]
 pub trait VoiceCall: Send + Sync {
-    /// Starts `source` playing, returning a handle to control it. Errs if
-    /// the backend rejects (or can't confirm) the request — e.g. the IPC
-    /// backend, when the audio worker has no session for this guild.
     async fn play(&self, source: AudioSource) -> Result<Arc<dyn VoiceTrack>, String>;
 }
 
-/// A control handle for a track that is (or was) playing.
 #[async_trait::async_trait]
 pub trait VoiceTrack: Send + Sync {
-    /// The track's own id, used to recognise stale end events.
     fn uuid(&self) -> Uuid;
     async fn set_volume(&self, multiplier: f32) -> Result<(), String>;
     async fn stop(&self) -> Result<(), String>;
     async fn pause(&self) -> Result<(), String>;
     async fn resume(&self) -> Result<(), String>;
-    /// Registers `events` to be notified once this track ends *or* errors
-    /// out. Best-effort by design: a registration failure is logged rather
-    /// than returned, since the track still plays — it just won't
-    /// auto-advance the queue.
     fn notify_when_finished(&self, guild_id: GuildId, events: Arc<dyn VoiceEvents>);
-    /// Live position and pause state, or `None` if songbird couldn't report
-    /// them (e.g. the track just ended in a race with this call).
     async fn status(&self) -> Option<TrackStatus>;
 }
 
@@ -296,77 +168,19 @@ pub trait VoiceTrack: Send + Sync {
 struct GuildState {
     now_playing: Option<QueuedTrack>,
     current_handle: Option<Arc<dyn VoiceTrack>>,
-    /// `current_handle`'s track uuid, captured at the same time it's set.
-    /// Every track-finished notification carries the uuid of the track it
-    /// fired for, and `advance` checks it against this before touching state
-    /// — a track that was stopped/skipped/replaced still has an End/Error
-    /// event in flight from `apollo-audio-worker`, and without this check
-    /// that stale event would land after a *new* track has already started,
-    /// clearing its handle out from under it or layering another track on
-    /// top of it (two tracks audibly playing at once).
     current_track_id: Option<Uuid>,
-    /// Background pre-buffer for the upcoming queue's front entry (now a
-    /// live DB table, `guild_session_queue` — see `db::queue_peek_front` and
-    /// friends), started right after the current track begins playing.
-    /// Always corresponds to whatever is at the front of that table —
-    /// `enqueue`/`advance`/`stop` are the only places that mutate the queue,
-    /// and each keeps this in sync.
     prefetch: Option<Prefetch>,
-    /// The live `/player` panel message for this guild, if one has been
-    /// posted — kept current by [`PlayerRegistry::refresh_panel`] after
-    /// every state-changing mutation.
     panel: Option<(ChannelId, MessageId)>,
-    /// Set while a `/player` invocation holds the exclusive right to post
-    /// this guild's panel (via [`GuildState::claim_panel`]) but hasn't
-    /// posted it yet — closes the race where two concurrent `/player`s both
-    /// see no panel and both post one. See [`GuildState::claim_panel`].
     panel_reserved: bool,
-    /// Whether radio mode is on for this guild — a pure toggle, not tied to
-    /// any particular seed. See `radio_history`.
     radio_enabled: bool,
-    /// Video ids of the most recently *started* tracks, newest at the back,
-    /// capped at [`RADIO_HISTORY_CAP`] (playlist, one-off `/play`, search
-    /// result, or a radio-fetched track alike — every path through
-    /// `start_playback` pushes onto this). A refill draws its seed from
-    /// this window rather than always the single latest entry — see
-    /// `pick_radio_seed`. Empty until something has played this session.
     radio_history: VecDeque<String>,
-    /// Requester of the most recently started track — attributed to
-    /// radio-fetched tracks too, since nothing new requested them.
     radio_requested_by: Option<UserId>,
-    /// Video ids already surfaced by radio mode this session, so it doesn't
-    /// immediately repeat itself.
     radio_played: HashSet<String>,
-    /// Set when a radio refill found the seed's Mix exhausted (every entry
-    /// already in `radio_played`). Short-circuits further refills, which
-    /// would otherwise re-run the whole yt-dlp mix listing plus hydration on
-    /// every queue drain only to come up empty again, forever. Cleared when
-    /// something changes the picture: radio being toggled, or a track being
-    /// queued by hand (see `enqueue`/`enqueue_many`/`toggle_radio`).
     radio_exhausted: bool,
-    /// Bumped by [`PlayerRegistry::stop`]. Background work that leaves the
-    /// guild lock and comes back later (radio's refill task) captures this
-    /// first and refuses to commit if it changed meanwhile — a `/stop` that
-    /// lands mid-refill must not have a track pushed into the queue behind
-    /// it, which would break the "nothing playing implies nothing queued"
-    /// invariant the idle disconnect relies on (see `leave_if_idle` and
-    /// `persist_session`, which now check the live DB queue directly since
-    /// there's no in-memory queue to inspect synchronously anymore).
     epoch: u64,
 }
 
 impl GuildState {
-    /// Atomically checks for a live `/player` panel and, if there isn't one,
-    /// reserves this guild's panel slot — the check-and-reserve
-    /// [`PlayerRegistry::claim_panel_slot`] performs under the guild lock so
-    /// two `/player` invocations landing together can't both see no panel
-    /// and both post one (the old `existing_panel`-then-`replace_panel`
-    /// pair left exactly that gap open across two `.await` points).
-    ///
-    /// A [`PanelClaim::Reserved`] caller holds the exclusive right to post a
-    /// panel and must follow up with [`Self::set_panel`] once it has (or
-    /// [`Self::release_panel`] if it gives up before posting, so this guild
-    /// isn't wedged with a reservation nobody will ever fulfil).
     fn claim_panel(&mut self) -> PanelClaim {
         if let Some(panel) = self.panel {
             return PanelClaim::Existing(panel);
@@ -378,81 +192,37 @@ impl GuildState {
         PanelClaim::Reserved
     }
 
-    /// Records a freshly posted `/player` panel and clears the reservation
-    /// [`Self::claim_panel`] made for it.
     fn set_panel(&mut self, channel_id: ChannelId, message_id: MessageId) {
         self.panel = Some((channel_id, message_id));
         self.panel_reserved = false;
     }
 
-    /// Releases a reservation from [`Self::claim_panel`] without posting a
-    /// panel — e.g. the send itself failed. Leaves any actual `panel`
-    /// pointer alone; this only ever clears the in-flight flag.
     fn release_panel(&mut self) {
         self.panel_reserved = false;
     }
 }
 
-/// The result of [`PlayerRegistry::claim_panel_slot`] (see
-/// [`GuildState::claim_panel`] for the invariant it maintains).
 pub enum PanelClaim {
-    /// A panel is already live at this location — point back at it instead
-    /// of posting a new one.
     Existing((ChannelId, MessageId)),
-    /// No panel exists yet, and the caller now holds the exclusive right to
-    /// post one. Must be followed by [`PlayerRegistry::set_panel`] on
-    /// success, or [`PlayerRegistry::release_panel_slot`] if the caller
-    /// gives up before posting.
     Reserved,
-    /// No panel exists yet, but another `/player` invocation is already in
-    /// the middle of posting one. Nothing to do here; a `/player` shortly
-    /// after will see it via [`PanelClaim::Existing`].
     InProgress,
 }
 
-/// A point-in-time view of a guild's queue, for `/queue` and `/now_playing`.
 pub struct QueueSnapshot {
     pub now_playing: Option<QueuedTrack>,
     pub upcoming: Vec<QueuedTrack>,
 }
 
-/// Shared, per-process registry of per-guild playback state. Cheap to
-/// clone (every field is `Arc`-backed) — lives in [`crate::commands::Data`]
-/// so every command shares the same songbird manager and queues.
 #[derive(Clone)]
 pub struct PlayerRegistry {
-    /// `IpcBackend` in production (`crate::voice::ipc_backend`), a fake in
-    /// tests — see [`VoiceBackend`].
     voice: Arc<dyn VoiceBackend>,
-    /// Used only to edit/delete the live `/player` panel message from
-    /// contexts that aren't already handling a Discord interaction (e.g. a
-    /// track-finished notification from `apollo-audio-worker`, or a `/skip`
-    /// slash command refreshing a panel message it didn't itself respond
-    /// to). Unrelated to `http` above, which is for yt-dlp/YouTube stream
-    /// resolution.
     discord_http: Arc<serenity::Http>,
     cookies_file: Option<String>,
     db: sqlx::SqlitePool,
-    /// `yt-dlp`-backed client, used by radio mode's background refill to
-    /// hydrate bare video ids (from `crate::voice::radio::list_mix_video_ids`)
-    /// into full `Track`s — see `maybe_spawn_radio_refill`.
     youtube: YouTubeClient,
-    /// The upcoming queue itself lives in SQLite (`guild_session_queue`),
-    /// not here — only the state that can't be persisted (live track
-    /// handles, panel pointers, radio bookkeeping) is kept in memory. Every
-    /// method that reads or writes that table does so while holding this
-    /// lock, deliberately: it's what keeps a queue mutation exactly as
-    /// atomic (process-wide) as it was back when the queue itself was a
-    /// plain `VecDeque` guarded by the same lock. This serializes queue I/O
-    /// across every guild, not just within one — an accepted trade-off for
-    /// a bot this size, not an oversight; don't "fix" it by moving a
-    /// `db::queue_*` call outside its critical section without re-checking
-    /// the race it was closing.
     guilds: Arc<Mutex<HashMap<GuildId, GuildState>>>,
 }
 
-/// [`VoiceEvents`] callbacks land here from whichever backend the registry
-/// was built with, in production always [`crate::voice::ipc_backend::IpcBackend`].
 #[async_trait::async_trait]
 impl VoiceEvents for PlayerRegistry {
     async fn track_finished(&self, guild_id: GuildId, track_id: Uuid) {
@@ -460,11 +230,6 @@ impl VoiceEvents for PlayerRegistry {
     }
 
     async fn connection_lost(&self, guild_id: GuildId) {
-        // Not spawned here: `DriverDisconnectHandler` already spawns before
-        // calling this, to keep songbird's event task unblocked (see its doc
-        // comment) — spawning again would just add a redundant task.
-        // `leave` is idempotent (see `DriverDisconnectHandler`'s doc comment),
-        // so this is safe even racing a local `/leave`.
         if let Err(err) = self.leave(guild_id).await {
             tracing::debug!(%guild_id, %err, "cleanup after voice disconnect");
         }
@@ -472,11 +237,6 @@ impl VoiceEvents for PlayerRegistry {
 }
 
 impl PlayerRegistry {
-    /// `voice` is `IpcBackend` in production (talking to
-    /// `apollo-audio-worker` over IPC — see `crate::voice::ipc_backend`) and
-    /// `FakeBackend` in tests. Built by the caller (`main.rs`) rather than
-    /// here, since connecting to the audio worker is itself async/fallible —
-    /// this constructor stays sync and infallible.
     pub fn new(
         voice: Arc<dyn VoiceBackend>,
         discord_http: Arc<serenity::Http>,
@@ -494,19 +254,10 @@ impl PlayerRegistry {
         }
     }
 
-    /// This registry as the callback sink a backend notifies. Handed out per
-    /// registration rather than stored, so [`VoiceBackend`] implementations
-    /// never need a registry to be constructed.
     fn events(&self) -> Arc<dyn VoiceEvents> {
         Arc::new(self.clone())
     }
 
-    /// Test-only convenience over [`Self::new`], filling in the fields no
-    /// test needs to vary (a [`tests::FakeBackend`] stands in for
-    /// [`crate::voice::ipc_backend::IpcBackend`] — see the module's doc
-    /// comment for why the seam exists). `db` still needs to be a real pool
-    /// (`sqlite::memory:` works) since `start_playback`/`set_volume` go
-    /// through it.
     #[cfg(test)]
     fn new_for_test(voice: Arc<dyn VoiceBackend>, db: sqlx::SqlitePool) -> Self {
         Self::new(
@@ -523,25 +274,11 @@ impl PlayerRegistry {
         guild_id: GuildId,
         voice_channel_id: ChannelId,
     ) -> Result<(), PlayerError> {
-        // The backend also registers this registry for connection-loss
-        // notifications. Losing the voice connection (kicked or disconnected
-        // by a moderator, or a reconnect that exhausted its retries) is
-        // reported *only* that way — songbird fires no track End/Error for
-        // the track that was playing at the time. Without it that track's
-        // state would sit in `now_playing`/`current_handle` forever: nothing
-        // to advance the queue, nothing to time out (the idle check would
-        // keep seeing an occupied `now_playing`), and a `/player` panel
-        // frozen mid-progress-bar.
         self.voice
             .join(guild_id, voice_channel_id, self.events())
             .await
             .map_err(PlayerError::Join)?;
 
-        // Only reached on a successful join, which every command that joins
-        // voice makes right before its own `enqueue`/`enqueue_many` call —
-        // see `restore_session_if_new`'s doc comment for why hooking in here
-        // is enough to cover every entry point without any command-layer
-        // changes.
         if let Some(call) = self.voice.call(guild_id) {
             self.restore_session_if_new(guild_id, call).await;
         }
@@ -549,18 +286,6 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    /// Restores a persisted session (see [`db::load_guild_session`]) into a
-    /// guild that doesn't already have in-memory state, and starts playing
-    /// its resumed `now_playing`. A no-op if the guild already has state
-    /// (mid-session, or a concurrent `join` already restored it), or if
-    /// there's nothing persisted to restore.
-    ///
-    /// Called from [`Self::join`] rather than from the command layer: every
-    /// `/play`-style command already calls `join` immediately before its own
-    /// `enqueue`/`enqueue_many`, and by the time that runs, `now_playing`
-    /// here is already `Some` (if anything was restored), so the freshly
-    /// requested track correctly lands *behind* the resumed queue instead of
-    /// jumping ahead of it.
     async fn restore_session_if_new(&self, guild_id: GuildId, call: Arc<dyn VoiceCall>) {
         if self.guild_state_exists(guild_id).await {
             return;
@@ -578,8 +303,6 @@ impl PlayerRegistry {
             return;
         };
 
-        // Mirrors `enqueue_many`'s start-and-retry loop: walk past restored
-        // tracks that fail to start instead of stalling on the first one.
         let mut started = false;
         while let Some(queued) = candidate {
             match self
@@ -624,20 +347,6 @@ impl PlayerRegistry {
         }
     }
 
-    // Lost a race against a concurrent `join`/`enqueue` that landed between
-    // `guild_state_exists` and now — don't clobber real state with a stale
-    // restore. `now_playing.is_some()` alone is a sufficient guard: whenever
-    // a concurrent `enqueue`/`enqueue_many` has actually started something,
-    // it always sets `now_playing` synchronously (under this same lock)
-    // before doing anything else — there's no "queue non-empty but
-    // now_playing still None" state reachable via those paths. Returns
-    // `None` when that race was lost, `Some(candidate)` otherwise, where
-    // `candidate` is determined in this same critical section, not a
-    // separate re-lock afterward — releasing the lock between setting
-    // `now_playing` and reading it back would open a window for a
-    // concurrent `/play` to set its own `now_playing` and start its own
-    // track, only for this restore to then read (and start) that same track
-    // too, racing two songbird tracks for the guild.
     async fn apply_restored_session(
         &self,
         guild_id: GuildId,
@@ -663,12 +372,6 @@ impl PlayerRegistry {
             })
         });
         if state.now_playing.is_none() {
-            // Nothing was actively playing when this was persisted (or its
-            // `requested_by` failed to parse) — but the DB queue is the live
-            // upcoming-queue table regardless of what got restored above, so
-            // pop its front as the resumed `now_playing` if anything's
-            // there. Inlined rather than calling `promote_next` (which
-            // re-acquires this same lock and would deadlock here).
             let next = match db::queue_pop_front(&self.db, guild_id_str).await {
                 Ok(next) => next,
                 Err(err) => {
@@ -681,19 +384,6 @@ impl PlayerRegistry {
         Some(state.now_playing.clone())
     }
 
-    /// Snapshots this guild's radio/now-playing state to the database, so a
-    /// crash or restart doesn't drop it — see [`Self::restore_session_if_new`].
-    /// Best-effort: a failure is logged, never surfaced as a [`PlayerError`],
-    /// since persistence must not stand in the way of playback.
-    ///
-    /// Much cheaper than it used to be: the upcoming queue is no longer
-    /// rewritten wholesale here (it's written incrementally, at the actual
-    /// point of each mutation, by the `queue_*` functions in `db.rs`) — this
-    /// only has to keep the `guild_sessions` meta row (radio state,
-    /// `now_playing`) in sync. Called after every mutation that changes
-    /// that meta — not after every mutation in general, so e.g.
-    /// `pause`/`resume`/`set_volume` don't pay for a write that would
-    /// restore into exactly the same state anyway.
     async fn persist_session(&self, guild_id: GuildId) {
         let guild_id_str = guild_id.to_string();
         let guilds = self.guilds.lock().await;
@@ -710,8 +400,6 @@ impl PlayerRegistry {
         let radio_requested_by = state.radio_requested_by.map(|id| id.to_string());
         let radio_history = Vec::from(state.radio_history.clone());
 
-        // Only paid on the rare "just went idle" path — the common "still
-        // playing" case short-circuits before ever touching the DB queue.
         let is_idle = if now_playing.is_none() {
             db::queue_len(&self.db, &guild_id_str).await.unwrap_or(0) == 0
         } else {
@@ -742,46 +430,21 @@ impl PlayerRegistry {
         }
     }
 
-    /// Leaves voice and drops all queued/now-playing state for the guild. If
-    /// a `/player` panel is live, it gets one last edit to reflect that
-    /// nothing is playing anymore — otherwise it would freeze showing
-    /// whatever was playing right before disconnect (notably including the
-    /// common case of the idle-timeout auto-disconnect in
-    /// [`Self::schedule_idle_disconnect`]).
     pub async fn leave(&self, guild_id: GuildId) -> Result<(), PlayerError> {
         let panel = {
             let mut guilds = self.guilds.lock().await;
             Self::take_guild_state(guild_id, &mut guilds)
         };
 
-        // `remove`, not `leave` — `Songbird::leave` only clears the voice
-        // connection, leaving the (now-disconnected) `Call` registered in
-        // songbird's manager map. `is_connected` would then keep reporting
-        // this guild as connected, so `/play` would skip rejoining voice
-        // and play into a `Call` with nothing on the other end.
-        //
-        // Deliberately outside the lock above: this is an IPC round trip to
-        // the audio worker, and `guilds` is the single process-wide mutex
-        // every guild's commands share (see its doc comment) — a slow or
-        // stuck worker response must not stall every other guild along with
-        // this one.
         let result = self.voice.remove(guild_id).await.map_err(PlayerError::Join);
 
         if let Some((channel_id, message_id)) = panel {
             let _ = self.edit_panel(guild_id, channel_id, message_id).await;
         }
-        // An explicit `/leave` means the session is over on purpose, not "a
-        // crash happened" — nothing to resume next time, unlike a restart.
         self.persist_session(guild_id).await;
         result
     }
 
-    /// Removes the guild's entry from the map (aborting any live prefetch)
-    /// and returns its panel pointer, if it had one. Synchronous and
-    /// lock-scoped only — the actual voice teardown is a separate IPC round
-    /// trip callers must make after dropping the guild-map lock, so it can't
-    /// stall every other guild sharing that same mutex (see [`Self::leave`]
-    /// and [`Self::leave_if_idle`]).
     fn take_guild_state(
         guild_id: GuildId,
         guilds: &mut HashMap<GuildId, GuildState>,
@@ -793,20 +456,6 @@ impl PlayerRegistry {
         removed.and_then(|state| state.panel)
     }
 
-    /// Leaves voice, but only if the guild is still idle — the action half
-    /// of the idle-disconnect timer.
-    ///
-    /// The idle check and the teardown happen under a single lock
-    /// acquisition on purpose. Checking, dropping the lock, and *then*
-    /// leaving loses to a concurrent `/play`: `enqueue` claims
-    /// `now_playing` before its network-bound resolve step, so a leave
-    /// decided a moment earlier would tear the guild down around a track
-    /// that's already mid-start — and that track's eventual End/Error event
-    /// would find no state to advance, leaving the bot silently out of voice
-    /// with a queue nobody drains. `enqueue`/`enqueue_many` look up the
-    /// `Call` under this same lock, so they either win the race (and this
-    /// sees a non-idle guild and bails) or lose it (and see no `Call`,
-    /// reporting `NotConnected` rather than playing into a dead one).
     async fn leave_if_idle(&self, guild_id: GuildId) {
         let panel = {
             let mut guilds = self.guilds.lock().await;
@@ -814,11 +463,6 @@ impl PlayerRegistry {
                 Some(state) if state.now_playing.is_some() => return,
                 _ => {}
             }
-            // The upcoming queue no longer lives in memory, so "idle" needs
-            // a DB round trip — done here, still inside the same lock
-            // acquisition as the removal below, so nothing (a radio refill
-            // landing rows, a queue push) can slip into the gap between
-            // deciding this guild is idle and removing its map entry.
             let queue_empty = db::queue_len(&self.db, &guild_id.to_string())
                 .await
                 .unwrap_or(0)
@@ -829,8 +473,6 @@ impl PlayerRegistry {
             Self::take_guild_state(guild_id, &mut guilds)
         };
 
-        // Outside the lock, same reasoning as `leave`: this is an IPC round
-        // trip, and every other guild shares this mutex.
         let result = self.voice.remove(guild_id).await.map_err(PlayerError::Join);
 
         if let Err(err) = result {
@@ -839,9 +481,6 @@ impl PlayerRegistry {
         if let Some((channel_id, message_id)) = panel {
             let _ = self.edit_panel(guild_id, channel_id, message_id).await;
         }
-        // Reaching here means the guild really was idle (nothing playing,
-        // empty queue), so there's nothing to persist — this just clears
-        // any stale row from before the idle disconnect.
         self.persist_session(guild_id).await;
     }
 
@@ -849,18 +488,11 @@ impl PlayerRegistry {
         self.voice.call(guild_id).is_some()
     }
 
-    /// Enqueues a track. If nothing is currently playing, starts it
-    /// immediately instead of leaving it queued.
     pub async fn enqueue(&self, guild_id: GuildId, queued: QueuedTrack) -> Result<(), PlayerError> {
         let (call, should_start) = {
             let mut guilds = self.guilds.lock().await;
-            // Looked up under the guild lock, not before it: that's what
-            // makes this mutually exclusive with `leave_if_idle`'s teardown
-            // — see its doc comment.
             let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
             let state = guilds.entry(guild_id).or_default();
-            // A hand-queued track means the queue is no longer running on
-            // radio fumes; give a previously exhausted mix another chance.
             state.radio_exhausted = false;
             let should_start = state.now_playing.is_none();
             if should_start {
@@ -880,40 +512,17 @@ impl PlayerRegistry {
         };
 
         if should_start && result.is_err() {
-            // `state.now_playing` was set speculatively above, before the
-            // resolve/play attempt above was known to succeed. Roll it back
-            // on failure — otherwise it's left pointing at a track with no
-            // `current_handle` and no `TrackEndHandler` ever registered to
-            // advance past it, permanently orphaning every track queued
-            // behind it (they just see `now_playing.is_some()` and pile up
-            // in the DB queue instead of ever being tried).
             let mut guilds = self.guilds.lock().await;
             if let Some(state) = guilds.get_mut(&guild_id) {
                 state.now_playing = None;
             }
         }
 
-        // Unconditional, including on failure: `queue_snapshot` only
-        // surfaces `now_playing` once `current_track_id` confirms it, so a
-        // failed/still-resolving attempt won't show up here — but the panel
-        // still needs telling either way, or it's left showing whatever was
-        // true before this call (stale on failure, or missing the promotion
-        // that just happened on success).
         self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
         result
     }
 
-    /// Enqueues many tracks at once — for `/play`'s playlist branch, queuing
-    /// a whole playlist in one go. Equivalent to calling [`Self::enqueue`]
-    /// once per track, but under a single lock and with a single panel
-    /// refresh at the end, instead of one Discord API call *per track*:
-    /// looping the single-track `enqueue` over a playlist of hundreds (or
-    /// thousands) of tracks turns "queue a playlist" into that many
-    /// sequential, rate-limited HTTP round-trips — slow enough to look
-    /// hung. Returns how many tracks ended up queued (fewer than
-    /// `tracks.len()` only if the tracks tried as the starting track all
-    /// failed to play).
     pub async fn enqueue_many(
         &self,
         guild_id: GuildId,
@@ -929,7 +538,6 @@ impl PlayerRegistry {
 
         let (call, needs_start) = {
             let mut guilds = self.guilds.lock().await;
-            // Under the lock, as in `enqueue` — see `leave_if_idle`.
             let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
             let state = guilds.entry(guild_id).or_default();
             state.radio_exhausted = false;
@@ -938,14 +546,6 @@ impl PlayerRegistry {
                 state.now_playing = first.clone();
             }
 
-            // The rest of the list (everything but the track about to become
-            // `now_playing`, if any) is persisted while the lock is still
-            // held, same as `enqueue`'s `db::queue_push_back` call — letting
-            // go of the lock first would open a window for a concurrent
-            // `/stop` to clear the DB queue between claiming `now_playing`
-            // and this write, which would then land the rest of the
-            // playlist back into `guild_session_queue` after `/stop` just
-            // cleared it (see the `guilds` field's doc comment).
             let rest: Vec<QueuedTrack> = if needs_start {
                 tracks.split_off(1)
             } else {
@@ -955,10 +555,6 @@ impl PlayerRegistry {
                 && let Err(err) = db::queue_push_many(&self.db, &guild_id_str, &rest).await
             {
                 if needs_start {
-                    // The speculative `now_playing` claim above never got a
-                    // chance to actually start — roll it back so it doesn't
-                    // orphan whatever might get queued behind it later (same
-                    // reasoning as `enqueue`'s own rollback).
                     state.now_playing = None;
                 }
                 return Err(PlayerError::Storage(err.to_string()));
@@ -969,12 +565,6 @@ impl PlayerRegistry {
 
         let mut failed = 0;
         if needs_start {
-            // Keep trying front-of-queue tracks until one starts or the
-            // queue runs dry — same rollback-and-retry `enqueue` relies on
-            // to avoid orphaning everything behind a track that fails to
-            // start, just looped here since the whole playlist is already
-            // sitting in the queue rather than trickling in one call at a
-            // time.
             let mut candidate = first;
             while let Some(queued) = candidate {
                 match self
@@ -996,10 +586,6 @@ impl PlayerRegistry {
         Ok(total - failed)
     }
 
-    /// Resolves a prefetch handle into a playable source, retrying a fresh
-    /// resolve (rather than propagating a stale prefetch failure) if the
-    /// background download errored. No further fallback beyond that retry —
-    /// see [`VoiceBackend::buffered_source`].
     async fn resolve_prefetched(
         &self,
         queued: &QueuedTrack,
@@ -1013,25 +599,10 @@ impl PlayerRegistry {
         self.voice.buffered_source(&queued.track).await
     }
 
-    /// Pre-buffers `queued`, for the background prefetch task
-    /// `start_playback`/`restart_prefetch` spawn for whatever's next in the
-    /// queue. Thin wrapper around the backend so that spawned task doesn't
-    /// need to reach past the registry into `self.voice` itself.
     async fn cached_input(&self, queued: &QueuedTrack) -> Result<AudioSource, PlaybackError> {
         self.voice.buffered_source(&queued.track).await
     }
 
-    /// Turns a raw resolution failure into the clearest user-facing error
-    /// available.
-    ///
-    /// The playback path resolves through songbird's `YoutubeDl` source,
-    /// whose failures surface as an opaque `PlaybackError::Other` — a
-    /// truncated yt-dlp/IO message that tells a user nothing about the
-    /// common, actionable cases. So on failure, re-ask yt-dlp directly via
-    /// [`resolve::preflight_check`], whose stderr classification names them
-    /// ("video is age-restricted", "not available in this region", "private
-    /// or deleted"), and report that instead when it has an opinion. Only
-    /// costs the extra subprocess on the failure path.
     async fn classify_playback_failure(&self, video_id: &str, err: PlaybackError) -> PlayerError {
         if !matches!(err, PlaybackError::Other(_)) {
             return PlayerError::Playback(err.to_string());
@@ -1043,17 +614,8 @@ impl PlayerRegistry {
         PlayerError::Playback(better_playback_error(err, preflight).to_string())
     }
 
-    /// Pops the front of the (DB-backed) upcoming queue into `now_playing`
-    /// and returns it — `None` if the queue is empty, or the guild's state
-    /// is gone. Used to walk past tracks that fail to start rather than
-    /// stalling on them.
     async fn promote_next(&self, guild_id: GuildId) -> Option<QueuedTrack> {
         let mut guilds = self.guilds.lock().await;
-        // Checked before the DB pop, not after: a track popped for a guild
-        // that's already been torn down (a concurrent `/leave` landing
-        // between calls) would just be discarded — better to leave it in
-        // the DB queue for nobody to ever have removed it in the first
-        // place.
         if !guilds.contains_key(&guild_id) {
             return None;
         }
@@ -1092,16 +654,9 @@ impl PlayerRegistry {
         let handle = call.play(source).await.map_err(PlayerError::Playback)?;
         let track_id = handle.uuid();
 
-        // Best-effort: a missing/unreadable volume setting shouldn't block
-        // playback — fall back to songbird's own default (100%) rather than
-        // erroring the whole track out.
         let volume = db::get_guild_volume(&self.db, &guild_id.to_string())
             .await
             .unwrap_or(db::DEFAULT_VOLUME);
-        // Clamped here rather than trusting callers/storage: songbird takes
-        // an unbounded multiplier, so a stray >100 value (a hand-edited row,
-        // a future caller that forgets to validate) would blow out the
-        // amplitude and clip.
         if let Err(err) = handle.set_volume(volume_multiplier(volume)).await {
             tracing::warn!(%err, "failed to apply saved volume to new track");
         }
@@ -1113,17 +668,12 @@ impl PlayerRegistry {
         if let Some(state) = guilds.get_mut(&guild_id) {
             state.current_handle = Some(handle);
             state.current_track_id = Some(track_id);
-            // Every track start feeds the radio history, regardless of how
-            // the track got here (playlist, one-off `/play`, search, or a
-            // radio-fetched track itself) — see `maybe_spawn_radio_refill`.
             state.radio_history.push_back(queued.track.video_id.clone());
             if state.radio_history.len() > RADIO_HISTORY_CAP {
                 state.radio_history.pop_front();
             }
             state.radio_requested_by = Some(queued.requested_by);
 
-            // Start pre-buffering whatever's next in the queue now, so its
-            // download runs in the background while this track plays.
             let next = db::queue_peek_front(&self.db, &guild_id.to_string())
                 .await
                 .ok()
@@ -1134,11 +684,6 @@ impl PlayerRegistry {
                     async move { registry.cached_input(&next).await },
                 ));
             } else {
-                // Nothing queued behind this track — if radio mode is on,
-                // top the queue up in the background so a track is already
-                // waiting by the time this one ends. Deferred until after
-                // `guilds` is dropped below, since `maybe_spawn_radio_refill`
-                // does its own locking.
                 needs_radio_refill = true;
             }
         }
@@ -1151,19 +696,6 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    /// Advances to the next queued track, or — if the queue is empty —
-    /// schedules an idle-timeout disconnect. Called via
-    /// [`VoiceEvents::track_finished`] (routed from `apollo-audio-worker`'s
-    /// track-end event over IPC — see `crate::voice::ipc_backend`) whenever a
-    /// track ends, whether naturally or via `/skip`/`/stop`.
-    ///
-    /// `track_id` is the uuid of the track whose End/Error event triggered
-    /// this call. It's checked against the guild's `current_track_id` and
-    /// the call is dropped if they don't match — an End/Error event fired by
-    /// songbird's mixer thread for a track that's already been superseded
-    /// (stopped, skipped, or replaced by a fresh `/play` before this event
-    /// landed). Acting on it anyway would advance past whatever's actually
-    /// playing now, or start a second track on top of it.
     async fn advance(&self, guild_id: GuildId, track_id: Uuid) {
         let (mut next, mut prefetch) = {
             let mut guilds = self.guilds.lock().await;
@@ -1175,11 +707,6 @@ impl PlayerRegistry {
             }
             state.current_handle = None;
             state.current_track_id = None;
-            // The DB pop happens only after re-confirming `current_track_id`
-            // above, and while still holding this same lock — otherwise a
-            // stale/duplicate End event for a track that's already been
-            // superseded (see this method's doc comment) could pop a track
-            // it has no business popping.
             let next = match db::queue_pop_front(&self.db, &guild_id.to_string()).await {
                 Ok(next) => next,
                 Err(err) => {
@@ -1191,11 +718,6 @@ impl PlayerRegistry {
             (next, state.prefetch.take())
         };
 
-        // Walk past tracks that fail to start instead of stalling on the
-        // first one: a failed start leaves `now_playing` set with no handle
-        // and no end-event handler, so without this the queue behind it
-        // would never be tried (the same trap `enqueue`/`enqueue_many`
-        // already guard against on their own start paths).
         let mut started = false;
         while let Some(queued) = next {
             let Some(call) = self.voice.call(guild_id) else {
@@ -1229,16 +751,10 @@ impl PlayerRegistry {
         tokio::spawn(async move {
             tokio::time::sleep(IDLE_DISCONNECT).await;
 
-            // Re-checked rather than disconnecting unconditionally —
-            // something may have been queued (or `/leave` already run) while
-            // we slept — and re-checked *inside* the leave itself, holding
-            // the guild lock across both halves, so a `/play` landing in
-            // between can't be torn down mid-start. See `leave_if_idle`.
             registry.leave_if_idle(guild_id).await;
         });
     }
 
-    /// Stops the current track and clears the queue (does not leave voice).
     pub async fn stop(&self, guild_id: GuildId) -> Result<(), PlayerError> {
         let handle = {
             let mut guilds = self.guilds.lock().await;
@@ -1247,19 +763,11 @@ impl PlayerRegistry {
             };
             state.now_playing = None;
             state.current_track_id = None;
-            // Invalidates any in-flight background refill: radio's mix
-            // lookup can take arbitrarily long, and a track pushed into the
-            // queue after a `/stop` would either sit inert forever or be
-            // silently destroyed by the idle disconnect this schedules.
             state.epoch = state.epoch.wrapping_add(1);
             if let Some(prefetch) = state.prefetch.take() {
                 prefetch.abort();
             }
             let handle = state.current_handle.take();
-            // The epoch bump above already gates any in-flight refill from
-            // committing a track behind this `/stop` — see the `guilds`
-            // field's doc comment for why this DB call still happens inside
-            // the same lock acquisition rather than after it.
             if let Err(err) = db::queue_clear(&self.db, &guild_id.to_string()).await {
                 tracing::warn!(%guild_id, %err, "failed to clear the persisted queue on stop");
             }
@@ -1270,11 +778,6 @@ impl PlayerRegistry {
             return Err(PlayerError::NothingPlaying);
         };
 
-        // Stopping fires a Track::End event, but `current_track_id` is
-        // already cleared above, so `advance()` will recognize it as stale
-        // (belonging to a track that's no longer current) and ignore it
-        // rather than double-advance — schedule the idle timer ourselves
-        // instead of relying on that event to do it.
         let result = handle
             .stop()
             .await
@@ -1287,8 +790,6 @@ impl PlayerRegistry {
         result
     }
 
-    /// Stops the current track, which triggers the queue to auto-advance to
-    /// the next one via the existing track-end handler.
     pub async fn skip(&self, guild_id: GuildId) -> Result<(), PlayerError> {
         let handle = {
             let guilds = self.guilds.lock().await;
@@ -1339,15 +840,8 @@ impl PlayerRegistry {
         result
     }
 
-    /// Shuffles the upcoming queue in place. Leaves `now_playing` where it
-    /// is — shuffling shouldn't restart or skip the current track.
     pub async fn shuffle(&self, guild_id: GuildId) -> Result<(), PlayerError> {
         let guild_id_str = guild_id.to_string();
-        // Fetch, shuffle, and write back all under one lock acquisition —
-        // splitting the fetch and the write across two would reopen a
-        // window for a concurrent `enqueue` to land in between and get
-        // silently discarded by the write. See the `guilds` field's doc
-        // comment.
         let mut guilds = self.guilds.lock().await;
         let mut items = db::queue_all(&self.db, &guild_id_str)
             .await
@@ -1370,12 +864,6 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    /// Clears every upcoming track, leaving `now_playing` (and the current
-    /// track's playback) untouched. If radio mode is on, kicks off a fresh
-    /// refill afterward — mirroring `toggle_radio`'s "just turned on against
-    /// an empty queue" trigger — since clearing just wiped out whatever
-    /// runway `start_playback` had already topped up for when the current
-    /// track ends.
     pub async fn clear_queue(&self, guild_id: GuildId) -> Result<(), PlayerError> {
         let guild_id_str = guild_id.to_string();
         let needs_refill = {
@@ -1409,11 +897,6 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    /// Skips directly to the upcoming track at `index` (0-based, matching
-    /// [`QueueSnapshot::upcoming`]), discarding every track ahead of it.
-    /// Reuses the current track's stop path — the resulting track-finished
-    /// notification advances to the new front of the queue exactly as it
-    /// would on a natural track end or a `/skip`.
     pub async fn jump_to(&self, guild_id: GuildId, index: usize) -> Result<(), PlayerError> {
         let guild_id_str = guild_id.to_string();
         let mut guilds = self.guilds.lock().await;
@@ -1431,12 +914,6 @@ impl PlayerRegistry {
             .clone()
             .ok_or(PlayerError::NothingPlaying)?;
 
-        // Stop first, and keep the guild lock held while dropping the
-        // skipped-over entries: `TrackHandle::stop` is a non-blocking send
-        // to the mixer, so a failure here means nothing was stopped and the
-        // queue mutation must not be committed. Holding the lock across both
-        // also keeps the resulting End event's `advance` (which needs this
-        // same lock) from popping the old front before it's drained.
         handle
             .stop()
             .await
@@ -1457,14 +934,6 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    /// Cancels any in-flight prefetch and starts a fresh one for `next` (the
-    /// new front of the upcoming queue), if there is one. `prefetch` is only
-    /// ever kept in sync automatically when the queue is mutated by a plain
-    /// push/pop (see the field's doc comment) — `shuffle` and `jump_to`
-    /// instead reorder or drop entries out from under an in-flight prefetch,
-    /// which would otherwise hand the *next* track a download meant for
-    /// whatever used to be at the front (wrong audio playing under the
-    /// right track's title). Must be called with `state`'s guild lock held.
     fn restart_prefetch(&self, state: &mut GuildState, next: Option<QueuedTrack>) {
         if let Some(old) = state.prefetch.take() {
             old.abort();
@@ -1477,7 +946,6 @@ impl PlayerRegistry {
         }
     }
 
-    /// Whether the current track is paused. `None` if nothing is playing.
     pub async fn is_paused(&self, guild_id: GuildId) -> Option<bool> {
         let handle = {
             let guilds = self.guilds.lock().await;
@@ -1488,19 +956,13 @@ impl PlayerRegistry {
         handle.status().await.map(|status| status.paused)
     }
 
-    /// This guild's persisted playback volume (0-100), for display — the
-    /// same lookup [`Self::start_playback`] uses to apply it to a new track.
     pub async fn get_volume(&self, guild_id: GuildId) -> u8 {
         db::get_guild_volume(&self.db, &guild_id.to_string())
             .await
             .unwrap_or(db::DEFAULT_VOLUME)
     }
 
-    /// Sets and persists this guild's playback volume (0-100), applying it
-    /// immediately to whatever's currently playing.
     pub async fn set_volume(&self, guild_id: GuildId, volume: u8) -> Result<(), PlayerError> {
-        // Clamped rather than trusting the caller to have validated — see
-        // `start_playback`.
         let volume = volume.min(MAX_VOLUME);
         db::set_guild_volume(&self.db, &guild_id.to_string(), volume)
             .await
@@ -1522,17 +984,11 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    /// Flips radio mode for the guild and returns the new state. If it just
-    /// turned on and nothing is currently queued behind whatever's playing
-    /// (or nothing is playing at all), kicks off a refill in the background
-    /// rather than waiting for the next natural track-end.
     pub async fn toggle_radio(&self, guild_id: GuildId) -> bool {
         let (enabled, needs_refill) = {
             let mut guilds = self.guilds.lock().await;
             let state = guilds.entry(guild_id).or_default();
             state.radio_enabled = !state.radio_enabled;
-            // Toggling is the user's "try again" for a mix that previously
-            // came up empty.
             state.radio_exhausted = false;
             let enabled = state.radio_enabled;
             let needs_refill = if enabled {
@@ -1555,8 +1011,6 @@ impl PlayerRegistry {
         enabled
     }
 
-    /// Whether radio mode is on for this guild — for the `/player` panel's
-    /// toggle button.
     pub async fn is_radio_enabled(&self, guild_id: GuildId) -> bool {
         let guilds = self.guilds.lock().await;
         guilds
@@ -1564,21 +1018,6 @@ impl PlayerRegistry {
             .is_some_and(|state| state.radio_enabled)
     }
 
-    /// Spawns a background task that tops up `guild_id`'s queue with up to
-    /// [`RADIO_REFILL_BATCH`] radio-mix tracks, if radio mode is on and
-    /// something has already played this session (`radio_history` non-empty,
-    /// `radio_requested_by` set). No-op otherwise — called from
-    /// `start_playback` whenever the queue goes empty as a track starts, and
-    /// from `toggle_radio` when radio is
-    /// switched on mid-session against an already-empty queue. Calling it
-    /// from both places can race (e.g. toggled on the instant a track
-    /// starts with an empty queue) — worst case two tracks land instead of
-    /// one, which is harmless and not worth guarding against.
-    ///
-    /// On any failure (yt-dlp/mix-listing failure, hydration failure, or an
-    /// exhausted mix with no unplayed candidates left), logs a warning and
-    /// does nothing further — `advance()`'s existing idle-disconnect path
-    /// remains the safety net if the queue stays empty.
     fn maybe_spawn_radio_refill(&self, guild_id: GuildId) {
         let registry = self.clone();
         tokio::spawn(async move { registry.run_radio_refill(guild_id).await });
@@ -1639,10 +1078,6 @@ impl PlayerRegistry {
         let guilds = self.guilds.lock().await;
         let state = guilds.get(&guild_id)?;
         if state.radio_exhausted {
-            // Already established there's nothing left to pull from this
-            // mix — don't re-run the whole yt-dlp listing plus hydration on
-            // every queue drain just to find that out again. Cleared by a
-            // radio toggle or a hand-queued track.
             return None;
         }
         let (true, Some(requested_by)) = (state.radio_enabled, state.radio_requested_by) else {
@@ -1656,10 +1091,6 @@ impl PlayerRegistry {
         ))
     }
 
-    // A wider pool than `RADIO_REFILL_BATCH` needs, then shuffled: taking a
-    // strict prefix would always follow YouTube's single "most related"
-    // ordering, so every refill off the same seed would pick the same
-    // tracks in the same order.
     async fn radio_refill_candidates(
         &self,
         guild_id: GuildId,
@@ -1693,15 +1124,6 @@ impl PlayerRegistry {
         Some(candidates)
     }
 
-    // `state.epoch == epoch` rejects a refill that a `/stop` overtook while
-    // the (unbounded-latency) mix listing and hydration above were in
-    // flight: pushing now would resurrect a queue behind a stopped player,
-    // leaving an entry that either sits inert or gets quietly eaten by the
-    // idle disconnect `stop` already scheduled. The DB push below happens
-    // while still holding this same lock — the whole point of the epoch
-    // check is that nothing can invalidate this decision between checking
-    // it and committing, which is only true if the write lands inside the
-    // same critical section (see the `guilds` field's doc comment).
     async fn push_radio_refill(
         &self,
         guild_id: GuildId,
@@ -1737,12 +1159,6 @@ impl PlayerRegistry {
 
     pub async fn queue_snapshot(&self, guild_id: GuildId) -> QueueSnapshot {
         let guilds = self.guilds.lock().await;
-        // `now_playing` is claimed speculatively (see `enqueue`/`enqueue_many`
-        // /`advance`/`restore_session_if_new`) before the resolve/download/
-        // play attempt behind it is known to succeed. Surfacing it here
-        // before `current_track_id` confirms a track is actually playing
-        // would show a panel/`/queue` for a track no audio has played from
-        // yet — including one stuck mid-download that never starts at all.
         let now_playing = guilds.get(&guild_id).and_then(|s| {
             s.current_track_id
                 .is_some()
@@ -1761,10 +1177,6 @@ impl PlayerRegistry {
         }
     }
 
-    /// Live playback position of the current track, for a `/now_playing`
-    /// progress display. `None` if nothing is playing or songbird couldn't
-    /// report a position (e.g. the track just ended in a race with this
-    /// call) — a missing position isn't worth surfacing as an error.
     pub async fn now_playing_position(&self, guild_id: GuildId) -> Option<Duration> {
         let handle = {
             let guilds = self.guilds.lock().await;
@@ -1775,16 +1187,6 @@ impl PlayerRegistry {
         handle.status().await.map(|status| status.position)
     }
 
-    /// Atomic check-and-reserve for the `/player` command: if this guild
-    /// already has a live panel, refreshes and returns it (the same
-    /// self-heal an older `existing_panel` used to do standalone); otherwise
-    /// reserves the right to post one so a second, concurrent `/player`
-    /// doesn't also post one. See [`GuildState::claim_panel`] and
-    /// [`PanelClaim`].
-    ///
-    /// The caller MUST follow a [`PanelClaim::Reserved`] result with
-    /// [`Self::set_panel`] once it has posted, or [`Self::release_panel_slot`]
-    /// if it gives up before posting.
     pub async fn claim_panel_slot(&self, guild_id: GuildId) -> PanelClaim {
         let panel = {
             let mut guilds = self.guilds.lock().await;
@@ -1796,17 +1198,11 @@ impl PlayerRegistry {
         };
         let (channel_id, message_id) = panel;
 
-        // Refresh the existing panel in place, and only give up the slot
-        // (letting the caller post a fresh panel) if the message is
-        // genuinely gone rather than a transient edit failure.
         match self.edit_panel(guild_id, channel_id, message_id).await {
             Ok(()) => PanelClaim::Existing(panel),
             Err(failure) => {
                 let gone = self.forget_panel_if_gone(guild_id, panel, &failure).await;
                 if gone {
-                    // `forget_panel_if_gone` only clears `panel`, not a
-                    // reservation — there wasn't one here (we're in the
-                    // `Existing` arm), so it's safe to immediately reserve.
                     let mut guilds = self.guilds.lock().await;
                     let state = guilds.entry(guild_id).or_default();
                     state.claim_panel()
@@ -1817,10 +1213,6 @@ impl PlayerRegistry {
         }
     }
 
-    /// Records a freshly posted `/player` panel from a
-    /// [`PanelClaim::Reserved`] claim, best-effort deleting whatever panel
-    /// message preceded it (ignored if it's already gone — e.g. a user
-    /// deleted it themselves).
     pub async fn set_panel(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) {
         let old = {
             let mut guilds = self.guilds.lock().await;
@@ -1837,9 +1229,6 @@ impl PlayerRegistry {
         }
     }
 
-    /// Releases a [`PanelClaim::Reserved`] claim without posting a panel —
-    /// e.g. the send itself failed — so a later `/player` isn't wedged
-    /// forever believing one is already being posted.
     pub async fn release_panel_slot(&self, guild_id: GuildId) {
         let mut guilds = self.guilds.lock().await;
         if let Some(state) = guilds.get_mut(&guild_id) {
@@ -1847,11 +1236,6 @@ impl PlayerRegistry {
         }
     }
 
-    /// Renders and pushes the panel's current appearance to an already-known
-    /// panel message. Shared by [`Self::refresh_panel`] (looks up the
-    /// pointer itself and self-heals on failure) and [`Self::leave`] (which
-    /// already has the pointer in hand, from the `GuildState` it just
-    /// removed).
     async fn edit_panel(
         &self,
         guild_id: GuildId,
@@ -1874,17 +1258,6 @@ impl PlayerRegistry {
             .map_err(|err| PanelEditFailure::classify(&err))
     }
 
-    /// Compare-and-clear for a failed panel edit: forgets the guild's panel
-    /// pointer only if the failure means the message is really gone *and*
-    /// the stored pointer is still the one that failed. Returns whether the
-    /// panel was considered gone.
-    ///
-    /// The comparison matters because the edit happens with the guild lock
-    /// released: two `/player` invocations landing together can have the
-    /// second one delete the first's message and install its own before the
-    /// first's edit fails. Clearing unconditionally would then wipe out the
-    /// pointer to the panel that's actually live, and the next `/player`
-    /// would post a duplicate.
     async fn forget_panel_if_gone(
         &self,
         guild_id: GuildId,
@@ -1905,15 +1278,6 @@ impl PlayerRegistry {
         true
     }
 
-    /// Edits this guild's live `/player` panel message (if any) with fresh
-    /// content — called after every state-changing mutation so the panel
-    /// stays current regardless of what triggered the change (its own
-    /// buttons, a slash command, or a track ending on its own).
-    ///
-    /// Self-heals when the message turns out to have been deleted out from
-    /// under it, by forgetting the panel so later mutations don't keep
-    /// retrying a dead pointer — see [`Self::forget_panel_if_gone`] for why
-    /// that's narrower than "any edit failure".
     async fn refresh_panel(&self, guild_id: GuildId) {
         let panel = {
             let guilds = self.guilds.lock().await;
@@ -1948,12 +1312,6 @@ mod tests {
         }
     }
 
-    // `GuildState::is_idle` was a sync helper over the in-memory queue;
-    // there's no synchronous equivalent now that the upcoming queue lives in
-    // the DB. Its cases are covered by the `leave_if_idle_*` tests below
-    // instead, which exercise the same "nothing playing and nothing queued"
-    // decision through the real (now async) code path.
-
     #[test]
     fn volume_is_clamped_to_full_scale() {
         assert!((volume_multiplier(0) - 0.0).abs() < f32::EPSILON);
@@ -1984,11 +1342,6 @@ mod tests {
 
     #[test]
     fn weighting_favors_the_most_recent_entry_over_many_draws() {
-        // Weight is linear in position (oldest = 1, ..., newest = len), so
-        // with 4 entries the newest is picked 4x as often as the oldest —
-        // never literally 100% of the time, unlike the old single-seed
-        // behavior. `StdRng` is deterministic, so the counts below are
-        // stable across runs.
         use rand::SeedableRng;
         let history: Vec<String> = ["oldest", "b", "c", "newest"]
             .iter()
@@ -2005,7 +1358,6 @@ mod tests {
             }
         }
         assert!(newest_count > oldest_count);
-        // Not deterministic to a single track: the oldest still shows up.
         assert!(oldest_count > 0);
     }
 
@@ -2034,10 +1386,6 @@ mod tests {
         }
     }
 
-    /// Non-HTTP failures are never "the message was deleted", so they must
-    /// not clear the panel pointer. The 404/`Unknown Message` side can't be
-    /// unit-tested: serenity's `DiscordJsonError` is `#[non_exhaustive]`, so
-    /// an `ErrorResponse` can't be constructed outside serenity.
     #[test]
     fn transient_failures_do_not_count_as_a_deleted_panel() {
         for err in [
@@ -2050,8 +1398,6 @@ mod tests {
             ));
         }
     }
-
-    // ---- GuildState::claim_panel / set_panel / release_panel ----
 
     fn sample_panel() -> (ChannelId, MessageId) {
         (ChannelId::new(111), MessageId::new(222))
@@ -2076,13 +1422,9 @@ mod tests {
             PanelClaim::Reserved => panic!("expected Existing, got Reserved"),
             PanelClaim::InProgress => panic!("expected Existing, got InProgress"),
         }
-        // Seeing an existing panel must not also flip the reservation flag.
         assert!(!state.panel_reserved);
     }
 
-    /// The race this whole mechanism exists to close: a second claim while
-    /// the first reservation is still outstanding (nothing posted yet) must
-    /// not also get `Reserved` — that would let both callers post a panel.
     #[test]
     fn a_second_claim_while_reserved_does_not_also_reserve() {
         let mut state = GuildState::default();
@@ -2111,36 +1453,18 @@ mod tests {
 
         assert!(!state.panel_reserved);
         assert!(state.panel.is_none());
-        // The slot is claimable again after a released reservation.
         assert!(matches!(state.claim_panel(), PanelClaim::Reserved));
     }
-
-    // ---- fake VoiceBackend/VoiceCall/VoiceTrack, for exercising the queue
-    // state machine without a live songbird connection ----
 
     #[derive(Default)]
     struct FakeTrackState {
         stopped: bool,
         paused: bool,
         volume: Option<f32>,
-        /// Set by [`FakeTrack::fail_stop`] to make the next `stop()` call
-        /// return an error instead of succeeding — used to check that
-        /// callers don't commit a state mutation whose preceding `stop()`
-        /// failed (see `jump_to_does_not_drain_the_queue_if_stop_fails`).
         stop_error: Option<String>,
-        /// Set by `notify_when_finished`, modeling the per-track handler
-        /// registration `VoiceTrack` still declares (the production
-        /// `IpcTrack` implementation is a no-op there, since
-        /// `apollo-audio-worker` routes finish events per-guild instead —
-        /// see its doc comment). `FakeBackend::finish_track` dispatches
-        /// through this rather than a guild-level sink, so a test would
-        /// catch a regression where playback forgets to call
-        /// `notify_when_finished` on a newly started track.
         registered: Option<(GuildId, Arc<dyn VoiceEvents>)>,
     }
 
-    /// Fake [`VoiceTrack`]: records what was called on it instead of
-    /// actually controlling any audio.
     struct FakeTrack {
         uuid: Uuid,
         state: StdMutex<FakeTrackState>,
@@ -2166,7 +1490,6 @@ mod tests {
             self.state.lock().unwrap().volume
         }
 
-        /// Makes the next `stop()` call on this track fail with `message`.
         fn fail_stop(&self, message: &str) {
             self.state.lock().unwrap().stop_error = Some(message.to_string());
         }
@@ -2219,14 +1542,11 @@ mod tests {
         }
     }
 
-    /// One play() call recorded by [`FakeCall`].
     struct PlayedTrack {
         video_id: String,
         handle: Arc<FakeTrack>,
     }
 
-    /// Fake [`VoiceCall`]: records every `play()` call instead of touching
-    /// songbird's mixer.
     #[derive(Default)]
     struct FakeCall {
         played: StdMutex<Vec<PlayedTrack>>,
@@ -2277,20 +1597,10 @@ mod tests {
     #[derive(Default)]
     struct FakeBackendState {
         calls: HashMap<GuildId, Arc<FakeCall>>,
-        /// The `events` sink handed to the most recent successful `join()`
-        /// per guild — stands in for songbird's `DriverDisconnectHandler`,
-        /// which forwards to this same sink in production. `TrackEndHandler`
-        /// is modeled separately, per track, via `FakeTrack::registered`.
         events: HashMap<GuildId, Arc<dyn VoiceEvents>>,
-        /// Consumed (taken) by the next `join()` call, so a test can make
-        /// exactly one join fail without affecting a later rejoin attempt.
         next_join_failure: Option<String>,
     }
 
-    /// Fake [`VoiceBackend`]: an in-memory stand-in for songbird, with no
-    /// real voice connection. `join`/`remove`/`call` behave like a map of
-    /// guild -> [`FakeCall`]; `buffered_source` hands back an [`AudioSource`]
-    /// pointing at a path nothing here ever actually reads.
     #[derive(Default)]
     struct FakeBackend {
         state: StdMutex<FakeBackendState>,
@@ -2301,8 +1611,6 @@ mod tests {
             Arc::new(Self::default())
         }
 
-        /// Makes the *next* `join()` call fail with `message` instead of
-        /// succeeding.
         fn fail_next_join(&self, message: &str) {
             self.state.lock().unwrap().next_join_failure = Some(message.to_string());
         }
@@ -2311,12 +1619,6 @@ mod tests {
             self.state.lock().unwrap().calls.get(&guild_id).cloned()
         }
 
-        /// Simulates songbird reporting that `track_id` ended (or errored),
-        /// driving [`PlayerRegistry::advance`] exactly as a real
-        /// `TrackEndHandler` would. Dispatches through the track's own
-        /// `notify_when_finished` registration, so this is a no-op — instead
-        /// of misreporting the event as delivered — if playback never
-        /// registered a handler on `track_id`.
         async fn finish_track(&self, guild_id: GuildId, track_id: Uuid) {
             let registered = self
                 .call_for(guild_id)
@@ -2327,10 +1629,6 @@ mod tests {
             }
         }
 
-        /// Simulates the voice connection being lost, driving
-        /// [`PlayerRegistry::connection_lost`] exactly as a real
-        /// `DriverDisconnectHandler` would. No-op if `guild_id` was never
-        /// joined.
         async fn disconnect(&self, guild_id: GuildId) {
             let events = self.state.lock().unwrap().events.get(&guild_id).cloned();
             if let Some(events) = events {
@@ -2378,8 +1676,6 @@ mod tests {
         }
     }
 
-    /// An [`AudioSource`] pointing at a path nothing in these tests ever
-    /// actually reads.
     fn empty_source(video_id: &str) -> AudioSource {
         AudioSource {
             video_id: video_id.to_string(),
@@ -2387,8 +1683,6 @@ mod tests {
         }
     }
 
-    /// An in-memory-DB-backed [`PlayerRegistry`] wired to a fresh
-    /// [`FakeBackend`], not yet joined to any voice channel.
     async fn new_registry() -> (PlayerRegistry, Arc<FakeBackend>, GuildId) {
         let db = db::connect("sqlite::memory:").await.expect("in-memory db");
         let backend = FakeBackend::new();
@@ -2396,8 +1690,6 @@ mod tests {
         (registry, backend, GuildId::new(1))
     }
 
-    /// A [`new_registry`], already `join`ed into `guild_id`'s voice channel —
-    /// the common setup for the state-machine tests below.
     async fn joined_registry() -> (PlayerRegistry, Arc<FakeBackend>, GuildId) {
         let (registry, backend, guild_id) = new_registry().await;
         registry
@@ -2425,8 +1717,6 @@ mod tests {
             .collect()
     }
 
-    // ---- enqueue / enqueue_many ----
-
     #[tokio::test]
     async fn enqueue_starts_playback_immediately_on_an_empty_queue() {
         let (registry, backend, guild_id) = joined_registry().await;
@@ -2448,7 +1738,6 @@ mod tests {
         registry.enqueue(guild_id, queued("b")).await.unwrap();
 
         let call = backend.call_for(guild_id).unwrap();
-        // Only "a" was ever handed to the backend — "b" sits in the queue.
         assert_eq!(call.played_video_ids(), vec!["a"]);
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
@@ -2485,14 +1774,11 @@ mod tests {
 
         assert_eq!(queued_count, 2);
         let call = backend.call_for(guild_id).unwrap();
-        // Nothing new started — "a" is still the only track ever played.
         assert_eq!(call.played_video_ids(), vec!["a"]);
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(upcoming_ids(&snapshot), vec!["b", "c"]);
         assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
     }
-
-    // ---- advance() ----
 
     #[tokio::test]
     async fn advance_starts_the_next_queued_track_when_one_ends() {
@@ -2525,17 +1811,12 @@ mod tests {
 
     #[tokio::test]
     async fn advance_ignores_a_stale_track_finished_event() {
-        // An End/Error event for a track that's already been superseded
-        // (stopped/skipped/replaced) must not advance the queue a second
-        // time — see `advance`'s doc comment.
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
         registry.enqueue(guild_id, queued("b")).await.unwrap();
         let a_id = current_track_id(&registry, guild_id).await;
 
-        // "a" naturally finishes, advancing to "b"...
         backend.finish_track(guild_id, a_id).await;
-        // ...then a's now-stale End event lands a second time.
         backend.finish_track(guild_id, a_id).await;
 
         let call = backend.call_for(guild_id).unwrap();
@@ -2543,8 +1824,6 @@ mod tests {
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(snapshot.now_playing.unwrap().track.video_id, "b");
     }
-
-    // ---- stop() ----
 
     #[tokio::test]
     async fn stop_clears_queue_state_stops_playback_and_bumps_the_epoch() {
@@ -2580,8 +1859,6 @@ mod tests {
         assert!(matches!(err, PlayerError::NothingPlaying));
     }
 
-    // ---- jump_to() ----
-
     #[tokio::test]
     async fn jump_to_stops_the_current_track_and_drops_skipped_entries() {
         let (registry, backend, guild_id) = joined_registry().await;
@@ -2593,24 +1870,17 @@ mod tests {
         let a_track = backend.call_for(guild_id).unwrap().last_track();
         let a_id = current_track_id(&registry, guild_id).await;
 
-        // Jump to upcoming[1] ("c"), dropping "b" ahead of it.
         registry.jump_to(guild_id, 1).await.unwrap();
 
         assert!(a_track.was_stopped());
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(upcoming_ids(&snapshot), vec!["c", "d"]);
-        // The stopped track's End event fires just as a natural end would,
-        // advancing into the new front of the queue.
         backend.finish_track(guild_id, a_id).await;
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(upcoming_ids(&snapshot), vec!["d"]);
         assert_eq!(snapshot.now_playing.unwrap().track.video_id, "c");
     }
 
-    /// The bug `jump_to` fixed: the queue must only be drained *after*
-    /// `stop()` on the current track succeeds — never on a failed stop,
-    /// which would drop entries out from under a track that's still
-    /// actually playing.
     #[tokio::test]
     async fn jump_to_does_not_drain_the_queue_if_stop_fails() {
         let (registry, backend, guild_id) = joined_registry().await;
@@ -2626,7 +1896,6 @@ mod tests {
 
         assert!(matches!(err, PlayerError::Playback(_)));
         let snapshot = registry.queue_snapshot(guild_id).await;
-        // Unchanged — the drain never ran.
         assert_eq!(upcoming_ids(&snapshot), vec!["b", "c"]);
     }
 
@@ -2640,8 +1909,6 @@ mod tests {
 
         assert!(matches!(err, PlayerError::InvalidSelection));
     }
-
-    // ---- clear_queue() ----
 
     #[tokio::test]
     async fn clear_queue_drops_upcoming_but_leaves_now_playing_alone() {
@@ -2680,13 +1947,6 @@ mod tests {
         assert!(matches!(err, PlayerError::QueueEmpty));
     }
 
-    // ---- leave_if_idle / schedule_idle_disconnect ----
-    //
-    // These call `leave_if_idle` directly rather than going through
-    // `schedule_idle_disconnect`'s real 150-second timer — the race it
-    // closes is about lock ordering, not timing, so a deterministic
-    // sequential call is enough to exercise it (see the handoff doc).
-
     #[tokio::test]
     async fn leave_if_idle_leaves_voice_when_the_guild_is_idle() {
         let (registry, backend, guild_id) = joined_registry().await;
@@ -2698,9 +1958,6 @@ mod tests {
 
     #[tokio::test]
     async fn leave_if_idle_does_nothing_if_a_track_is_playing() {
-        // Closes the race with a concurrent `enqueue`: if a track landed
-        // between the idle timer being scheduled and it firing, the guild is
-        // no longer idle and must not be torn down.
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
 
@@ -2713,9 +1970,6 @@ mod tests {
 
     #[tokio::test]
     async fn leave_if_idle_does_nothing_if_only_the_queue_is_non_empty() {
-        // A queue entry with nothing playing (e.g. a radio refill that
-        // landed just after a `/stop`) must not be disconnected out from
-        // under either.
         let (registry, backend, guild_id) = joined_registry().await;
         db::queue_push_back(&registry.db, &guild_id.to_string(), &queued("a"))
             .await
@@ -2725,8 +1979,6 @@ mod tests {
 
         assert!(backend.call_for(guild_id).is_some());
     }
-
-    // ---- join failure ----
 
     #[tokio::test]
     async fn join_failure_is_reported_and_leaves_no_call_registered() {
@@ -2742,8 +1994,6 @@ mod tests {
         assert!(backend.call_for(guild_id).is_none());
     }
 
-    // ---- connection_lost ----
-
     #[tokio::test]
     async fn connection_lost_tears_down_playback_state() {
         let (registry, backend, guild_id) = joined_registry().await;
@@ -2755,12 +2005,6 @@ mod tests {
         let guilds = registry.guilds.lock().await;
         assert!(guilds.get(&guild_id).is_none());
     }
-
-    // ---- pause / resume / set_volume ----
-    //
-    // Not called out by name in the handoff's test list, but cheap to cover
-    // now that a fake track exists, and they exercise `FakeTrack` state the
-    // fakes above otherwise expose unused.
 
     #[tokio::test]
     async fn pause_and_resume_toggle_the_current_track() {
@@ -2787,8 +2031,6 @@ mod tests {
 
         assert_eq!(track.volume(), Some(0.5));
     }
-
-    // ---- session persistence (persist_session / restore_session_if_new) ----
 
     #[tokio::test]
     async fn enqueue_persists_a_resumable_session() {
@@ -2873,9 +2115,6 @@ mod tests {
         assert!(registry.is_radio_enabled(guild_id).await);
     }
 
-    /// The ordering `restore_session_if_new` exists to guarantee: a freshly
-    /// requested track must land behind whatever session was resumed, not
-    /// jump ahead of it.
     #[tokio::test]
     async fn enqueue_after_restore_appends_behind_the_resumed_queue() {
         let (registry, backend, guild_id) = new_registry().await;
@@ -2894,7 +2133,6 @@ mod tests {
         registry.enqueue(guild_id, queued("new")).await.unwrap();
 
         let call = backend.call_for(guild_id).unwrap();
-        // Only the restored "a" was ever started — "new" sits behind it.
         assert_eq!(call.played_video_ids(), vec!["a"]);
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(upcoming_ids(&snapshot), vec!["new"]);
@@ -2917,14 +2155,4 @@ mod tests {
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert!(snapshot.now_playing.is_none());
     }
-
-    // Note on radio-refill / `epoch`: `maybe_spawn_radio_refill` only
-    // reaches its `epoch` guard after live `yt-dlp`/YouTube network calls
-    // (`radio::list_mix_video_ids`, `YouTubeClient::hydrate_videos`), which
-    // sit outside the `VoiceBackend` seam this refactor introduced — faking
-    // them would mean adding a second, wider trait boundary rather than
-    // testing through the existing one. That's left untested here, per the
-    // handoff's own scope note; `stop_clears_queue_state_stops_playback_and_bumps_the_epoch`
-    // above covers the one piece of that mechanism that *is* reachable
-    // through `VoiceBackend`: that `stop()` bumps `epoch` at all.
 }

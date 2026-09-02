@@ -1,7 +1,3 @@
-//! The wire protocol between `apollo` and `apollo-audio-worker`: one
-//! full-duplex framed stream carrying request/response pairs (correlated by
-//! `id`) and server-pushed events, all wrapped in [`Envelope`].
-
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

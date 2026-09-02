@@ -1,26 +1,13 @@
-//! Rendering for the `/player` panel: the embed and button/select-menu rows
-//! that represent a guild's playback state.
-//!
-//! Pure functions of [`PlayerRegistry`]'s own state — no `Data`/`Context`
-//! dependency — so the same rendering backs the initial `/player` post,
-//! [`PlayerRegistry`]'s self-refresh after every state-changing mutation,
-//! and the panel's own button clicks. Lives under `voice` rather than
-//! `commands` because `PlayerRegistry` needs to call into it directly to
-//! refresh a live panel, and `voice` must not depend on `commands`.
-
 use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
 
 use super::player::{PlayerRegistry, QueueSnapshot, QueuedTrack};
 
-/// Discord select menus cap out at 25 options.
 const QUEUE_SELECT_LIMIT: usize = 25;
 
-/// Accent color for the now-playing embed.
 const ACCENT_COLOR: serenity::Colour = serenity::Colour::new(0x008B_5CF6);
 
-/// Formats a `Duration` as `mm:ss`, or `h:mm:ss` once it reaches an hour.
 pub(crate) fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
     let hours = total_secs / 3600;
@@ -33,7 +20,6 @@ pub(crate) fn format_duration(duration: Duration) -> String {
     }
 }
 
-/// Picks a volume glyph for the panel's volume button: muted, low, or full.
 fn volume_glyph(volume: u8) -> char {
     match volume {
         0 => '🔇',
@@ -42,7 +28,6 @@ fn volume_glyph(volume: u8) -> char {
     }
 }
 
-/// Discord caps select-menu option labels at 100 characters.
 pub(crate) fn truncate_label(label: &str) -> String {
     if label.chars().count() > 100 {
         let mut truncated: String = label.chars().take(97).collect();
@@ -53,14 +38,8 @@ pub(crate) fn truncate_label(label: &str) -> String {
     }
 }
 
-/// Builds the now-playing embed: title (linked to the video), thumbnail,
-/// requester, and progress (`position / duration`, or just `position` if the
-/// video's total duration is unknown, or omitted entirely if songbird
-/// couldn't report a position).
 fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> serenity::CreateEmbed {
     let video_url = format!("https://www.youtube.com/watch?v={}", queued.track.video_id);
-    // YouTube's thumbnail CDN follows this URL shape for every public video
-    // ID — no extra API call needed to get it.
     let thumbnail_url = format!(
         "https://i.ytimg.com/vi/{}/hqdefault.jpg",
         queued.track.video_id
@@ -92,16 +71,6 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
     embed
 }
 
-/// Builds the panel's button/select-menu rows: play/pause toggle, skip,
-/// stop, shuffle, and radio toggle on one row; a volume button (opens a
-/// type-in modal) alongside the Search and Playlists entry points into the
-/// library on another; and — when the queue isn't empty — a select menu to
-/// jump straight to an upcoming track.
-///
-/// The playback row disables itself when nothing is playing; volume, Search,
-/// and Playlists stay enabled always, since volume applies to future tracks
-/// too and `/player` is meant to be usable as a cold-start entry point into
-/// the whole app.
 fn panel_components(
     snapshot: &QueueSnapshot,
     paused: Option<bool>,
@@ -120,8 +89,6 @@ fn panel_components(
     rows
 }
 
-// At Discord's 5-button-per-row cap with `radio_toggle` included — a future
-// addition here needs its own row.
 fn playback_row(
     snapshot: &QueueSnapshot,
     paused: Option<bool>,
@@ -139,9 +106,6 @@ fn playback_row(
     }
     .disabled(!has_now_playing);
 
-    // Not gated by `has_now_playing`, unlike the other buttons in this row —
-    // toggling radio mode (or discovering it needs something to play first)
-    // should work with nothing currently playing.
     let radio_toggle = if radio_enabled {
         serenity::CreateButton::new("player:radio")
             .label("📻 Radio: On")
@@ -170,11 +134,6 @@ fn playback_row(
     ])
 }
 
-// Volume (a single button, rather than the old step +/- pair, so the exact
-// level is one tap — opening a type-in modal — away instead of several)
-// alongside the library entry point and Clear Queue, all on one row —
-// `playback_row` is already at Discord's 5-button cap, so Clear Queue (a
-// queue op, like Shuffle) lands here instead.
 fn controls_row(snapshot: &QueueSnapshot, volume: u8) -> serenity::CreateActionRow {
     serenity::CreateActionRow::Buttons(vec![
         serenity::CreateButton::new("player:volume")
@@ -218,14 +177,6 @@ fn queue_select_row(snapshot: &QueueSnapshot) -> Option<serenity::CreateActionRo
     Some(serenity::CreateActionRow::SelectMenu(select))
 }
 
-/// Renders the full panel for `guild_id` from [`PlayerRegistry`]'s current
-/// state: message content (used when nothing is playing — empty
-/// otherwise, since the embed carries the info instead), the now-playing
-/// embed (if any), and the button/select rows.
-///
-/// Single source of truth for the panel's appearance, used by the initial
-/// `/player` post, every self-refresh `PlayerRegistry` triggers after a
-/// mutation, and the panel's own button-click handler.
 pub(crate) async fn render(
     registry: &PlayerRegistry,
     guild_id: serenity::GuildId,
@@ -274,8 +225,6 @@ mod tests {
         }
     }
 
-    /// `CreateEmbed` derives `Serialize`; round-tripping through JSON is the
-    /// only way to inspect a built embed's fields from outside the crate.
     fn embed_json(embed: serenity::CreateEmbed) -> serde_json::Value {
         serde_json::to_value(embed).expect("CreateEmbed should serialize")
     }
@@ -388,8 +337,6 @@ mod tests {
     fn playback_buttons_disabled_when_nothing_playing() {
         let snapshot = sample_queue_snapshot(false, 0);
         let json = components_json(&panel_components(&snapshot, None, 50, false));
-        // toggle, skip, stop, shuffle — the radio toggle (last button) is
-        // deliberately exempt, see `radio_button_stays_enabled_when_nothing_playing`.
         let buttons = json[0]["components"].as_array().unwrap();
         for button in &buttons[..buttons.len() - 1] {
             assert_eq!(button["disabled"], true, "{button:?} should be disabled");

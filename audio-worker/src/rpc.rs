@@ -1,7 +1,3 @@
-//! Dispatches one IPC connection: reads `Request` frames and replies with
-//! `Response` frames, while a second task forwards songbird-originated
-//! `Event`s onto the same connection as they occur.
-
 use std::sync::Arc;
 
 use apollo_ipc::proto::{Envelope, Event as IpcEvent, Request, Response};
@@ -56,9 +52,6 @@ async fn dispatch(sessions: &Sessions, request: Request) -> Result<Response, Str
     }
 }
 
-/// Handles one connection end to end. Returns once the connection closes
-/// (cleanly or otherwise), at which point the caller tears down all active
-/// sessions — see `main.rs`.
 pub async fn handle_connection<R, W>(
     read_half: R,
     write_half: W,
@@ -91,14 +84,6 @@ pub async fn handle_connection<R, W>(
     let _ = writer_task.await;
 }
 
-/// Reads request frames and dispatches each on its own spawned task, so a
-/// slow request for one guild (e.g. `Join`'s voice-gateway handshake) never
-/// delays reading — let alone dispatching — a concurrently queued request
-/// for another guild. Responses go back over `outbound_tx` (shared with the
-/// event forwarder), which `run_writer` serializes onto the one socket; the
-/// client correlates them by `id`, not arrival order, so completing out of
-/// request order is fine (see `apollo_ipc::proto::Envelope::Response` and
-/// `Connection::pending` in apollo's `voice/ipc_backend.rs`).
 async fn run_reader<R: AsyncRead + Unpin>(
     mut reader: R,
     sessions: &Arc<Sessions>,
@@ -123,11 +108,6 @@ async fn run_reader<R: AsyncRead + Unpin>(
         let sessions = Arc::clone(sessions);
         let outbound_tx = outbound_tx.clone();
         tokio::spawn(async move {
-            // Dispatched on an inner task and joined here so a panic inside
-            // `dispatch` (e.g. a songbird call) still yields an error
-            // response instead of leaving the client's request pending
-            // forever — `dispatch` already reports its own `Err`s over the
-            // wire, this only covers the task-died case.
             let response = match tokio::spawn(async move { dispatch(&sessions, body).await }).await
             {
                 Ok(response) => response,
@@ -156,13 +136,6 @@ mod tests {
 
     use super::*;
 
-    /// Drives `handle_connection` over an in-memory duplex pipe (standing in
-    /// for the real Unix socket) so the actual accept/dispatch/response loop
-    /// gets exercised end to end without a real process boundary or a live
-    /// Discord voice connection — the one thing this can't cover is
-    /// anything past `Sessions::join` actually reaching a real
-    /// `songbird::Driver::connect`, which needs live voice credentials (see
-    /// the manual end-to-end step in the project's split-worker plan).
     async fn connected_client() -> (
         tokio::io::WriteHalf<tokio::io::DuplexStream>,
         tokio::io::ReadHalf<tokio::io::DuplexStream>,

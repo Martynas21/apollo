@@ -15,8 +15,6 @@ use session::Sessions;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Same as `apollo`'s own `main.rs`: tolerate a missing `.env` (e.g. under
-    // Docker, where config arrives via the environment directly).
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
@@ -29,9 +27,6 @@ async fn main() -> anyhow::Result<()> {
         apollo_ipc::optional_env_var(&|key| std::env::var(key), "AUDIO_WORKER_SOCKET")
             .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_PATH.to_string());
 
-    // A previous run's socket file left behind (crash, restart) makes
-    // `UnixListener::bind` fail with "address in use" even though nothing is
-    // listening — remove it first.
     if std::path::Path::new(&socket_path).exists() {
         std::fs::remove_file(&socket_path)?;
     }
@@ -46,12 +41,6 @@ async fn main() -> anyhow::Result<()> {
     let sessions = Arc::new(Sessions::new(events_tx));
     let events_rx = Arc::new(Mutex::new(events_rx));
 
-    // `docker compose down`/restart sends SIGTERM to this process (PID 1 in
-    // its container); Ctrl+C sends SIGINT when run directly. Neither has a
-    // default disposition that runs our cleanup, so without handling them
-    // explicitly the process would die immediately, leaving active voice
-    // connections dangling from Discord's perspective until its own gateway
-    // timeout catches up.
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
@@ -74,11 +63,6 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Accepts and fully services one connection, tearing down all sessions once
-/// it ends. Split out of `main`'s loop so it can be raced against the signal
-/// handlers in a `tokio::select!` — a signal arriving mid-connection cancels
-/// this future (dropping the in-flight connection) and runs `leave_all`
-/// itself instead.
 async fn accept_and_handle(
     listener: &UnixListener,
     sessions: &Arc<Sessions>,
@@ -87,10 +71,6 @@ async fn accept_and_handle(
     let (stream, _addr) = listener.accept().await?;
     tracing::info!("apollo connected");
 
-    // Discard anything left over from a previous connection's still-in-flight
-    // events — a fresh connection means `apollo` has no sessions registered
-    // against this worker yet (see `leave_all` below), so stale events
-    // referencing them would be meaningless.
     {
         let mut rx = events_rx.lock().await;
         while rx.try_recv().is_ok() {}

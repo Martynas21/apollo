@@ -1,6 +1,3 @@
-//! `/play`, `/queue`, `/skip`, `/pause`, `/resume`, `/stop`, `/player`,
-//! `/shuffle`, `/volume`: voice playback commands.
-
 use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
@@ -11,36 +8,16 @@ use crate::voice::panel::format_duration;
 use crate::voice::player::{PanelClaim, PlayerError, QueuedTrack};
 use crate::youtube::api::Track;
 
-/// Max `upcoming` entries shown in `/queue` before truncating with a
-/// "...and N more" trailer, to stay well under Discord's ~2000 char message
-/// cap on a long queue.
 const QUEUE_DISPLAY_LIMIT: usize = 10;
 
-/// How long the `/player` panel's Search button waits for a modal submission
-/// before giving up.
 const SEARCH_MODAL_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// How long the `/player` panel's Volume button waits for a modal submission
-/// before giving up.
 const VOLUME_MODAL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// How long a public status reply (`reply_public`'s "Queued: ...",
-/// "Skipped.", `/queue` listing, etc.) lingers before this schedules its own
-/// removal — long enough to read, short enough that the channel doesn't
-/// accumulate bot replies forever.
 const STATUS_REPLY_CLEANUP_DELAY: Duration = Duration::from_secs(15);
 
-/// How long an interactive prompt (a picker with a select menu, etc.) lingers
-/// before this schedules its own removal — longer than
-/// [`STATUS_REPLY_CLEANUP_DELAY`] since it takes a moment to read the options
-/// and act on one. `pub(super)` so `library.rs`'s picker cleanup (a different
-/// delete path — see its `schedule_picker_cleanup`) shares this window.
 pub(super) const REPLY_CLEANUP_DELAY: Duration = Duration::from_secs(30);
 
-/// Extracts a `YouTube` video ID from a URL, recognizing `youtu.be` short
-/// links, `.../watch?v=...`, and `.../shorts/...`. Returns `None` for
-/// anything that isn't a URL at all (treated by callers as a search query)
-/// or a recognized host with an unrecognized path.
 fn extract_video_id(input: &str) -> Option<String> {
     let url = url::Url::parse(input).ok()?;
     let host = url.host_str()?;
@@ -70,19 +47,6 @@ fn extract_video_id(input: &str) -> Option<String> {
     None
 }
 
-/// Whether `input` looks like a `YouTube` playlist link — a recognized host
-/// with a `list=` query parameter — regardless of whether
-/// [`extract_video_id`] could also pull a video id out of it (a
-/// `/watch?v=...&list=...` link is both; that case is already handled fine
-/// by playing the video, so this is only consulted when `extract_video_id`
-/// came back empty).
-///
-/// Used by `/play` to catch a pasted playlist URL and queue the whole
-/// playlist instead of silently falling through to a free-text search for
-/// the raw URL string, which would queue an unrelated top search result
-/// with no indication anything went wrong. A bare playlist ID (no URL) is
-/// not detected here — that's ambiguous with a single-word search term, so
-/// it's just treated as a search query.
 fn looks_like_playlist_url(input: &str) -> bool {
     let Ok(url) = url::Url::parse(input) else {
         return false;
@@ -95,8 +59,6 @@ fn looks_like_playlist_url(input: &str) -> bool {
     recognized_host && url.query_pairs().any(|(key, _)| key == "list")
 }
 
-/// Formats a track as `**title** — channel (mm:ss)`, omitting the duration
-/// parenthetical when unknown.
 fn format_track(track: &Track) -> String {
     match track.duration {
         Some(duration) => format!(
@@ -109,15 +71,6 @@ fn format_track(track: &Track) -> String {
     }
 }
 
-/// Handles a `player:*` button/select click from the `/player` panel.
-///
-/// `search` and `playlists` open a library picker and don't touch playback
-/// state, so they're handled up front and return early. Every other id
-/// applies a [`crate::voice::PlayerRegistry`] mutation, then rebuilds the
-/// panel via [`crate::voice::panel::render`] and edits it in place —
-/// `PlayerRegistry` also pushes this same rendering to the panel on its own
-/// after the mutation, so this in-place edit is just for zero-latency
-/// feedback on the click itself.
 pub async fn handle_component(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -146,11 +99,6 @@ pub async fn handle_component(
     respond_to_component_action(ctx, component, guild_id, data, result).await
 }
 
-/// Applies the [`crate::voice::PlayerRegistry`] mutation for a `player:*`
-/// custom id that isn't one of the up-front special cases in
-/// [`handle_component`]. `None` if `custom_id` isn't recognized at all —
-/// distinct from `Some(Ok(()))`, since an unrecognized id shouldn't trigger
-/// the panel re-render/edit that follows a real mutation.
 async fn apply_component_action(
     custom_id: &str,
     component: &serenity::ComponentInteraction,
@@ -184,11 +132,6 @@ async fn apply_component_action(
     })
 }
 
-/// Turns the outcome of [`apply_component_action`] into the actual
-/// interaction response: an ephemeral error message on `Err`, or on `Ok` a
-/// rebuilt panel edited in place for zero-latency feedback on the click
-/// itself (`PlayerRegistry` also pushes this same rendering to the panel on
-/// its own after the mutation).
 async fn respond_to_component_action(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -228,13 +171,6 @@ async fn respond_to_component_action(
     Ok(())
 }
 
-/// Handles the panel's `player:search` button: shows a one-field modal for a
-/// search query, waits for it to be submitted, then hands the query off to
-/// [`library::handle_search_modal_submit`] for the actual search + picker.
-///
-/// The modal's custom id is namespaced with the clicking interaction's own
-/// id so concurrent searches (different users, or the same user opening it
-/// twice) don't cross-collect each other's submissions.
 async fn handle_search_button(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -268,22 +204,16 @@ async fn handle_search_button(
         .timeout(SEARCH_MODAL_TIMEOUT)
         .await
     else {
-        // Nobody submitted before the timeout — nothing to clean up, the
-        // modal just closes itself client-side.
         return Ok(());
     };
 
     library::handle_search_modal_submit(ctx, &modal, data).await
 }
 
-/// Parses a typed volume field's raw text into a level (0-100). `None` if
-/// it isn't a whole number or is out of range.
 fn parse_volume_input(raw: &str) -> Option<u8> {
     raw.trim().parse::<u8>().ok().filter(|level| *level <= 100)
 }
 
-/// Reads the typed volume level (0-100) out of a submitted volume modal.
-/// `None` if the field is missing or [`parse_volume_input`] rejects it.
 fn modal_volume(data: &serenity::ModalInteractionData) -> Option<u8> {
     data.components.iter().find_map(|row| {
         row.components.iter().find_map(|component| match component {
@@ -295,12 +225,6 @@ fn modal_volume(data: &serenity::ModalInteractionData) -> Option<u8> {
     })
 }
 
-/// Shows the `player:volume` button's one-field modal and waits for it to be
-/// submitted. `None` on timeout.
-///
-/// The modal's custom id is namespaced with the clicking interaction's own
-/// id so concurrent volume edits (different users, or the same user opening
-/// it twice) don't cross-collect each other's submissions.
 async fn await_volume_modal(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -334,10 +258,6 @@ async fn await_volume_modal(
         .await)
 }
 
-/// Validates and applies a submitted volume modal, then acknowledges it —
-/// with no visible change on success, since
-/// [`crate::voice::PlayerRegistry::set_volume`] already refreshes the live
-/// panel on its own.
 async fn apply_volume_modal(
     ctx: &serenity::Context,
     modal: &serenity::ModalInteraction,
@@ -378,8 +298,6 @@ async fn apply_volume_modal(
     Ok(())
 }
 
-/// Handles the panel's `player:volume` button: shows a one-field modal for a
-/// typed volume level and applies it.
 async fn handle_volume_button(
     ctx: &serenity::Context,
     component: &serenity::ComponentInteraction,
@@ -392,12 +310,6 @@ async fn handle_volume_button(
     apply_volume_modal(ctx, &modal, guild_id, data).await
 }
 
-/// The invoking user's current voice channel in this guild, if any.
-///
-/// `ctx.guild()` returns a `GuildRef` cache guard that borrows from the
-/// serenity cache and is not `Send` — it cannot be held across an `.await`.
-/// Extracting just the `ChannelId` we need in one expression, with nothing
-/// held afterward, is required for this to compile.
 fn voice_channel_of(ctx: Context<'_>) -> Option<serenity::ChannelId> {
     ctx.guild().and_then(|guild| {
         guild
@@ -407,14 +319,6 @@ fn voice_channel_of(ctx: Context<'_>) -> Option<serenity::ChannelId> {
     })
 }
 
-/// Sends a public (non-ephemeral) reply. Explicitly parses no mentions:
-/// several callers interpolate `YouTube`-supplied track/playlist text (title,
-/// channel, playlist name) into `content` here, and that text is fully
-/// attacker-controlled — without this, a track titled e.g. `@everyone ...`
-/// would ping the channel (or a `<@id>`-titled track would ping that user)
-/// whenever it's queued. Poise's own framework-level default
-/// (`all_users(true)`) still allows arbitrary user pings through, so it's
-/// not enough on its own here.
 pub(super) async fn reply_public(
     ctx: Context<'_>,
     content: impl Into<String>,
@@ -430,14 +334,6 @@ pub(super) async fn reply_public(
     Ok(())
 }
 
-/// Deletes `handle`'s message after [`STATUS_REPLY_CLEANUP_DELAY`],
-/// best-effort (the message may already be gone — e.g. a user deleted it
-/// themselves) — keeps `reply_public`'s confirmations from piling up in the
-/// channel forever.
-///
-/// Resolves the message up front: the actual delete runs in a detached task
-/// well past this command's own return, and neither the message nor `ctx`'s
-/// underlying interaction reference can be held that long.
 async fn schedule_cleanup(ctx: Context<'_>, handle: poise::ReplyHandle<'_>) {
     let http = ctx.serenity_context().http.clone();
     if let Ok(message) = handle.into_message().await {
@@ -458,17 +354,11 @@ async fn reply_error(ctx: Context<'_>, content: impl Into<String>) -> Result<(),
     Ok(())
 }
 
-/// The invoking guild, for a `guild_only` command. Every command in this
-/// file has that attribute, so poise's own check already guarantees this —
-/// but that guarantee lives in the framework rather than the type system, so
-/// this still surfaces a normal user-facing error instead of unwrapping it.
 fn require_guild_id(ctx: Context<'_>) -> Result<serenity::GuildId, Error> {
     ctx.guild_id()
         .ok_or_else(|| "this command can only be used in a server.".into())
 }
 
-/// Fetches `query` as a playlist and queues every track in it, in order.
-/// Assumes the caller already confirmed `query` looks like a playlist link.
 async fn play_playlist(ctx: Context<'_>, query: &str) -> Result<(), Error> {
     let tracks = match ctx.data().youtube.list_playlist_items(query).await {
         Ok(listing) => listing.tracks,
@@ -480,13 +370,6 @@ async fn play_playlist(ctx: Context<'_>, query: &str) -> Result<(), Error> {
     library::join_and_enqueue_all(ctx, query, tracks).await
 }
 
-/// If the caller is in a voice channel, joins it — moving there if the bot
-/// is already connected elsewhere in this guild, since a single bot identity
-/// can only ever hold one voice connection per guild (a Discord platform
-/// limit, not something apollo can route around). A caller with no voice
-/// channel of their own just queues into wherever the bot's already
-/// playing, if anywhere; that's an error only if the bot isn't playing
-/// anywhere either.
 async fn join_for_play(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result<(), Error> {
     match voice_channel_of(ctx) {
         Some(channel_id) => ctx
@@ -502,10 +385,6 @@ async fn join_for_play(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result<
     }
 }
 
-/// Looks up a single video by id (as already parsed by [`play`] from a
-/// direct URL/video-id query — no ambiguity to resolve, so no picker needed
-/// here). `Ok(None)` if the lookup failed and an error reply was already
-/// sent.
 async fn resolve_track(ctx: Context<'_>, video_id: &str) -> Result<Option<Track>, Error> {
     match ctx.data().youtube.get_video(video_id).await {
         Ok(track) => Ok(Some(track)),
@@ -516,13 +395,6 @@ async fn resolve_track(ctx: Context<'_>, video_id: &str) -> Result<Option<Track>
     }
 }
 
-/// Plays a video/playlist link directly, or shows a picker for free text.
-///
-/// Given a `YouTube` video URL or video ID, plays that video. Given a
-/// playlist link, queues every track in it, in order. Given free text,
-/// searches and shows the same picker `/add_to_queue` does — reusing it
-/// rather than guessing a top result, since a guess is often not what was
-/// meant and there was previously no way to pick a different one.
 #[poise::command(slash_command, guild_only)]
 pub async fn play(
     ctx: Context<'_>,
@@ -537,8 +409,6 @@ pub async fn play(
     }
 
     let Some(video_id) = video_id else {
-        // Deferred ephemeral to match `/add_to_queue`'s own browsing entry
-        // point, which this delegates to directly.
         ctx.defer_ephemeral().await?;
         let results = match library::search_with_cache(ctx.data(), guild_id, &query).await {
             Ok(results) => results,
@@ -547,11 +417,6 @@ pub async fn play(
         return library::present_search_results(ctx, &query, &results).await;
     };
 
-    // The video lookup below and `join`'s voice-gateway handshake can both
-    // easily exceed Discord's 3-second ack deadline (cold-start yt-dlp, a
-    // slow guild join) — deferred here, before either, so a slow response
-    // doesn't drop the interaction. `/play`'s success reply is public, so a
-    // matching (non-ephemeral) defer.
     ctx.defer().await?;
 
     if let Err(err) = join_for_play(ctx, guild_id).await {
@@ -567,11 +432,6 @@ pub async fn play(
         requested_by: ctx.author().id,
     };
 
-    // `enqueue` can take real time before it returns — a long track has to
-    // fully download before it's playable (see `voice::resolve`) — during
-    // which "thinking..." looks identical to a hang. This gives it a
-    // visible status, then edits the same message into the final result
-    // rather than leaving it behind alongside a second reply.
     let handle = ctx
         .send(
             poise::CreateReply::default()
@@ -599,7 +459,6 @@ pub async fn play(
     Ok(())
 }
 
-/// Shows the current queue.
 #[poise::command(slash_command, guild_only)]
 pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = require_guild_id(ctx)?;
@@ -627,7 +486,6 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
     reply_public(ctx, lines.join("\n")).await
 }
 
-/// Skips the currently playing track.
 #[poise::command(slash_command, guild_only)]
 pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = require_guild_id(ctx)?;
@@ -639,7 +497,6 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
     }
 }
 
-/// Pauses the currently playing track.
 #[poise::command(slash_command, guild_only)]
 pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = require_guild_id(ctx)?;
@@ -651,7 +508,6 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
     }
 }
 
-/// Resumes a paused track.
 #[poise::command(slash_command, guild_only)]
 pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = require_guild_id(ctx)?;
@@ -663,7 +519,6 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
     }
 }
 
-/// Stops playback and clears the queue.
 #[poise::command(slash_command, guild_only)]
 pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = require_guild_id(ctx)?;
@@ -675,26 +530,10 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     }
 }
 
-/// Posts this guild's persistent player panel, or points back at it if one's
-/// already active.
-///
-/// Combines playback controls with Search/Playlists entry points into the
-/// library, kept up to date on its own (by [`crate::voice::PlayerRegistry`])
-/// as state changes — whether via its own buttons, a slash command, or a
-/// track ending on its own.
-///
-/// Only one panel is ever live per guild: if this guild already has one,
-/// this refreshes it in place and replies with a link to it instead of
-/// posting a duplicate.
 #[poise::command(slash_command, guild_only)]
 pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = require_guild_id(ctx)?;
 
-    // `claim_panel_slot` makes the "does a panel already exist" check and
-    // the "reserve the right to post one" decision atomic under the
-    // registry's per-guild lock — without that, two `/player`s landing
-    // together could both see no panel, both post one, and leave the first
-    // live and un-refreshed forever (see the invariant documented above).
     let (channel_id, message_id) = match ctx.data().player.claim_panel_slot(guild_id).await {
         PanelClaim::Existing(panel) => panel,
         PanelClaim::InProgress => {
@@ -719,10 +558,6 @@ pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// Renders and posts a brand new player panel for a slot this call already
-/// reserved via `claim_panel_slot`, then records it as the guild's live
-/// panel — or, on any failure to post, releases the reservation so a wedged
-/// `/player` doesn't block every future `/player` in this guild.
 async fn post_new_panel(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result<(), Error> {
     let (content, embed, components) =
         crate::voice::panel::render(&ctx.data().player, guild_id).await;
@@ -755,7 +590,6 @@ async fn post_new_panel(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result
     }
 }
 
-/// Shuffles the upcoming queue. Leaves the currently playing track alone.
 #[poise::command(slash_command, guild_only)]
 pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = require_guild_id(ctx)?;
@@ -769,7 +603,6 @@ pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
     }
 }
 
-/// Clears the upcoming queue. Leaves the currently playing track alone.
 #[poise::command(slash_command, guild_only)]
 pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = require_guild_id(ctx)?;
@@ -781,8 +614,6 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
     }
 }
 
-/// Sets the playback volume (0-100). Applies immediately and persists for
-/// future tracks.
 #[poise::command(slash_command, guild_only)]
 pub async fn volume(
     ctx: Context<'_>,
@@ -802,8 +633,6 @@ pub async fn volume(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- parse_volume_input ----
 
     #[test]
     fn parses_valid_volume() {
@@ -835,8 +664,6 @@ mod tests {
     fn rejects_fractional_volume() {
         assert_eq!(parse_volume_input("50.5"), None);
     }
-
-    // ---- extract_video_id ----
 
     #[test]
     fn extracts_from_youtu_be_short_link() {
@@ -888,8 +715,6 @@ mod tests {
         assert_eq!(extract_video_id("https://example.com/foo"), None);
     }
 
-    // ---- looks_like_playlist_url ----
-
     #[test]
     fn recognizes_a_bare_playlist_url() {
         assert!(looks_like_playlist_url(
@@ -906,10 +731,6 @@ mod tests {
 
     #[test]
     fn recognizes_a_list_param_on_a_watch_url_too() {
-        // `extract_video_id` already handles this case fine (it plays the
-        // video), but `looks_like_playlist_url` doesn't need to know that —
-        // callers only consult it once `extract_video_id` has already come
-        // back empty.
         assert!(looks_like_playlist_url(
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLxxxx"
         ));
@@ -931,8 +752,6 @@ mod tests {
     fn plain_text_is_not_a_playlist_url() {
         assert!(!looks_like_playlist_url("never gonna give you up"));
     }
-
-    // ---- format_track ----
 
     #[test]
     fn format_track_includes_duration_when_known() {

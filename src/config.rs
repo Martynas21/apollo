@@ -1,66 +1,26 @@
-//! Environment-driven configuration for the bot.
-//!
-//! Values are loaded once at startup via [`Config::from_env`]. This will be
-//! extended as new subsystems (database, etc.) land.
-
 use anyhow::{Context, Result};
 
-/// All configuration the bot needs, sourced from environment variables
-/// (see `.env.example`).
 #[derive(Debug, Clone)]
 pub struct Config {
     pub discord_token: String,
     pub discord_application_id: String,
-    /// Guild to register slash commands against for fast dev iteration.
-    /// `None` means register globally.
     pub discord_guild_id: Option<u64>,
     pub database_url: String,
-    /// Path to a Netscape-format cookies file passed to `yt-dlp` as
-    /// `--cookies`. `YouTube` increasingly requires a proof-of-origin signal
-    /// from a real logged-in browser session before it'll serve a stream to
-    /// `yt-dlp` at all (surfaces as a "Sign in to confirm you're not a bot"
-    /// failure) — this is the standard workaround, and matters most from a
-    /// datacenter/cloud host IP, which is where this bot will typically run.
     pub yt_dlp_cookies_file: Option<String>,
-    /// Max tracks returned by a playlist import. See
-    /// `crate::youtube::api::YouTubeClient::playlist_track_limit`.
     pub playlist_track_limit: usize,
-    /// Unix domain socket `apollo-audio-worker` listens on — see
-    /// `crate::voice::ipc_backend::IpcBackend::connect`. Must match the
-    /// worker's own `AUDIO_WORKER_SOCKET`.
     pub audio_worker_socket: String,
-    /// Shared volume both this process and `apollo-audio-worker` mount, used
-    /// to hand the worker a fully pre-buffered track without sending its
-    /// bytes over the IPC control channel — see
-    /// `crate::voice::resolve::buffer_track_to_file`.
     pub audio_buffer_dir: String,
 }
 
-/// Default for [`Config::playlist_track_limit`] when
-/// `PLAYLIST_TRACK_LIMIT` is unset.
 const DEFAULT_PLAYLIST_TRACK_LIMIT: usize = 500;
 
-/// Default for [`Config::audio_buffer_dir`] — matches `compose.yaml`'s
-/// volume mount point. `audio_worker_socket`'s default
-/// (`apollo_ipc::DEFAULT_SOCKET_PATH`) lives in the shared `apollo-ipc`
-/// crate instead, since `apollo-audio-worker` needs the same default and
-/// isn't a dependent of this crate.
 const DEFAULT_AUDIO_BUFFER_DIR: &str = "/audio-buf";
 
 impl Config {
-    /// Reads configuration from process environment variables.
-    ///
-    /// Callers are expected to load a `.env` file (e.g. via `dotenvy::dotenv()`)
-    /// before calling this.
     pub fn from_env() -> Result<Self> {
         Self::from_source(|key| std::env::var(key))
     }
 
-    /// Builds configuration from an arbitrary key lookup, matching
-    /// [`std::env::var`]'s signature. Split out from [`Self::from_env`] so
-    /// the parsing/validation logic can be exercised in tests against an
-    /// in-memory map instead of mutating real process environment variables
-    /// (which would be flaky under parallel test execution).
     fn from_source(lookup: impl Fn(&str) -> Result<String, std::env::VarError>) -> Result<Self> {
         Ok(Self {
             discord_token: env_var(&lookup, "DISCORD_TOKEN")?,

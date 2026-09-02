@@ -1,18 +1,3 @@
-//! [`VoiceBackend`] implementation talking to `apollo-audio-worker` over a
-//! Unix domain socket, instead of driving songbird's mixer in this process.
-//!
-//! This process still does the Discord voice *gateway* choreography itself
-//! (`Songbird::join_gateway`, still requiring the full `songbird` gateway
-//! feature set built in `main.rs`) — only the actual `Driver`/mixer moves to
-//! the worker. `join_gateway` hands back a `ConnectionInfo` (session/token/
-//! endpoint) without starting a local driver; that's shipped to the worker,
-//! which opens the real voice UDP connection itself.
-//!
-//! One connection is held open for this process's whole lifetime. Requests
-//! are correlated to responses by an id; a background reader task dispatches
-//! incoming `Response`s to whichever caller is waiting and incoming `Event`s
-//! to whichever guild's registered [`VoiceEvents`] they belong to.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,10 +23,6 @@ use crate::youtube::api::Track;
 type PendingMap = StdMutex<HashMap<u64, oneshot::Sender<Result<Response, String>>>>;
 type EventsMap = StdMutex<HashMap<GuildId, Arc<dyn VoiceEvents>>>;
 
-/// How many times [`Connection::reconnect`] retries `UnixStream::connect`
-/// before giving up. Just enough to ride out `apollo-audio-worker`
-/// restarting under docker/systemd (a few seconds) — this is a hobby
-/// project, not a service with an SLA, so no exponential backoff/jitter.
 const RECONNECT_ATTEMPTS: u32 = 5;
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
@@ -51,42 +32,18 @@ struct Connection {
     guild_events: EventsMap,
     next_id: AtomicU64,
     socket_path: PathBuf,
-    /// Bumped every time [`Connection::reconnect`] successfully replaces
-    /// `write`. Lets a caller that saw a given connection fail tell whether
-    /// someone else already fixed it before it gets its turn at
-    /// `reconnecting`'s lock, and lets a stale [`run_reader`] task recognise
-    /// that it's reading a connection that's already been superseded.
     epoch: AtomicU64,
-    /// Serializes reconnect attempts so concurrent callers hitting a broken
-    /// connection at once don't all dial the worker and spawn duplicate
-    /// reader tasks.
     reconnecting: Mutex<()>,
 }
 
 type PendingRx = oneshot::Receiver<Result<Response, String>>;
 
-/// The result of a successful [`Connection::reconnect`] call.
 enum Reconnected {
-    /// This call actually re-dialed the worker; the caller owns the new read
-    /// half and is responsible for spawning a [`run_reader`] on it.
     New(tokio::net::unix::OwnedReadHalf, u64),
-    /// Another caller already reconnected (and spawned its own reader)
-    /// while this one waited for `reconnecting`'s lock — nothing further to
-    /// do here.
     AlreadyDone,
 }
 
 impl Connection {
-    /// Writes `body` as a new request and returns a receiver for its
-    /// eventual response, without waiting for it. The write itself still
-    /// happens inline (under `self.write`'s lock) before this returns, so a
-    /// caller that needs the *next* request to reach the worker only after
-    /// this one — e.g. `IpcCall::play` immediately followed by a
-    /// `set_volume` on the resulting handle — can rely on write order being
-    /// preserved even without awaiting this request's response first.
-    ///
-    /// A broken write triggers one reconnect-and-retry before giving up —
-    /// see [`Self::reconnect`].
     async fn send(self: &Arc<Self>, body: Request) -> Result<PendingRx, String> {
         let epoch = self.epoch.load(Ordering::Acquire);
         match self.try_send(body.clone()).await {
@@ -129,13 +86,6 @@ impl Connection {
             .map_err(|_| "IPC connection closed before a response arrived".to_string())?
     }
 
-    /// Re-dials `socket_path`, replacing `write` on success and handing the
-    /// new read half back to the caller (which is responsible for spawning
-    /// a fresh [`run_reader`] on it — this fn deliberately doesn't do that
-    /// itself, so it never has to know about `run_reader`'s type). `seen_epoch`
-    /// is the epoch the caller observed fail; if it no longer matches
-    /// `self.epoch` by the time this gets `reconnecting`'s lock, some other
-    /// caller already reconnected while this one was waiting.
     async fn reconnect(self: &Arc<Self>, seen_epoch: u64) -> Result<Reconnected, String> {
         let _guard = self.reconnecting.lock().await;
         if self.epoch.load(Ordering::Acquire) != seen_epoch {
@@ -163,24 +113,11 @@ impl Connection {
     }
 }
 
-/// Reads frames off `stream`'s read half for as long as the connection
-/// lives, resolving pending requests and dispatching events to whichever
-/// guild's [`VoiceEvents`] registered for them. `epoch` is the connection
-/// generation this reader was spawned for (see [`Connection::reconnect`]).
-///
-/// A dead connection isn't necessarily the end: this tries
-/// [`Connection::reconnect`] before giving up. Only once that's exhausted
-/// its retries do guilds with a registration get told the connection is
-/// lost (mirroring how a real songbird `DriverDisconnect` is handled) and
-/// in-flight requests get unblocked with an error.
 async fn run_reader(
     mut read_half: tokio::net::unix::OwnedReadHalf,
     connection: Arc<Connection>,
     mut epoch: u64,
 ) {
-    // The outer loop re-enters the read loop on a freshly reconnected
-    // stream; a plain (non-recursive) loop here, rather than this fn calling
-    // itself, keeps its future's type from being self-referential.
     loop {
         loop {
             let envelope = match read_frame(&mut read_half).await {
@@ -212,10 +149,6 @@ async fn run_reader(
             }
         }
 
-        // If some other task already reconnected (bumping the epoch) since
-        // this loop last started, that reconnect's own reader is the live
-        // one now — this one just observed the old, now-superseded stream
-        // close and has nothing further to do.
         if connection.epoch.load(Ordering::Acquire) != epoch {
             return;
         }
@@ -233,11 +166,6 @@ async fn run_reader(
     handle_reader_exit(&connection);
 }
 
-// Reconnecting is exhausted — the worker is really gone. Every guild that
-// had a registration needs to be told, the same way a real
-// `DriverDisconnectHandler` would report a lost voice connection. Any
-// request still awaiting a response also needs to be unblocked with an
-// error rather than hanging forever.
 fn handle_reader_exit(connection: &Connection) {
     let guild_events: Vec<(GuildId, Arc<dyn VoiceEvents>)> = {
         let mut map = connection
@@ -312,9 +240,6 @@ pub struct IpcBackend {
 }
 
 impl IpcBackend {
-    /// Connects to `apollo-audio-worker`'s Unix domain socket at
-    /// `socket_path`. `buffer_dir` must be the same shared volume the worker
-    /// reads pre-buffered tracks from (`AUDIO_BUFFER_DIR`).
     pub async fn connect(
         socket_path: &str,
         buffer_dir: PathBuf,
@@ -383,10 +308,6 @@ impl VoiceBackend for IpcBackend {
             });
 
         if let Err(err) = result {
-            // songbird now has a `Call` for `guild_id` with nothing on the
-            // worker side to back it — `is_connected` would otherwise keep
-            // reporting this guild as connected. Undo the gateway join so
-            // songbird's state can't diverge from the worker's.
             self.connection
                 .guild_events
                 .lock()
@@ -406,9 +327,6 @@ impl VoiceBackend for IpcBackend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&guild_id);
-        // Best-effort: the worker may already be gone (which is exactly why
-        // this guild is being removed), so a failure here doesn't block
-        // tearing down the gateway side below.
         if let Err(err) = self
             .connection
             .request(Request::Leave {
@@ -520,13 +438,7 @@ impl VoiceTrack for IpcTrack {
         .await
     }
 
-    fn notify_when_finished(&self, _guild_id: GuildId, _events: Arc<dyn VoiceEvents>) {
-        // No-op: `apollo-audio-worker` reports `TrackFinished`/`TrackErrored`
-        // for every track it plays without a separate opt-in, and
-        // `dispatch_event` in this module already routes those to whichever
-        // `VoiceEvents` `join` registered for this guild. Unlike songbird's
-        // per-track handle, there's nothing further to register here.
-    }
+    fn notify_when_finished(&self, _guild_id: GuildId, _events: Arc<dyn VoiceEvents>) {}
 
     async fn status(&self) -> Option<TrackStatus> {
         match self
@@ -547,8 +459,6 @@ impl VoiceTrack for IpcTrack {
 }
 
 impl IpcTrack {
-    /// Sends `request` and maps a bare `Ok` response to success — the shape
-    /// every `stop`/`pause`/`resume`/`set_volume` request expects back.
     async fn request(&self, request: Request) -> Result<(), String> {
         match self.connection.request(request).await? {
             Response::Ok => Ok(()),

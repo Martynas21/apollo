@@ -1,9 +1,3 @@
-//! SQLite-backed persistence for per-guild playback settings.
-//!
-//! Schema lives in `migrations/` and is embedded into the binary via
-//! [`sqlx::migrate!`], so a fresh SQLite file is brought up to date
-//! automatically on startup.
-
 use anyhow::{Context, Result};
 use poise::serenity_prelude::UserId;
 use sqlx::sqlite::{
@@ -16,36 +10,14 @@ use std::time::Duration;
 use crate::voice::player::QueuedTrack;
 use crate::youtube::api::Track;
 
-/// How many rows [`replace_playlist_tracks`] inserts per multi-row
-/// `INSERT`, to stay comfortably under SQLite's bound-parameter limit
-/// (default 32766) while still batching real-world playlists (YouTube caps
-/// a single playlist at 5000 videos) in a small, fixed number of round
-/// trips instead of one `INSERT` per track.
 const TRACK_INSERT_BATCH_SIZE: usize = 500;
 
-/// Opens a connection pool for `database_url`, creating the SQLite file if
-/// it doesn't exist and running any pending migrations.
 pub async fn connect(database_url: &str) -> Result<SqlitePool> {
-    // Deliberately don't include `database_url` in these error messages: if
-    // it was misconfigured with a full connection string copy-pasted from
-    // elsewhere, it could carry credentials, and these errors get logged.
     let options = SqliteConnectOptions::from_str(database_url)
         .context("invalid DATABASE_URL")?
         .create_if_missing(true)
-        // Defense in depth alongside the `ON DELETE CASCADE` on
-        // `playlist_tracks.playlist_id`: SQLite has foreign key enforcement
-        // off by default per-connection even when FKs are declared in the
-        // schema, and this applies it to every connection the pool opens.
         .foreign_keys(true)
-        // WAL lets readers and a writer proceed concurrently instead of a
-        // writer blocking all readers, and the busy timeout below makes a
-        // second concurrent writer (e.g. two guilds' playlist operations
-        // landing around the same time) retry instead of failing outright.
         .journal_mode(SqliteJournalMode::Wal)
-        // Safe and standard under WAL: only a full OS crash (not just this
-        // process crashing) can lose the most recent commit, an acceptable
-        // tradeoff for a bot that isn't the system of record, in exchange for
-        // skipping an fsync on every commit.
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_secs(5));
 
@@ -54,18 +26,6 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool> {
         .await
         .context("failed to connect to database")?;
 
-    // Not production, and migrations get edited/reordered during local dev —
-    // a stale `_sqlx_migrations` checksum from a migration file whose
-    // content has since changed (its actual schema effect already applied
-    // under an earlier version of the file) shouldn't be a fatal,
-    // unrecoverable state that permanently wedges startup. On a mismatch,
-    // re-stamp that one row's checksum to match the current file *without*
-    // re-running its SQL — most migrations here aren't written to tolerate
-    // re-execution (plain `ALTER TABLE ADD COLUMN`, not `IF NOT EXISTS`), so
-    // re-running is the wrong recovery; the file changing (reformatted,
-    // renumbered, comment tweaked) without the schema actually needing to
-    // change again is the case this is for. Bounded by the migration count
-    // so a real, unrelated failure still surfaces instead of looping.
     let migrator = sqlx::migrate!("./migrations");
     for _ in 0..migrator.migrations.len() {
         match migrator.run(&pool).await {
@@ -96,11 +56,8 @@ pub async fn connect(database_url: &str) -> Result<SqlitePool> {
     Ok(pool)
 }
 
-/// Default playback volume (percent) for a guild with no `guild_settings` row.
 pub const DEFAULT_VOLUME: u8 = 100;
 
-/// Reads a guild's persisted playback volume (0-100), defaulting to
-/// [`DEFAULT_VOLUME`] if it's never been set.
 pub async fn get_guild_volume(pool: &SqlitePool, guild_id: &str) -> Result<u8> {
     let row: Option<(i64,)> =
         sqlx::query_as("SELECT volume FROM guild_settings WHERE guild_id = ?1")
@@ -122,7 +79,6 @@ pub async fn get_guild_volume(pool: &SqlitePool, guild_id: &str) -> Result<u8> {
     })
 }
 
-/// Persists a guild's playback volume (0-100).
 pub async fn set_guild_volume(pool: &SqlitePool, guild_id: &str, volume: u8) -> Result<()> {
     sqlx::query(
         "INSERT INTO guild_settings (guild_id, volume) VALUES (?1, ?2)
@@ -137,19 +93,11 @@ pub async fn set_guild_volume(pool: &SqlitePool, guild_id: &str, volume: u8) -> 
     Ok(())
 }
 
-/// A guild's saved playlist: a named pointer to a `YouTube` playlist URL,
-/// browsable from the `/player` panel instead of re-pasting the URL into
-/// `/play` every time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedPlaylist {
     pub id: i64,
     pub name: String,
     pub url: String,
-    /// Unix timestamp (seconds) of the last successful
-    /// [`replace_playlist_tracks`] call for this playlist. `None` if it's
-    /// never been cached (shouldn't normally happen — `save_guild_playlist`
-    /// is always followed by a cache populate — but a row imported before
-    /// caching existed would have no tracks to show until refreshed).
     pub cached_at: Option<i64>,
 }
 
@@ -163,7 +111,6 @@ fn playlist_from_row(row: (i64, String, String, Option<i64>)) -> SavedPlaylist {
     }
 }
 
-/// Lists a guild's saved playlists, in the order they were added.
 pub async fn list_guild_playlists(pool: &SqlitePool, guild_id: &str) -> Result<Vec<SavedPlaylist>> {
     let rows: Vec<(i64, String, String, Option<i64>)> = sqlx::query_as(
         "SELECT id, name, url, cached_at FROM playlists WHERE guild_id = ?1 ORDER BY id",
@@ -176,10 +123,6 @@ pub async fn list_guild_playlists(pool: &SqlitePool, guild_id: &str) -> Result<V
     Ok(rows.into_iter().map(playlist_from_row).collect())
 }
 
-/// Saves a playlist for a guild, keyed by (guild, url) — importing the same
-/// URL again updates its saved name rather than creating a duplicate entry —
-/// and returns its row id, so the caller can populate its track cache right
-/// after (see [`replace_playlist_tracks`]).
 pub async fn save_guild_playlist(
     pool: &SqlitePool,
     guild_id: &str,
@@ -203,8 +146,6 @@ pub async fn save_guild_playlist(
     Ok(id)
 }
 
-/// Looks up one of a guild's saved playlists by id. `None` if it doesn't
-/// exist or belongs to a different guild.
 pub async fn get_guild_playlist(
     pool: &SqlitePool,
     guild_id: &str,
@@ -222,22 +163,12 @@ pub async fn get_guild_playlist(
     Ok(row.map(playlist_from_row))
 }
 
-/// Permanently removes one of a guild's saved playlists, along with its
-/// cached track listing. Returns whether a row was actually deleted —
-/// `false` if it didn't exist or belonged to a different guild, so the
-/// caller can report that accurately without a separate existence check.
 pub async fn delete_guild_playlist(pool: &SqlitePool, guild_id: &str, id: i64) -> Result<bool> {
     let mut tx = pool
         .begin()
         .await
         .context("failed to start playlist delete transaction")?;
 
-    // Scoped to the same guild (via the subquery) so this can never touch
-    // another guild's cached tracks — mirrors the ownership check the
-    // `playlists` delete below already enforces. Also backstopped by the
-    // `ON DELETE CASCADE` on `playlist_tracks.playlist_id` (see the
-    // `playlist_tracks_cascade_delete` migration), but that's defense in
-    // depth, not a substitute for scoping this statement correctly.
     sqlx::query(
         "DELETE FROM playlist_tracks WHERE playlist_id = \
          (SELECT id FROM playlists WHERE guild_id = ?1 AND id = ?2)",
@@ -262,8 +193,6 @@ pub async fn delete_guild_playlist(pool: &SqlitePool, guild_id: &str, id: i64) -
     Ok(result.rows_affected() > 0)
 }
 
-/// Reads a saved playlist's cached track listing, in playlist order. Empty
-/// if it's never been cached — see [`SavedPlaylist::cached_at`].
 pub async fn get_playlist_tracks(pool: &SqlitePool, playlist_id: i64) -> Result<Vec<Track>> {
     let rows: Vec<(String, String, String, Option<i64>)> = sqlx::query_as(
         "SELECT video_id, title, channel, duration_secs FROM playlist_tracks \
@@ -286,12 +215,6 @@ pub async fn get_playlist_tracks(pool: &SqlitePool, playlist_id: i64) -> Result<
         .collect())
 }
 
-/// Replaces a saved playlist's cached track listing wholesale and stamps
-/// `cached_at` with the current time — used both right after import and by
-/// the panel's per-playlist Refresh button to re-pull from `YouTube`.
-///
-/// Runs as one transaction so a concurrent read never sees a
-/// half-replaced cache (all-old or all-new tracks, never a mix).
 pub async fn replace_playlist_tracks(
     pool: &SqlitePool,
     playlist_id: i64,
@@ -308,9 +231,6 @@ pub async fn replace_playlist_tracks(
         .await
         .context("failed to clear old cached playlist tracks")?;
 
-    // Batched into multi-row `INSERT`s (rather than one statement per
-    // track) so a large playlist holds the write lock for far fewer round
-    // trips.
     let indexed_tracks = tracks.iter().enumerate().collect::<Vec<_>>();
     for batch in indexed_tracks.chunks(TRACK_INSERT_BATCH_SIZE) {
         let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
@@ -345,32 +265,18 @@ pub async fn replace_playlist_tracks(
     Ok(())
 }
 
-/// A guild's in-progress radio/now-playing session, as persisted by
-/// [`save_guild_session_meta`] and restored by [`load_guild_session`]. The
-/// *upcoming* queue is not part of this struct — `guild_session_queue` is
-/// itself the live, continuously-authoritative queue (written incrementally
-/// by the `queue_*` functions below, at the point of each mutation), so
-/// there's nothing to snapshot for it here. `now_playing` is paired with the
-/// id of the user who requested it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedSession {
     pub radio_enabled: bool,
     pub radio_requested_by: Option<String>,
-    /// Oldest first, capped at `RADIO_HISTORY_CAP` by the caller — see
-    /// `voice::player::GuildState::radio_history`.
     pub radio_history: Vec<String>,
     pub now_playing: Option<(Track, String)>,
 }
 
-/// Joins `radio_history` into the comma-separated form `guild_sessions`
-/// stores it in. Video ids are `[A-Za-z0-9_-]{11}` and never contain commas,
-/// so no escaping is needed.
 fn encode_radio_history(history: &[String]) -> String {
     history.join(",")
 }
 
-/// Inverse of [`encode_radio_history`]. Filters out empty segments as
-/// defense in depth (e.g. an empty stored string splitting into `[""]`).
 fn decode_radio_history(raw: &str) -> Vec<String> {
     raw.split(',')
         .filter(|segment| !segment.is_empty())
@@ -378,10 +284,6 @@ fn decode_radio_history(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Persists a guild's radio/now-playing metadata, replacing whatever was
-/// there before. Does *not* touch `guild_session_queue` — the upcoming queue
-/// is written incrementally by the `queue_*` functions below, at the point
-/// of each actual mutation, not as a periodic snapshot here.
 pub async fn save_guild_session_meta(
     pool: &SqlitePool,
     guild_id: &str,
@@ -434,11 +336,6 @@ pub async fn save_guild_session_meta(
     Ok(())
 }
 
-/// Loads `guild_id`'s persisted session metadata, if any — `None` if there's
-/// no `guild_sessions` row for it. The upcoming queue is not loaded here:
-/// `guild_session_queue` is the live table, already reflecting whatever's
-/// actually queued, so there's nothing to restore for it — callers read it
-/// separately (`queue_pop_front`/`queue_all`/etc.) once they need to.
 pub async fn load_guild_session(
     pool: &SqlitePool,
     guild_id: &str,
@@ -478,9 +375,6 @@ pub async fn load_guild_session(
         return Ok(None);
     };
 
-    // The five `now_playing_*` columns are always written together (all
-    // `Some` or all `None`) by `save_guild_session_meta` — matching on all
-    // four non-duration columns being `Some` is just defense in depth.
     let now_playing = match (np_video_id, np_title, np_channel, np_requested_by) {
         (Some(video_id), Some(title), Some(channel), Some(requested_by)) => {
             #[allow(clippy::cast_sign_loss)]
@@ -503,9 +397,6 @@ pub async fn load_guild_session(
     }))
 }
 
-/// Deletes `guild_id`'s persisted session (cascading to its queue rows), for
-/// when a session ends on purpose — `/leave` or an idle disconnect — rather
-/// than a crash. A no-op if there wasn't one.
 pub async fn clear_guild_session(pool: &SqlitePool, guild_id: &str) -> Result<()> {
     sqlx::query("DELETE FROM guild_sessions WHERE guild_id = ?1")
         .bind(guild_id)
@@ -516,10 +407,6 @@ pub async fn clear_guild_session(pool: &SqlitePool, guild_id: &str) -> Result<()
     Ok(())
 }
 
-/// Turns a `guild_session_queue` row into a [`QueuedTrack`]. `None` if
-/// `requested_by` fails to parse as a Discord snowflake — shouldn't happen,
-/// since only valid ids are ever written, but matches this file's existing
-/// defensive-parsing style (see `restore_session_if_new`).
 fn queued_track_from_row(
     row: (String, String, String, Option<i64>, String),
 ) -> Option<QueuedTrack> {
@@ -538,10 +425,6 @@ fn queued_track_from_row(
     })
 }
 
-/// Appends `queued` to `guild_id`'s live upcoming queue, at
-/// `MAX(position) + 1`. Ensures a `guild_sessions` parent row exists first
-/// (`guild_session_queue.guild_id` has an `ON DELETE CASCADE` FK back to
-/// it), since this can be the very first thing ever persisted for a guild.
 pub async fn queue_push_back(
     pool: &SqlitePool,
     guild_id: &str,
@@ -583,10 +466,6 @@ pub async fn queue_push_back(
     Ok(())
 }
 
-/// Appends `tracks` to `guild_id`'s live upcoming queue in position order,
-/// continuing from the current `MAX(position)`. Batched into multi-row
-/// `INSERT`s, same as `replace_playlist_tracks` — a whole playlist can be
-/// queued (and thus persisted) at once. No-op if `tracks` is empty.
 pub async fn queue_push_many(
     pool: &SqlitePool,
     guild_id: &str,
@@ -650,18 +529,6 @@ pub async fn queue_push_many(
     Ok(())
 }
 
-/// Removes and returns the lowest-position row in `guild_id`'s upcoming
-/// queue — the track that should become the new `now_playing`. `None` if
-/// the queue is empty. Runs as one transaction so a concurrent read never
-/// sees a row gone without having been returned to somebody, and so a
-/// corrupt row (see below) is skipped atomically along with everything
-/// still queued behind it in the empty case.
-///
-/// A row that fails to parse (see `queued_track_from_row`) is deleted and
-/// skipped rather than returned as `None` — otherwise it would look
-/// indistinguishable from a genuinely empty queue to callers like
-/// `promote_next`, which would then idle-disconnect while valid tracks are
-/// still queued behind it.
 pub async fn queue_pop_front(pool: &SqlitePool, guild_id: &str) -> Result<Option<QueuedTrack>> {
     let mut tx = pool
         .begin()
@@ -706,8 +573,6 @@ pub async fn queue_pop_front(pool: &SqlitePool, guild_id: &str) -> Result<Option
     }
 }
 
-/// Reads (without removing) the lowest-position row in `guild_id`'s upcoming
-/// queue. `None` if it's empty.
 pub async fn queue_peek_front(pool: &SqlitePool, guild_id: &str) -> Result<Option<QueuedTrack>> {
     let row: Option<(String, String, String, Option<i64>, String)> = sqlx::query_as(
         "SELECT video_id, title, channel, duration_secs, requested_by \
@@ -721,7 +586,6 @@ pub async fn queue_peek_front(pool: &SqlitePool, guild_id: &str) -> Result<Optio
     Ok(row.and_then(queued_track_from_row))
 }
 
-/// Number of tracks in `guild_id`'s upcoming queue.
 pub async fn queue_len(pool: &SqlitePool, guild_id: &str) -> Result<usize> {
     let (count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM guild_session_queue WHERE guild_id = ?1")
@@ -733,7 +597,6 @@ pub async fn queue_len(pool: &SqlitePool, guild_id: &str) -> Result<usize> {
     Ok(count.max(0) as usize)
 }
 
-/// `guild_id`'s whole upcoming queue, in order.
 pub async fn queue_all(pool: &SqlitePool, guild_id: &str) -> Result<Vec<QueuedTrack>> {
     let rows: Vec<(String, String, String, Option<i64>, String)> = sqlx::query_as(
         "SELECT video_id, title, channel, duration_secs, requested_by \
@@ -747,10 +610,6 @@ pub async fn queue_all(pool: &SqlitePool, guild_id: &str) -> Result<Vec<QueuedTr
     Ok(rows.into_iter().filter_map(queued_track_from_row).collect())
 }
 
-/// Empties `guild_id`'s upcoming queue. Leaves the `guild_sessions` parent
-/// row alone — that row's lifecycle (and the `now_playing` it may still
-/// carry) is managed separately by `save_guild_session_meta`/
-/// `clear_guild_session`.
 pub async fn queue_clear(pool: &SqlitePool, guild_id: &str) -> Result<()> {
     sqlx::query("DELETE FROM guild_session_queue WHERE guild_id = ?1")
         .bind(guild_id)
@@ -760,9 +619,6 @@ pub async fn queue_clear(pool: &SqlitePool, guild_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Removes the `count` lowest-position rows from `guild_id`'s upcoming
-/// queue, leaving the rest in their existing order — for `jump_to` dropping
-/// the entries ahead of a selected track. No-op if `count` is 0.
 pub async fn queue_drop_front(pool: &SqlitePool, guild_id: &str, count: usize) -> Result<()> {
     if count == 0 {
         return Ok(());
@@ -781,9 +637,6 @@ pub async fn queue_drop_front(pool: &SqlitePool, guild_id: &str, count: usize) -
     Ok(())
 }
 
-/// Replaces `guild_id`'s entire upcoming queue with `tracks`, in the given
-/// order, renumbering positions `0..N` — used by `shuffle`. Runs as one
-/// transaction so a concurrent read never sees a half-replaced queue.
 pub async fn queue_replace_all(
     pool: &SqlitePool,
     guild_id: &str,
@@ -831,11 +684,6 @@ pub async fn queue_replace_all(
     Ok(())
 }
 
-/// Searches a guild's cached playlist tracks by title — a fast, local
-/// alternative to shelling out to `yt-dlp` when the wanted track is already
-/// known from an imported playlist. Case-insensitive for ASCII (SQLite's
-/// `LIKE` is by default); `query`'s own `%`/`_` are escaped so they match
-/// literally rather than acting as wildcards.
 pub async fn search_cached_tracks(
     pool: &SqlitePool,
     guild_id: &str,
@@ -893,10 +741,8 @@ mod tests {
         set_guild_volume(&pool, "1", 42).await?;
         assert_eq!(get_guild_volume(&pool, "1").await?, 42);
 
-        // A different guild is unaffected.
         assert_eq!(get_guild_volume(&pool, "2").await?, DEFAULT_VOLUME);
 
-        // Setting again replaces rather than erroring on the existing row.
         set_guild_volume(&pool, "1", 7).await?;
         assert_eq!(get_guild_volume(&pool, "1").await?, 7);
 
@@ -907,8 +753,6 @@ mod tests {
     async fn guild_volume_falls_back_to_default_when_stored_value_is_out_of_range() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
 
-        // Bypass `set_guild_volume` (which only ever writes valid `u8`
-        // values) to simulate a corrupted row.
         sqlx::query(
             "INSERT INTO guild_settings (guild_id, volume) VALUES ('1', 99999)
              ON CONFLICT(guild_id) DO UPDATE SET volume = excluded.volume",
@@ -950,7 +794,6 @@ mod tests {
         let fetched = get_guild_playlist(&pool, "1", playlists[0].id).await?;
         assert_eq!(fetched, Some(playlists[0].clone()));
 
-        // A different guild sees none of these.
         assert_eq!(list_guild_playlists(&pool, "2").await?, Vec::new());
 
         Ok(())
@@ -1026,9 +869,6 @@ mod tests {
         assert!(!delete_guild_playlist(&pool, "2", id).await?);
         assert!(!delete_guild_playlist(&pool, "1", 9999).await?);
         assert!(get_guild_playlist(&pool, "1", id).await?.is_some());
-        // The wrong-guild attempt above must not have touched this
-        // playlist's cached tracks — regression test for a bug where the
-        // `playlist_tracks` delete wasn't scoped to the guild at all.
         assert_eq!(
             get_playlist_tracks(&pool, id).await?,
             vec![sample_track("a", None)]
@@ -1039,10 +879,6 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_playlist_row_directly_cascades_to_its_cached_tracks() -> Result<()> {
-        // Bypasses `delete_guild_playlist` entirely to verify the `ON
-        // DELETE CASCADE` foreign key itself (added in the
-        // `playlist_tracks_cascade_delete` migration) — defense in depth
-        // for any future caller that deletes a `playlists` row directly.
         let pool = connect("sqlite::memory:").await?;
         let id = save_guild_playlist(
             &pool,
@@ -1082,7 +918,6 @@ mod tests {
             vec![get_guild_playlist(&pool, "1", id).await?.unwrap()]
         );
 
-        // Re-saving the same URL returns the same id (an update, not a new row).
         let same_id =
             save_guild_playlist(&pool, "1", "Renamed", "https://example.com/list=abc", "42")
                 .await?;
@@ -1230,7 +1065,6 @@ mod tests {
         save_session(&pool, "1", &session).await?;
 
         assert_eq!(load_guild_session(&pool, "1").await?, Some(session));
-        // A different guild is unaffected.
         assert_eq!(load_guild_session(&pool, "2").await?, None);
 
         Ok(())
@@ -1256,9 +1090,6 @@ mod tests {
 
     #[tokio::test]
     async fn saving_meta_with_no_now_playing_leaves_existing_queue_rows_alone() -> Result<()> {
-        // `save_guild_session_meta` only ever touches `guild_sessions` — the
-        // upcoming queue lives in `guild_session_queue` continuously and is
-        // never rewritten as a side effect of a meta save.
         let pool = connect("sqlite::memory:").await?;
         save_session(
             &pool,
@@ -1333,9 +1164,6 @@ mod tests {
 
     #[tokio::test]
     async fn queue_push_back_creates_a_guild_session_row_if_missing() -> Result<()> {
-        // The FK on `guild_session_queue.guild_id` requires a parent
-        // `guild_sessions` row to already exist — `queue_push_back` must
-        // create one rather than erroring on a guild's very first track.
         let pool = connect("sqlite::memory:").await?;
         queue_push_back(&pool, "1", &sample_queued("a", None, 42)).await?;
 
@@ -1410,8 +1238,6 @@ mod tests {
 
     #[tokio::test]
     async fn queue_pop_front_skips_a_row_with_an_unparsable_requested_by() -> Result<()> {
-        // A corrupt row shouldn't be mistaken for an empty queue — it should
-        // be dropped and popping should continue on to the next valid one.
         let pool = connect("sqlite::memory:").await?;
         queue_push_back(&pool, "1", &sample_queued("a", None, 42)).await?;
         sqlx::query(
@@ -1537,7 +1363,6 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].video_id, "a");
 
-        // A different guild's cache is not searched.
         assert_eq!(
             search_cached_tracks(&pool, "2", "title a", 10).await?,
             Vec::new()
@@ -1565,8 +1390,6 @@ mod tests {
         };
         replace_playlist_tracks(&pool, id, &[literal, decoy]).await?;
 
-        // Without escaping, "%" and "_" would act as SQL wildcards and also
-        // match the decoy track ("X" standing in for any single character).
         let results = search_cached_tracks(&pool, "1", "50% off_sale", 10).await?;
 
         assert_eq!(

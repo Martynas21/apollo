@@ -1,38 +1,17 @@
-//! `YouTube` search/lookup, entirely via `yt-dlp` subprocess calls.
-//!
-//! No Google API quota and no per-user login needed: `yt-dlp -j
-//! --flat-playlist` already returns id/title/channel/duration for both
-//! search results (`ytsearch<n>:<query>`) and playlist listings, and
-//! `yt-dlp -j --no-playlist` does the same for a single video. This mirrors
-//! the trust boundary `crate::voice::radio` and `crate::voice::resolve`
-//! already rely on for Mix listing and stream resolution — `yt-dlp`
-//! scraping the regular frontend, not a versioned/quota'd API.
-
 use std::io::ErrorKind;
 use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::process::Command;
 
-/// Max search results requested per `/add_to_queue` query — mirrors the old
-/// Data API client's `maxResults=25`: only the top handful are shown, but a
-/// `number` selection can reach any of the fetched set.
 const SEARCH_LIMIT: usize = 25;
 
-/// Default for [`YouTubeClient::playlist_track_limit`] — see
-/// `Config::playlist_track_limit` (`PLAYLIST_TRACK_LIMIT` env var) to
-/// override it.
 const DEFAULT_PLAYLIST_LIMIT: usize = 500;
 
-/// Timeout for a single `yt-dlp` search or video-lookup call.
 const YT_DLP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Timeout for `yt-dlp` calls that may process many more entries than a
-/// single search or lookup: playlist listing and batch id hydration.
 const YT_DLP_BATCH_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Recognized `YouTube` hosts accepted for a playlist URL passed to
-/// `list_playlist_items`.
 const YOUTUBE_HOSTS: [&str; 5] = [
     "www.youtube.com",
     "youtube.com",
@@ -41,48 +20,24 @@ const YOUTUBE_HOSTS: [&str; 5] = [
     "youtu.be",
 ];
 
-/// Max length accepted for a bare (schemeless) playlist id passed to
-/// `list_playlist_items`. Real `YouTube` playlist ids are well under this.
 const MAX_PLAYLIST_ID_LEN: usize = 64;
 
-/// Truncation length for stderr embedded in `YouTubeApiError::YtDlpFailed`,
-/// matching `PlaybackError::Other`'s convention in `crate::voice::resolve`.
 const STDERR_TRUNCATE_LEN: usize = 200;
 
-/// A single playable video, as resolved from a search, a playlist listing,
-/// or a direct video id/URL lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub video_id: String,
     pub title: String,
     pub channel: String,
-    /// `None` when `yt-dlp` didn't report a usable duration (e.g. an
-    /// in-progress livestream).
     pub duration: Option<Duration>,
 }
 
 #[derive(Debug)]
 pub enum YouTubeApiError {
-    /// The `yt-dlp` binary itself could not be found on `PATH`.
     YtDlpMissing,
-    /// yt-dlp exited non-zero (video/playlist private, deleted, region-locked,
-    /// or otherwise unavailable), or exited zero but produced no parseable
-    /// metadata at all.
     YtDlpFailed(String),
-    /// User-supplied input (currently: `list_playlist_items`'s playlist
-    /// URL/id) failed validation before a `yt-dlp` process was even spawned
-    /// — e.g. not a recognized `YouTube` host, or a bare id shaped like a
-    /// `yt-dlp` command-line flag rather than a real playlist id.
     InvalidInput(String),
-    /// The `yt-dlp` process didn't finish within its allotted timeout and
-    /// was killed.
     Timeout,
-    /// The requested video has no known duration — in practice, an
-    /// in-progress livestream (see [`Track::duration`]). Rejected rather
-    /// than queued: songbird's HLS path for a live broadcast never stops
-    /// downloading segments if the track is skipped/stopped before the
-    /// broadcast itself ends, leaking a background task for as long as the
-    /// stream stays live.
     LiveStreamNotSupported,
 }
 
@@ -105,9 +60,6 @@ impl std::fmt::Display for YouTubeApiError {
 
 impl std::error::Error for YouTubeApiError {}
 
-/// Like `crate::voice::radio`'s `truncate_tail`: keeps the *last* `max_len`
-/// characters, since yt-dlp's fatal `ERROR:` line comes after any non-fatal
-/// `WARNING:` lines and would otherwise get head-truncated away.
 fn truncate_tail(s: &str, max_len: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_len {
@@ -131,36 +83,22 @@ struct YtDlpEntry {
     uploader: Option<String>,
     #[serde(default)]
     duration: Option<f64>,
-    /// Present on every entry of a `--flat-playlist` listing (not a search),
-    /// carrying the *playlist's* title rather than this entry's own — see
-    /// [`first_playlist_title`].
     #[serde(default)]
     playlist_title: Option<String>,
 }
 
-/// Maps one parsed `yt-dlp -j` entry into a [`Track`]. `None` if it has no
-/// usable video id — happens for deleted/private playlist slots, which
-/// `yt-dlp` still emits a placeholder line for.
 fn track_from_entry(entry: YtDlpEntry) -> Option<Track> {
     let video_id = entry.id.filter(|id| !id.is_empty())?;
     Some(Track {
         video_id,
         title: entry.title.unwrap_or_default(),
-        // `channel` is present on full extractions and most flat listings;
-        // `uploader` is the fallback yt-dlp uses when `channel` is absent.
         channel: entry.channel.or(entry.uploader).unwrap_or_default(),
-        // `Duration::from_secs_f64` panics on a negative, non-finite, or
-        // overflowing value; `try_from_secs_f64` rejects the same inputs
-        // without panicking, so a malformed `duration` from yt-dlp's JSON
-        // just becomes `None` instead of crashing the caller.
         duration: entry
             .duration
             .and_then(|secs| Duration::try_from_secs_f64(secs).ok()),
     })
 }
 
-/// Parses `yt-dlp -j`'s (one-JSON-object-per-line) stdout into [`YtDlpEntry`]
-/// values, skipping any line that isn't valid JSON.
 fn parse_entries(stdout: &str) -> impl Iterator<Item = YtDlpEntry> + '_ {
     stdout.lines().filter_map(|line| {
         let line = line.trim();
@@ -172,19 +110,6 @@ fn parse_entries(stdout: &str) -> impl Iterator<Item = YtDlpEntry> + '_ {
     })
 }
 
-/// Parses `yt-dlp -j`'s stdout into [`Track`]s, skipping any entry that isn't
-/// valid JSON, maps to no usable track (e.g. deleted-video placeholder
-/// entries), or has no known duration — silently, none of these are treated
-/// as an error. A missing duration means `yt-dlp` couldn't report one, most
-/// commonly because the video is an in-progress livestream (see
-/// [`Track::duration`]); those are dropped rather than surfaced because
-/// every caller of this (`search`, `list_playlist_items`, `hydrate_videos`)
-/// already tolerates a track going missing from its results, and queuing one
-/// leaks a background download if it's skipped before the broadcast itself
-/// ends (songbird's HLS path never notices — see the removed
-/// `vendor/stream_lib` patch this replaced). `get_video` needs to tell a
-/// caller-picked livestream apart from a missing video, so it checks
-/// [`Track::duration`] itself instead of going through this.
 fn parse_tracks(stdout: &str) -> Vec<Track> {
     parse_entries(stdout)
         .filter_map(track_from_entry)
@@ -192,10 +117,6 @@ fn parse_tracks(stdout: &str) -> Vec<Track> {
         .collect()
 }
 
-/// Pulls the playlist's own title out of a `--flat-playlist` listing's
-/// stdout — every entry carries it under `playlist_title`, so the first
-/// entry that has one (usually the first line) settles it. `None` for a
-/// search listing (no such field at all) or an empty/unparseable playlist.
 fn first_playlist_title(stdout: &str) -> Option<String> {
     stdout.lines().find_map(|line| {
         let line = line.trim();
@@ -209,26 +130,11 @@ fn first_playlist_title(stdout: &str) -> Option<String> {
     })
 }
 
-/// A playlist listing: its tracks, plus its own title if `yt-dlp` reported
-/// one — used by the saved-playlists picker to default an import's name to
-/// the real playlist title instead of the raw URL when the user leaves the
-/// name field blank.
 pub struct PlaylistListing {
     pub title: Option<String>,
     pub tracks: Vec<Track>,
 }
 
-/// Validates `playlist_url_or_id` and builds the single argv token passed to
-/// `yt-dlp` as its playlist target.
-///
-/// This is the fix for a `yt-dlp` argument-injection bug: `playlist_url_or_id`
-/// comes straight from raw user text (the playlist-import modal and
-/// `/play`'s playlist branch), and without validation, a bare id starting
-/// with `-` (e.g. `--exec=<cmd> http://x`) is parsed by `yt-dlp` as a
-/// command-line flag rather than a positional argument — `--exec` runs an
-/// arbitrary shell command. Rejecting a leading `-` is the critical check;
-/// the URL/host/charset checks narrow this further to only what a real
-/// `YouTube` playlist reference looks like.
 fn build_playlist_target(playlist_url_or_id: &str) -> Result<String, YouTubeApiError> {
     if playlist_url_or_id.contains("://") {
         let url = url::Url::parse(playlist_url_or_id)
@@ -265,20 +171,9 @@ fn build_playlist_target(playlist_url_or_id: &str) -> Result<String, YouTubeApiE
     }
 }
 
-/// `yt-dlp`-backed `YouTube` client: search, single-video lookup, and
-/// playlist listing. Cheap to clone — holds only the (optional) cookies
-/// file path and the playlist track cap, no connection state.
 #[derive(Debug, Clone)]
 pub struct YouTubeClient {
-    /// Path to a Netscape-format cookies file, passed to `yt-dlp` as
-    /// `--cookies` when set — see `Config::yt_dlp_cookies_file`.
     cookies_file: Option<String>,
-    /// Max tracks returned by `list_playlist_items`. `YouTube` playlists can
-    /// run up to 5000 entries; without a cap a very large (or deliberately
-    /// crafted) playlist produces an unbounded `Vec<Track>`. Passed to
-    /// `yt-dlp` itself via `--playlist-end` (so it stops fetching early) and
-    /// enforced again on the parsed result as a defense-in-depth backstop.
-    /// See `Config::playlist_track_limit`.
     playlist_track_limit: usize,
 }
 
@@ -299,9 +194,6 @@ impl YouTubeClient {
         }
     }
 
-    /// Runs `yt-dlp -j <extra_args...> <target>` and returns its stdout on
-    /// success. Killed and reported as [`YouTubeApiError::Timeout`] if it
-    /// doesn't finish within `timeout`.
     async fn run(
         &self,
         extra_args: &[&str],
@@ -338,12 +230,7 @@ impl YouTubeClient {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    /// Searches `YouTube` for `query`, returning up to [`SEARCH_LIMIT`] hits
-    /// in `YouTube`'s own relevance order.
     pub async fn search(&self, query: &str) -> Result<Vec<Track>, YouTubeApiError> {
-        // The `ytsearch{N}:` prefix is a fixed literal, so the resulting
-        // target can never start with `-` regardless of `query`'s content —
-        // it can't be mistaken by yt-dlp for a flag.
         let target = format!("ytsearch{SEARCH_LIMIT}:{query}");
         let stdout = self
             .run(
@@ -355,13 +242,7 @@ impl YouTubeClient {
         Ok(parse_tracks(&stdout))
     }
 
-    /// Looks up a single video by ID (used by `/play` for a direct video
-    /// ID/URL, and by `/add_to_queue`'s picker re-lookup).
     pub async fn get_video(&self, video_id: &str) -> Result<Track, YouTubeApiError> {
-        // As with `search`, the `https://www.youtube.com/watch?v=` prefix is
-        // a fixed literal: the resulting target always starts with `h`, so
-        // it can't be mistaken by yt-dlp for a flag no matter what
-        // `video_id` contains.
         let url = format!("https://www.youtube.com/watch?v={video_id}");
         let stdout = self.run(&["--no-playlist"], &url, YT_DLP_TIMEOUT).await?;
         let track = parse_entries(&stdout)
@@ -376,12 +257,6 @@ impl YouTubeClient {
         Ok(track)
     }
 
-    /// Lists every track in a playlist, given either a full playlist URL or
-    /// a bare playlist ID (e.g. `PLxxxxxxxxxxxx`), alongside the playlist's
-    /// own title if `yt-dlp` reported one. Rejects anything that doesn't
-    /// validate as a `YouTube` playlist URL/id (see
-    /// [`YouTubeApiError::InvalidInput`]), and returns at most
-    /// [`Self::playlist_track_limit`] tracks.
     pub async fn list_playlist_items(
         &self,
         playlist_url_or_id: &str,
@@ -408,14 +283,6 @@ impl YouTubeClient {
         })
     }
 
-    /// Looks up multiple videos by id in one `yt-dlp` invocation (used by
-    /// radio mode to hydrate a batch of bare video ids from a `yt-dlp` Mix
-    /// listing — see `crate::voice::radio::list_mix_video_ids` — into full
-    /// `Track`s, without spawning one process per candidate).
-    ///
-    /// Ids that don't resolve (deleted/private since the Mix was generated)
-    /// are silently omitted from the result rather than erroring the whole
-    /// batch. Order is not guaranteed to match `video_ids`'s input order.
     pub async fn hydrate_videos(&self, video_ids: &[&str]) -> Result<Vec<Track>, YouTubeApiError> {
         if video_ids.is_empty() {
             return Ok(Vec::new());
@@ -442,10 +309,6 @@ impl YouTubeClient {
                 }
             })?;
 
-        // `--ignore-errors` means a per-id failure doesn't fail the whole
-        // batch (or the process' exit code) — just skips that id's line, so
-        // stdout is parsed unconditionally rather than gating on
-        // `output.status`.
         Ok(parse_tracks(&String::from_utf8_lossy(&output.stdout)))
     }
 }
@@ -453,8 +316,6 @@ impl YouTubeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- track_from_entry / parse_tracks ----
 
     #[test]
     fn maps_entry_with_channel_field() {
@@ -591,8 +452,6 @@ mod tests {
         assert_eq!(tracks[0].video_id, "vod1");
     }
 
-    // ---- first_playlist_title ----
-
     #[test]
     fn first_playlist_title_reads_it_from_any_entry() {
         let stdout = "{\"id\": \"a\", \"playlist_title\": \"Chill Mix\"}\n\
@@ -602,7 +461,6 @@ mod tests {
 
     #[test]
     fn first_playlist_title_none_when_absent() {
-        // e.g. a search listing, which has no playlist_title field at all.
         let stdout = "{\"id\": \"a\", \"title\": \"Some Video\"}\n";
         assert_eq!(first_playlist_title(stdout), None);
     }
@@ -619,8 +477,6 @@ mod tests {
         assert_eq!(first_playlist_title(stdout), Some("Chill Mix".to_string()));
     }
 
-    // ---- truncate_tail ----
-
     #[test]
     fn truncate_tail_keeps_final_error_over_leading_warning() {
         let stderr = format!(
@@ -635,8 +491,6 @@ mod tests {
     fn truncate_tail_leaves_short_strings_untouched() {
         assert_eq!(truncate_tail("short", 200), "short");
     }
-
-    // ---- build_playlist_target ----
 
     #[test]
     fn accepts_bare_playlist_id() {
@@ -676,16 +530,12 @@ mod tests {
 
     #[test]
     fn rejects_bare_id_starting_with_dash() {
-        // The actual root cause of the injection: a leading `-`/`--` makes
-        // yt-dlp treat the token as a flag rather than a positional arg.
         let err = build_playlist_target("--exec=touch /tmp/pwned").unwrap_err();
         assert!(matches!(err, YouTubeApiError::InvalidInput(_)));
     }
 
     #[test]
     fn rejects_injection_style_url_with_extra_flag_token() {
-        // `"http://x"` here exists only to pass a naive `contains("://")`
-        // check; the host isn't YouTube at all, so this must be rejected.
         let err = build_playlist_target("--exec=<cmd> http://x").unwrap_err();
         assert!(matches!(err, YouTubeApiError::InvalidInput(_)));
     }
@@ -724,8 +574,6 @@ mod tests {
     fn rejects_garbage_url() {
         assert!(build_playlist_target("not a url://at all").is_err());
     }
-
-    // ---- playlist track limit truncation ----
 
     #[test]
     fn track_list_is_truncated_to_playlist_limit() {

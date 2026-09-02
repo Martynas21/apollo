@@ -1,6 +1,3 @@
-//! Per-guild `songbird::Driver` state — the only "business logic" this
-//! worker has. Everything else (queueing, DB, panels) stays in `apollo`.
-
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::Mutex;
@@ -43,12 +40,6 @@ fn to_connection_info(dto: ConnectionInfoDto) -> Result<ConnectionInfo, String> 
     })
 }
 
-/// Relays a track's End/Error events back over IPC — direct analog of
-/// apollo's own `TrackEndHandler` (`src/voice/player.rs`), just relocated
-/// into this process. Both End and Error are registered (not just End) for
-/// the same reason apollo's does: a track whose input fails mid-stream goes
-/// to `PlayMode::Errored` without ever firing `End` in songbird 0.6 — the
-/// same handler instance (cloned) is registered for both.
 #[derive(Clone)]
 struct TrackEndHandler {
     guild_id: u64,
@@ -83,18 +74,12 @@ impl SongbirdEventHandler for TrackEndHandler {
     }
 }
 
-/// The buffer file is on tmpfs (RAM-backed, see `compose.yaml`) and nothing
-/// else ever deletes it — every path that ends a track's life must clean up
-/// after itself here or it leaks for the life of the container.
 fn delete_audio_file(path: &str) {
     if let Err(err) = std::fs::remove_file(path) {
         tracing::warn!(%err, %path, "failed to delete buffered audio file");
     }
 }
 
-/// Relays connection loss (kick, reconnect exhausted) — analog of apollo's
-/// `DriverDisconnectHandler`. This is the only way to detect the connection
-/// dying while nothing was actively playing.
 struct DriverDisconnectHandler {
     guild_id: u64,
     events: UnboundedSender<IpcEvent>,
@@ -140,10 +125,6 @@ impl Sessions {
                     current: None,
                 },
             );
-        // A re-issued Join for a guild that already has a session (e.g. a
-        // second /play while one is already active) must not just drop the
-        // old Driver — that would orphan its track with no End/Error ever
-        // reaching apollo. Tear it down the same way an explicit leave does.
         if let Some(mut old) = old {
             old.driver.leave();
         }
@@ -161,9 +142,6 @@ impl Sessions {
         }
     }
 
-    /// Leaves every active session — used when the IPC connection to
-    /// `apollo` drops, since nothing will ever consume further events or
-    /// send further commands once that happens.
     pub fn leave_all(&self) {
         let mut guilds = self
             .guilds
@@ -191,12 +169,6 @@ impl Sessions {
             audio_path,
             events: self.events.clone(),
         };
-        // Registration failures are logged, not propagated: the track is
-        // already playing by this point, so returning `Err` here would skip
-        // `session.current` below and leave a live track this `Sessions`
-        // can never look up again to pause/stop/clean up — the same
-        // log-and-continue tradeoff apollo's own (pre-split)
-        // `notify_when_finished` made.
         if let Err(err) = handle.add_event(Event::Track(TrackEvent::End), end_handler.clone()) {
             tracing::warn!(%err, "failed to register track-end handler");
         }
@@ -207,11 +179,6 @@ impl Sessions {
         Ok(())
     }
 
-    /// The current track's handle for `guild_id`, if `track_id` is still
-    /// that guild's current track — `Err` for an unknown guild or a
-    /// stale/superseded `track_id`. Shared by every command below, sync
-    /// (`with_current`) or async (`status`), that needs to reach the actual
-    /// `TrackHandle`.
     fn current_handle(&self, guild_id: u64, track_id: Uuid) -> Result<TrackHandle, String> {
         let guilds = self
             .guilds
@@ -284,8 +251,6 @@ mod tests {
         Sessions::new(tx)
     }
 
-    /// A `Driver` with no live connection — safe to construct and play into
-    /// off-network; only `.connect()` touches anything external.
     fn offline_driver_with_track() -> (Driver, TrackHandle) {
         let mut driver = Driver::new(Config::default());
         let handle = driver.play_input(Input::from(Vec::<u8>::new()));
@@ -306,9 +271,6 @@ mod tests {
     #[tokio::test]
     async fn play_rejects_a_guild_with_no_join() {
         let sessions = sessions();
-        // A path that doesn't exist: `play`'s failure path tries to delete
-        // it (see `delete_audio_file`), which must not panic when there's
-        // nothing there to remove.
         assert!(
             sessions
                 .play(
@@ -331,7 +293,6 @@ mod tests {
         assert!(sessions.pause(1, stale_id).is_err());
         assert!(sessions.stop(1, stale_id).is_err());
 
-        // The real (non-stale) id is still accepted.
         assert!(sessions.pause(1, current_id).is_ok());
     }
 
