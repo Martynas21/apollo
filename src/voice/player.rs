@@ -96,7 +96,6 @@ pub enum PlayerError {
     NothingPlaying,
     NothingToShuffle,
     QueueEmpty,
-    InvalidSelection,
     Join(String),
     Playback(String),
     Storage(String),
@@ -109,12 +108,6 @@ impl std::fmt::Display for PlayerError {
             Self::NothingPlaying => write!(f, "nothing is playing"),
             Self::NothingToShuffle => write!(f, "not enough upcoming tracks to shuffle"),
             Self::QueueEmpty => write!(f, "the queue is already empty"),
-            Self::InvalidSelection => {
-                write!(
-                    f,
-                    "that queue selection is no longer valid — the queue may have changed"
-                )
-            }
             Self::Join(message) => write!(f, "failed to join voice channel: {message}"),
             Self::Playback(message) => write!(f, "playback error: {message}"),
             Self::Storage(message) => write!(f, "failed to save setting: {message}"),
@@ -130,6 +123,7 @@ pub struct AudioSource {
 }
 
 pub struct TrackStatus {
+    #[allow(dead_code)]
     pub position: Duration,
     pub paused: bool,
 }
@@ -191,17 +185,6 @@ struct GuildState {
 }
 
 impl GuildState {
-    fn claim_panel(&mut self) -> PanelClaim {
-        if let Some(panel) = self.panel {
-            return PanelClaim::Existing(panel);
-        }
-        if self.panel_reserved {
-            return PanelClaim::InProgress;
-        }
-        self.panel_reserved = true;
-        PanelClaim::Reserved
-    }
-
     fn set_panel(&mut self, channel_id: ChannelId, message_id: MessageId) {
         self.panel = Some((channel_id, message_id));
         self.panel_reserved = false;
@@ -210,10 +193,17 @@ impl GuildState {
     fn release_panel(&mut self) {
         self.panel_reserved = false;
     }
+
+    fn begin_panel_repost(&mut self) -> PanelRepost {
+        if self.panel_reserved {
+            return PanelRepost::InProgress;
+        }
+        self.panel_reserved = true;
+        PanelRepost::Reserved
+    }
 }
 
-pub enum PanelClaim {
-    Existing((ChannelId, MessageId)),
+pub enum PanelRepost {
     Reserved,
     InProgress,
 }
@@ -226,6 +216,7 @@ pub struct QueueSnapshot {
 
 struct SessionSnapshot {
     now_playing: Option<QueuedTrack>,
+    last_played: Option<QueuedTrack>,
     radio_enabled: bool,
     radio_requested_by: Option<UserId>,
     radio_history: Vec<String>,
@@ -235,11 +226,21 @@ impl From<&GuildState> for SessionSnapshot {
     fn from(state: &GuildState) -> Self {
         Self {
             now_playing: state.now_playing.clone(),
+            last_played: state.last_played.clone(),
             radio_enabled: state.radio_enabled,
             radio_requested_by: state.radio_requested_by,
             radio_history: Vec::from(state.radio_history.clone()),
         }
     }
+}
+
+fn persisted_to_queued_track(pair: Option<(Track, String)>) -> Option<QueuedTrack> {
+    pair.and_then(|(track, requested_by)| {
+        requested_by.parse().ok().map(|id| QueuedTrack {
+            track,
+            requested_by: UserId::new(id),
+        })
+    })
 }
 
 #[derive(Clone)]
@@ -403,12 +404,8 @@ impl PlayerRegistry {
             .and_then(|id| id.parse().ok())
             .map(UserId::new);
         state.radio_history = session.radio_history.into();
-        state.now_playing = session.now_playing.and_then(|(track, requested_by)| {
-            requested_by.parse().ok().map(|id| QueuedTrack {
-                track,
-                requested_by: UserId::new(id),
-            })
-        });
+        state.now_playing = persisted_to_queued_track(session.now_playing);
+        state.last_played = persisted_to_queued_track(session.last_played);
         if state.now_playing.is_none() {
             let next = match db::queue_pop_front(&self.db, guild_id_str).await {
                 Ok(next) => next,
@@ -446,6 +443,15 @@ impl PlayerRegistry {
             .as_ref()
             .zip(now_playing_requested_by.as_deref())
             .map(|(q, rb)| (&q.track, rb));
+        let last_played_requested_by = snapshot
+            .last_played
+            .as_ref()
+            .map(|q| q.requested_by.to_string());
+        let last_played_arg = snapshot
+            .last_played
+            .as_ref()
+            .zip(last_played_requested_by.as_deref())
+            .map(|(q, rb)| (&q.track, rb));
         let result = db::save_guild_session_meta(
             &self.db,
             &guild_id_str,
@@ -453,6 +459,7 @@ impl PlayerRegistry {
             radio_requested_by.as_deref(),
             &snapshot.radio_history,
             now_playing_arg,
+            last_played_arg,
         )
         .await;
         if let Err(err) = result {
@@ -945,43 +952,6 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    pub async fn jump_to(&self, guild_id: GuildId, index: usize) -> Result<(), PlayerError> {
-        let guild_id_str = guild_id.to_string();
-        let mut guilds = self.guilds.lock().await;
-        let queue_len = db::queue_len(&self.db, &guild_id_str)
-            .await
-            .map_err(|e| PlayerError::Storage(e.to_string()))?;
-        if index >= queue_len {
-            return Err(PlayerError::InvalidSelection);
-        }
-        let state = guilds
-            .get_mut(&guild_id)
-            .ok_or(PlayerError::InvalidSelection)?;
-        let handle = state
-            .current_handle
-            .clone()
-            .ok_or(PlayerError::NothingPlaying)?;
-
-        handle
-            .stop()
-            .await
-            .map_err(|e| PlayerError::Playback(e.to_string()))?;
-
-        db::queue_drop_front(&self.db, &guild_id_str, index)
-            .await
-            .map_err(|e| PlayerError::Storage(e.to_string()))?;
-        if index > 0 {
-            let next = db::queue_peek_front(&self.db, &guild_id_str)
-                .await
-                .map_err(|e| PlayerError::Storage(e.to_string()))?;
-            self.restart_prefetch(state, next);
-        }
-        drop(guilds);
-
-        self.persist_session(guild_id).await;
-        Ok(())
-    }
-
     fn restart_prefetch(&self, state: &mut GuildState, next: Option<QueuedTrack>) {
         if let Some(old) = state.prefetch.take() {
             discard_prefetch(old);
@@ -1229,14 +1199,25 @@ impl PlayerRegistry {
     }
 
     pub async fn queue_snapshot(&self, guild_id: GuildId) -> QueueSnapshot {
-        let guilds = self.guilds.lock().await;
-        let now_playing = guilds.get(&guild_id).and_then(|s| {
-            s.current_track_id
-                .is_some()
-                .then(|| s.now_playing.clone())
-                .flatten()
-        });
-        let last_played = guilds.get(&guild_id).and_then(|s| s.last_played.clone());
+        let (now_playing, last_played, has_entry) = {
+            let guilds = self.guilds.lock().await;
+            match guilds.get(&guild_id) {
+                Some(s) => {
+                    let now_playing = s
+                        .current_track_id
+                        .is_some()
+                        .then(|| s.now_playing.clone())
+                        .flatten();
+                    (now_playing, s.last_played.clone(), true)
+                }
+                None => (None, None, false),
+            }
+        };
+        let last_played = if has_entry {
+            last_played
+        } else {
+            self.load_last_played_from_db(guild_id).await
+        };
         let upcoming = db::queue_all(&self.db, &guild_id.to_string())
             .await
             .unwrap_or_else(|err| {
@@ -1250,40 +1231,20 @@ impl PlayerRegistry {
         }
     }
 
-    pub async fn now_playing_position(&self, guild_id: GuildId) -> Option<Duration> {
-        let handle = {
-            let guilds = self.guilds.lock().await;
-            guilds
-                .get(&guild_id)
-                .and_then(|state| state.current_handle.clone())
-        }?;
-        handle.status().await.map(|status| status.position)
-    }
-
-    pub async fn claim_panel_slot(&self, guild_id: GuildId) -> PanelClaim {
-        let panel = {
-            let mut guilds = self.guilds.lock().await;
-            let state = guilds.entry(guild_id).or_default();
-            match state.claim_panel() {
-                PanelClaim::Existing(panel) => panel,
-                other => return other,
-            }
-        };
-        let (channel_id, message_id) = panel;
-
-        match self.edit_panel(guild_id, channel_id, message_id).await {
-            Ok(()) => PanelClaim::Existing(panel),
-            Err(failure) => {
-                let gone = self.forget_panel_if_gone(guild_id, panel, &failure).await;
-                if gone {
-                    let mut guilds = self.guilds.lock().await;
-                    let state = guilds.entry(guild_id).or_default();
-                    state.claim_panel()
-                } else {
-                    PanelClaim::Existing(panel)
-                }
+    async fn load_last_played_from_db(&self, guild_id: GuildId) -> Option<QueuedTrack> {
+        match db::load_guild_session(&self.db, &guild_id.to_string()).await {
+            Ok(Some(session)) => persisted_to_queued_track(session.last_played),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(%guild_id, %err, "failed to load last-played from persisted session");
+                None
             }
         }
+    }
+
+    pub async fn begin_panel_repost(&self, guild_id: GuildId) -> PanelRepost {
+        let mut guilds = self.guilds.lock().await;
+        guilds.entry(guild_id).or_default().begin_panel_repost()
     }
 
     pub async fn set_panel(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) {
@@ -1477,38 +1438,9 @@ mod tests {
     }
 
     #[test]
-    fn claim_panel_reserves_a_fresh_slot() {
-        let mut state = GuildState::default();
-        assert!(matches!(state.claim_panel(), PanelClaim::Reserved));
-        assert!(state.panel_reserved);
-        assert!(state.panel.is_none());
-    }
-
-    #[test]
-    fn claim_panel_returns_existing_without_reserving() {
-        let mut state = GuildState::default();
-        let panel = sample_panel();
-        state.panel = Some(panel);
-
-        match state.claim_panel() {
-            PanelClaim::Existing(got) => assert_eq!(got, panel),
-            PanelClaim::Reserved => panic!("expected Existing, got Reserved"),
-            PanelClaim::InProgress => panic!("expected Existing, got InProgress"),
-        }
-        assert!(!state.panel_reserved);
-    }
-
-    #[test]
-    fn a_second_claim_while_reserved_does_not_also_reserve() {
-        let mut state = GuildState::default();
-        assert!(matches!(state.claim_panel(), PanelClaim::Reserved));
-        assert!(matches!(state.claim_panel(), PanelClaim::InProgress));
-    }
-
-    #[test]
     fn set_panel_fulfils_a_reservation_and_records_the_message() {
         let mut state = GuildState::default();
-        assert!(matches!(state.claim_panel(), PanelClaim::Reserved));
+        assert!(matches!(state.begin_panel_repost(), PanelRepost::Reserved));
 
         let (channel_id, message_id) = sample_panel();
         state.set_panel(channel_id, message_id);
@@ -1520,13 +1452,34 @@ mod tests {
     #[test]
     fn release_panel_clears_the_reservation_without_touching_panel() {
         let mut state = GuildState::default();
-        assert!(matches!(state.claim_panel(), PanelClaim::Reserved));
+        assert!(matches!(state.begin_panel_repost(), PanelRepost::Reserved));
 
         state.release_panel();
 
         assert!(!state.panel_reserved);
         assert!(state.panel.is_none());
-        assert!(matches!(state.claim_panel(), PanelClaim::Reserved));
+        assert!(matches!(state.begin_panel_repost(), PanelRepost::Reserved));
+    }
+
+    #[test]
+    fn begin_panel_repost_reserves_even_when_a_panel_already_exists() {
+        let mut state = GuildState {
+            panel: Some(sample_panel()),
+            ..GuildState::default()
+        };
+
+        assert!(matches!(state.begin_panel_repost(), PanelRepost::Reserved));
+        assert!(state.panel_reserved);
+    }
+
+    #[test]
+    fn begin_panel_repost_reports_in_progress_while_already_reserved() {
+        let mut state = GuildState::default();
+        assert!(matches!(state.begin_panel_repost(), PanelRepost::Reserved));
+        assert!(matches!(
+            state.begin_panel_repost(),
+            PanelRepost::InProgress
+        ));
     }
 
     #[derive(Default)]
@@ -1561,10 +1514,6 @@ mod tests {
 
         fn volume(&self) -> Option<f32> {
             self.state.lock().unwrap().volume
-        }
-
-        fn fail_stop(&self, message: &str) {
-            self.state.lock().unwrap().stop_error = Some(message.to_string());
         }
 
         fn registered(&self) -> Option<(GuildId, Arc<dyn VoiceEvents>)> {
@@ -1994,57 +1943,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn jump_to_stops_the_current_track_and_drops_skipped_entries() {
-        let (registry, backend, guild_id) = joined_registry().await;
-        registry.enqueue(guild_id, queued("a")).await.unwrap();
-        registry
-            .enqueue_many(guild_id, vec![queued("b"), queued("c"), queued("d")])
-            .await
-            .unwrap();
-        let a_track = backend.call_for(guild_id).unwrap().last_track();
-        let a_id = current_track_id(&registry, guild_id).await;
-
-        registry.jump_to(guild_id, 1).await.unwrap();
-
-        assert!(a_track.was_stopped());
-        let snapshot = registry.queue_snapshot(guild_id).await;
-        assert_eq!(upcoming_ids(&snapshot), vec!["c", "d"]);
-        backend.finish_track(guild_id, a_id).await;
-        let snapshot = registry.queue_snapshot(guild_id).await;
-        assert_eq!(upcoming_ids(&snapshot), vec!["d"]);
-        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "c");
-    }
-
-    #[tokio::test]
-    async fn jump_to_does_not_drain_the_queue_if_stop_fails() {
-        let (registry, backend, guild_id) = joined_registry().await;
-        registry.enqueue(guild_id, queued("a")).await.unwrap();
-        registry
-            .enqueue_many(guild_id, vec![queued("b"), queued("c")])
-            .await
-            .unwrap();
-        let a_track = backend.call_for(guild_id).unwrap().last_track();
-        a_track.fail_stop("mixer gone");
-
-        let err = registry.jump_to(guild_id, 1).await.unwrap_err();
-
-        assert!(matches!(err, PlayerError::Playback(_)));
-        let snapshot = registry.queue_snapshot(guild_id).await;
-        assert_eq!(upcoming_ids(&snapshot), vec!["b", "c"]);
-    }
-
-    #[tokio::test]
-    async fn jump_to_rejects_an_out_of_range_index() {
-        let (registry, _backend, guild_id) = joined_registry().await;
-        registry.enqueue(guild_id, queued("a")).await.unwrap();
-        registry.enqueue(guild_id, queued("b")).await.unwrap();
-
-        let err = registry.jump_to(guild_id, 5).await.unwrap_err();
-
-        assert!(matches!(err, PlayerError::InvalidSelection));
-    }
-
-    #[tokio::test]
     async fn clear_queue_drops_upcoming_but_leaves_now_playing_alone() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
@@ -2185,6 +2083,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advance_into_an_empty_queue_then_idle_disconnect_still_shows_last_played() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        let a_id = current_track_id(&registry, guild_id).await;
+        backend.finish_track(guild_id, a_id).await;
+
+        registry.leave_if_idle(guild_id).await;
+
+        assert!(backend.call_for(guild_id).is_none());
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(
+            snapshot.last_played.map(|q| q.track.video_id),
+            Some("a".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn leave_preserves_last_played_for_the_next_queue_snapshot() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        let a_id = current_track_id(&registry, guild_id).await;
+        backend.finish_track(guild_id, a_id).await;
+
+        registry.leave(guild_id).await.unwrap();
+
+        assert!(backend.call_for(guild_id).is_none());
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(
+            snapshot.last_played.map(|q| q.track.video_id),
+            Some("a".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn set_volume_applies_to_the_current_track() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
@@ -2280,6 +2212,7 @@ mod tests {
             Some("1"),
             &["a".to_string()],
             Some((&queued("a").track, "1")),
+            None,
         )
         .await
         .unwrap();
@@ -2307,6 +2240,7 @@ mod tests {
             None,
             &[],
             Some((&queued("a").track, "1")),
+            None,
         )
         .await
         .unwrap();

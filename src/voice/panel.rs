@@ -4,9 +4,9 @@ use poise::serenity_prelude as serenity;
 
 use super::player::{PlayerRegistry, QueueSnapshot, QueuedTrack};
 
-const QUEUE_SELECT_LIMIT: usize = 25;
-
 const ACCENT_COLOR: serenity::Colour = serenity::Colour::new(0x008B_5CF6);
+
+const PANEL_UPCOMING_PREVIEW: usize = 5;
 
 pub(crate) fn format_duration(duration: Duration) -> String {
     let total_secs = duration.as_secs();
@@ -38,22 +38,12 @@ pub(crate) fn truncate_label(label: &str) -> String {
     }
 }
 
-fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> serenity::CreateEmbed {
+fn now_playing_embed(queued: &QueuedTrack, upcoming: &[QueuedTrack]) -> serenity::CreateEmbed {
     let video_url = format!("https://www.youtube.com/watch?v={}", queued.track.video_id);
     let thumbnail_url = format!(
         "https://i.ytimg.com/vi/{}/hqdefault.jpg",
         queued.track.video_id
     );
-
-    let progress = match (position, queued.track.duration) {
-        (Some(pos), Some(dur)) => Some(format!(
-            "{} / {}",
-            format_duration(pos),
-            format_duration(dur)
-        )),
-        (Some(pos), None) => Some(format_duration(pos)),
-        (None, _) => None,
-    };
 
     let mut embed = serenity::CreateEmbed::new()
         .author(serenity::CreateEmbedAuthor::new("▶ Now Playing"))
@@ -64,11 +54,28 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
         .field("Channel", &queued.track.channel, true)
         .field("Requested by", format!("<@{}>", queued.requested_by), true);
 
-    if let Some(progress) = progress {
-        embed = embed.field("Progress", progress, false);
+    if let Some((name, value)) = upcoming_field(upcoming) {
+        embed = embed.field(name, value, false);
     }
 
     embed
+}
+
+fn upcoming_field(upcoming: &[QueuedTrack]) -> Option<(String, String)> {
+    if upcoming.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<String> = upcoming
+        .iter()
+        .take(PANEL_UPCOMING_PREVIEW)
+        .enumerate()
+        .map(|(i, q)| format!("{}. {}", i + 1, truncate_label(&q.track.title)))
+        .collect();
+    let remaining = upcoming.len().saturating_sub(PANEL_UPCOMING_PREVIEW);
+    if remaining > 0 {
+        lines.push(format!("...and {remaining} more"));
+    }
+    Some(("Up Next".to_string(), lines.join("\n")))
 }
 
 fn last_played_embed(queued: &QueuedTrack) -> serenity::CreateEmbed {
@@ -94,16 +101,10 @@ fn panel_components(
     volume: u8,
     radio_enabled: bool,
 ) -> Vec<serenity::CreateActionRow> {
-    let mut rows = vec![
+    vec![
         playback_row(snapshot, paused, radio_enabled),
         controls_row(snapshot, volume),
-    ];
-
-    if let Some(select_row) = queue_select_row(snapshot) {
-        rows.push(select_row);
-    }
-
-    rows
+    ]
 }
 
 fn playback_row(
@@ -169,31 +170,6 @@ fn controls_row(snapshot: &QueueSnapshot, volume: u8) -> serenity::CreateActionR
     ])
 }
 
-fn queue_select_row(snapshot: &QueueSnapshot) -> Option<serenity::CreateActionRow> {
-    if snapshot.upcoming.is_empty() {
-        return None;
-    }
-
-    let options = snapshot
-        .upcoming
-        .iter()
-        .take(QUEUE_SELECT_LIMIT)
-        .enumerate()
-        .map(|(i, queued)| {
-            serenity::CreateSelectMenuOption::new(
-                truncate_label(&format!("{}. {}", i + 1, queued.track.title)),
-                i.to_string(),
-            )
-        })
-        .collect();
-    let select = serenity::CreateSelectMenu::new(
-        "player:jump",
-        serenity::CreateSelectMenuKind::String { options },
-    )
-    .placeholder("Jump to a track in the queue...");
-    Some(serenity::CreateActionRow::SelectMenu(select))
-}
-
 pub(crate) async fn render(
     registry: &PlayerRegistry,
     guild_id: serenity::GuildId,
@@ -209,14 +185,11 @@ pub(crate) async fn render(
     let components = panel_components(&snapshot, paused, volume, radio_enabled);
 
     match &snapshot.now_playing {
-        Some(queued) => {
-            let position = registry.now_playing_position(guild_id).await;
-            (
-                String::new(),
-                Some(now_playing_embed(queued, position)),
-                components,
-            )
-        }
+        Some(queued) => (
+            String::new(),
+            Some(now_playing_embed(queued, &snapshot.upcoming)),
+            components,
+        ),
         None => match &snapshot.last_played {
             Some(queued) => (
                 "Queue finished — search or `/play` to add more.".to_string(),
@@ -256,7 +229,7 @@ mod tests {
     #[test]
     fn embed_includes_title_url_thumbnail_and_requester() {
         let queued = sample_queued_track(Some(Duration::from_secs(213)));
-        let json = embed_json(now_playing_embed(&queued, Some(Duration::from_secs(30))));
+        let json = embed_json(now_playing_embed(&queued, &[]));
 
         assert_eq!(json["title"], "Some Video");
         assert_eq!(json["url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
@@ -279,37 +252,80 @@ mod tests {
             field_value("Requested by"),
             Some("<@123456789012345678>".to_string())
         );
-        assert!(
-            field_value("Progress")
-                .expect("Progress field should be present")
-                .ends_with("0:30 / 3:33")
-        );
     }
 
     #[test]
-    fn embed_omits_progress_field_when_position_unknown() {
+    fn embed_omits_up_next_field_when_queue_is_empty() {
         let queued = sample_queued_track(Some(Duration::from_secs(213)));
-        let json = embed_json(now_playing_embed(&queued, None));
+        let json = embed_json(now_playing_embed(&queued, &[]));
 
         let fields = json["fields"]
             .as_array()
             .expect("fields should be an array");
-        assert!(!fields.iter().any(|f| f["name"] == "Progress"));
+        assert!(!fields.iter().any(|f| f["name"] == "Up Next"));
     }
 
     #[test]
-    fn embed_shows_bare_position_when_duration_unknown() {
-        let queued = sample_queued_track(None);
-        let json = embed_json(now_playing_embed(&queued, Some(Duration::from_secs(30))));
+    fn embed_shows_up_next_field_with_upcoming_titles() {
+        let queued = sample_queued_track(Some(Duration::from_secs(213)));
+        let upcoming = vec![
+            QueuedTrack {
+                track: Track {
+                    video_id: "a".to_string(),
+                    title: "Track A".to_string(),
+                    channel: "Channel".to_string(),
+                    duration: None,
+                },
+                requested_by: serenity::UserId::new(1),
+            },
+            QueuedTrack {
+                track: Track {
+                    video_id: "b".to_string(),
+                    title: "Track B".to_string(),
+                    channel: "Channel".to_string(),
+                    duration: None,
+                },
+                requested_by: serenity::UserId::new(1),
+            },
+        ];
+        let json = embed_json(now_playing_embed(&queued, &upcoming));
 
         let fields = json["fields"]
             .as_array()
             .expect("fields should be an array");
-        let progress = fields
+        let up_next = fields
             .iter()
-            .find(|f| f["name"] == "Progress")
+            .find(|f| f["name"] == "Up Next")
             .map(|f| f["value"].as_str().unwrap());
-        assert_eq!(progress, Some("0:30"));
+        assert_eq!(up_next, Some("1. Track A\n2. Track B"));
+    }
+
+    #[test]
+    fn embed_up_next_field_truncates_with_remaining_count() {
+        let queued = sample_queued_track(Some(Duration::from_secs(213)));
+        let upcoming: Vec<QueuedTrack> = (0..8)
+            .map(|i| QueuedTrack {
+                track: Track {
+                    video_id: format!("id{i}"),
+                    title: format!("Track {i}"),
+                    channel: "Channel".to_string(),
+                    duration: None,
+                },
+                requested_by: serenity::UserId::new(1),
+            })
+            .collect();
+        let json = embed_json(now_playing_embed(&queued, &upcoming));
+
+        let fields = json["fields"]
+            .as_array()
+            .expect("fields should be an array");
+        let up_next = fields
+            .iter()
+            .find(|f| f["name"] == "Up Next")
+            .map(|f| f["value"].as_str().unwrap())
+            .expect("Up Next field should be present");
+        assert!(up_next.ends_with("...and 3 more"));
+        assert_eq!(up_next.lines().count(), PANEL_UPCOMING_PREVIEW + 1);
     }
 
     #[test]
@@ -448,22 +464,10 @@ mod tests {
     }
 
     #[test]
-    fn select_menu_omitted_when_queue_empty_and_present_otherwise() {
-        let empty = sample_queue_snapshot(true, 0);
-        let empty_json = components_json(&panel_components(&empty, Some(false), 50, false));
-        assert_eq!(empty_json.as_array().unwrap().len(), 2);
-
-        let nonempty = sample_queue_snapshot(true, 3);
-        let nonempty_json = components_json(&panel_components(&nonempty, Some(false), 50, false));
-        assert_eq!(nonempty_json.as_array().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn select_menu_caps_options_at_25() {
-        let snapshot = sample_queue_snapshot(true, 30);
+    fn panel_components_has_no_queue_select_menu() {
+        let snapshot = sample_queue_snapshot(true, 3);
         let json = components_json(&panel_components(&snapshot, Some(false), 50, false));
-        let options = json[2]["components"][0]["options"].as_array().unwrap();
-        assert_eq!(options.len(), 25);
+        assert_eq!(json.as_array().unwrap().len(), 2);
     }
 
     #[test]

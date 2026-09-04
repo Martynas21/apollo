@@ -5,7 +5,7 @@ use poise::serenity_prelude as serenity;
 use super::library;
 use super::{Context, Data, Error};
 use crate::voice::panel::format_duration;
-use crate::voice::player::{PanelClaim, PlayerError, QueuedTrack};
+use crate::voice::player::{PanelRepost, PlayerError, QueuedTrack};
 use crate::youtube::api::Track;
 
 const QUEUE_DISPLAY_LIMIT: usize = 10;
@@ -93,7 +93,7 @@ pub async fn handle_component(
         return handle_volume_button(ctx, component, guild_id, data).await;
     }
 
-    let Some(result) = apply_component_action(custom_id, component, guild_id, data).await else {
+    let Some(result) = apply_component_action(custom_id, guild_id, data).await else {
         return Ok(());
     };
     respond_to_component_action(ctx, component, guild_id, data, result).await
@@ -101,7 +101,6 @@ pub async fn handle_component(
 
 async fn apply_component_action(
     custom_id: &str,
-    component: &serenity::ComponentInteraction,
     guild_id: serenity::GuildId,
     data: &Data,
 ) -> Option<Result<(), PlayerError>> {
@@ -119,15 +118,6 @@ async fn apply_component_action(
             data.player.toggle_radio(guild_id).await;
             Ok(())
         }
-        "jump" => match &component.data.kind {
-            serenity::ComponentInteractionDataKind::StringSelect { values } => {
-                match values.first().and_then(|v| v.parse::<usize>().ok()) {
-                    Some(index) => data.player.jump_to(guild_id, index).await,
-                    None => Err(PlayerError::InvalidSelection),
-                }
-            }
-            _ => Err(PlayerError::InvalidSelection),
-        },
         _ => return None,
     })
 }
@@ -556,28 +546,18 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
 pub async fn player(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = require_guild_id(ctx)?;
 
-    let (channel_id, message_id) = match ctx.data().player.claim_panel_slot(guild_id).await {
-        PanelClaim::Existing(panel) => panel,
-        PanelClaim::InProgress => {
+    match ctx.data().player.begin_panel_repost(guild_id).await {
+        PanelRepost::InProgress => {
             ctx.send(
                 poise::CreateReply::default()
                     .content("The player panel is already being created — try again in a moment.")
                     .ephemeral(true),
             )
             .await?;
-            return Ok(());
+            Ok(())
         }
-        PanelClaim::Reserved => return post_new_panel(ctx, guild_id).await,
-    };
-
-    let link = message_id.link(channel_id, Some(guild_id));
-    ctx.send(
-        poise::CreateReply::default()
-            .content(format!("The player panel is already active: {link}"))
-            .ephemeral(true),
-    )
-    .await?;
-    Ok(())
+        PanelRepost::Reserved => post_new_panel(ctx, guild_id).await,
+    }
 }
 
 async fn post_new_panel(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result<(), Error> {
