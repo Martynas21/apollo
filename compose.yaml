@@ -46,15 +46,6 @@ services:
       retries: 15
       start_period: 5s
       start_interval: 2s
-    deploy:
-      resources:
-        limits:
-          # A ceiling on the worker's own CPU budget under plain `docker
-          # compose up` (cgroup CPU quota) — real isolation from `apollo`'s
-          # own load still depends on the host actually having spare CPU
-          # capacity; pin both services to disjoint cores with `cpuset` for
-          # a stronger guarantee if the host has cores to spare.
-          cpus: "1.0"
     restart: unless-stopped
 
 volumes:
