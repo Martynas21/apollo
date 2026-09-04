@@ -344,7 +344,7 @@ async fn schedule_cleanup(ctx: Context<'_>, handle: poise::ReplyHandle<'_>) {
     }
 }
 
-async fn reply_error(ctx: Context<'_>, content: impl Into<String>) -> Result<(), Error> {
+pub(super) async fn reply_error(ctx: Context<'_>, content: impl Into<String>) -> Result<(), Error> {
     ctx.send(
         poise::CreateReply::default()
             .content(content.into())
@@ -370,7 +370,10 @@ async fn play_playlist(ctx: Context<'_>, query: &str) -> Result<(), Error> {
     library::join_and_enqueue_all(ctx, query, tracks).await
 }
 
-async fn join_for_play(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result<(), Error> {
+pub(super) async fn join_for_play(
+    ctx: Context<'_>,
+    guild_id: serenity::GuildId,
+) -> Result<(), Error> {
     match voice_channel_of(ctx) {
         Some(channel_id) => ctx
             .data()
@@ -465,9 +468,12 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
     let snapshot = ctx.data().player.queue_snapshot(guild_id).await;
 
     let mut lines = Vec::new();
-    match &snapshot.now_playing {
-        Some(queued) => lines.push(format!("Now playing: {}", format_track(&queued.track))),
-        None => lines.push("Nothing is playing.".to_string()),
+    match (&snapshot.now_playing, &snapshot.last_played) {
+        (Some(queued), _) => lines.push(format!("Now playing: {}", format_track(&queued.track))),
+        (None, Some(queued)) => {
+            lines.push(format!("Finished playing: {}", format_track(&queued.track)));
+        }
+        (None, None) => lines.push("Nothing is playing.".to_string()),
     }
 
     if !snapshot.upcoming.is_empty() {
@@ -514,8 +520,24 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
 
     match ctx.data().player.resume(guild_id).await {
         Ok(()) => reply_public(ctx, "Resumed.").await,
+        Err(PlayerError::NothingPlaying) if !ctx.data().player.is_connected(guild_id) => {
+            resume_by_rejoining(ctx, guild_id).await
+        }
         Err(PlayerError::NothingPlaying) => reply_error(ctx, "nothing is playing").await,
         Err(err) => reply_error(ctx, err.to_string()).await,
+    }
+}
+
+async fn resume_by_rejoining(ctx: Context<'_>, guild_id: serenity::GuildId) -> Result<(), Error> {
+    if let Err(err) = join_for_play(ctx, guild_id).await {
+        return reply_error(ctx, err.to_string()).await;
+    }
+
+    let snapshot = ctx.data().player.queue_snapshot(guild_id).await;
+    if snapshot.now_playing.is_some() {
+        reply_public(ctx, "Resumed.").await
+    } else {
+        reply_error(ctx, "nothing is playing").await
     }
 }
 

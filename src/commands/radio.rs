@@ -1,4 +1,4 @@
-use super::playback::reply_public;
+use super::playback::{join_for_play, reply_error, reply_public};
 use super::{Context, Error};
 
 #[poise::command(slash_command, guild_only)]
@@ -12,6 +12,10 @@ pub async fn radio(ctx: Context<'_>) -> Result<(), Error> {
         .await?;
         return Ok(());
     };
+
+    if let Err(err) = join_for_play(ctx, guild_id).await {
+        return reply_error(ctx, err.to_string()).await;
+    }
 
     let enabled = ctx.data().player.toggle_radio(guild_id).await;
     reply_public(ctx, radio_status_message(enabled)).await

@@ -71,6 +71,23 @@ fn now_playing_embed(queued: &QueuedTrack, position: Option<Duration>) -> sereni
     embed
 }
 
+fn last_played_embed(queued: &QueuedTrack) -> serenity::CreateEmbed {
+    let video_url = format!("https://www.youtube.com/watch?v={}", queued.track.video_id);
+    let thumbnail_url = format!(
+        "https://i.ytimg.com/vi/{}/hqdefault.jpg",
+        queued.track.video_id
+    );
+
+    serenity::CreateEmbed::new()
+        .author(serenity::CreateEmbedAuthor::new("⏹ Finished Playing"))
+        .color(ACCENT_COLOR)
+        .title(&queued.track.title)
+        .url(video_url)
+        .image(thumbnail_url)
+        .field("Channel", &queued.track.channel, true)
+        .field("Requested by", format!("<@{}>", queued.requested_by), true)
+}
+
 fn panel_components(
     snapshot: &QueueSnapshot,
     paused: Option<bool>,
@@ -200,11 +217,18 @@ pub(crate) async fn render(
                 components,
             )
         }
-        None => (
-            "Nothing is playing — search or `/play` to get started.".to_string(),
-            None,
-            components,
-        ),
+        None => match &snapshot.last_played {
+            Some(queued) => (
+                "Queue finished — search or `/play` to add more.".to_string(),
+                Some(last_played_embed(queued)),
+                components,
+            ),
+            None => (
+                "Nothing is playing — search or `/play` to get started.".to_string(),
+                None,
+                components,
+            ),
+        },
     }
 }
 
@@ -289,6 +313,16 @@ mod tests {
     }
 
     #[test]
+    fn last_played_embed_shows_finished_header_with_title_and_url() {
+        let queued = sample_queued_track(Some(Duration::from_secs(213)));
+        let json = embed_json(last_played_embed(&queued));
+
+        assert_eq!(json["author"]["name"], "⏹ Finished Playing");
+        assert_eq!(json["title"], "Some Video");
+        assert_eq!(json["url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    }
+
+    #[test]
     fn truncate_label_leaves_short_labels_untouched() {
         assert_eq!(truncate_label("short title"), "short title");
     }
@@ -304,6 +338,7 @@ mod tests {
     fn sample_queue_snapshot(now_playing: bool, upcoming_count: usize) -> QueueSnapshot {
         QueueSnapshot {
             now_playing: now_playing.then(|| sample_queued_track(Some(Duration::from_secs(120)))),
+            last_played: None,
             upcoming: (0..upcoming_count)
                 .map(|i| QueuedTrack {
                     track: Track {
