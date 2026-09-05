@@ -412,35 +412,28 @@ pub async fn play(
 
     ctx.defer().await?;
 
-    if let Err(err) = join_for_play(ctx, guild_id).await {
-        return reply_error(ctx, err.to_string()).await;
-    }
+    let (join_result, track_result) =
+        tokio::join!(join_for_play(ctx, guild_id), resolve_track(ctx, &video_id));
 
-    let Some(track) = resolve_track(ctx, &video_id).await? else {
+    let Some(track) = track_result? else {
         return Ok(());
     };
+    if let Err(err) = join_result {
+        return reply_error(ctx, err.to_string()).await;
+    }
 
     let queued = QueuedTrack {
         track: track.clone(),
         requested_by: ctx.author().id,
     };
 
-    let handle = ctx
-        .send(
-            poise::CreateReply::default()
-                .content(format!("Fetching: {}...", format_track(&track)))
-                .allowed_mentions(serenity::CreateAllowedMentions::new()),
-        )
-        .await?;
-
     let result = ctx.data().player.enqueue(guild_id, queued).await;
     let content = match &result {
         Ok(()) => format!("Queued: {}", format_track(&track)),
         Err(err) => err.to_string(),
     };
-    handle
-        .edit(
-            ctx,
+    let handle = ctx
+        .send(
             poise::CreateReply::default()
                 .content(content)
                 .allowed_mentions(serenity::CreateAllowedMentions::new()),

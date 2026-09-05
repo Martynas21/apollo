@@ -38,7 +38,11 @@ pub(crate) fn truncate_label(label: &str) -> String {
     }
 }
 
-fn now_playing_embed(queued: &QueuedTrack, upcoming: &[QueuedTrack]) -> serenity::CreateEmbed {
+fn track_embed(
+    author_label: &str,
+    queued: &QueuedTrack,
+    upcoming: &[QueuedTrack],
+) -> serenity::CreateEmbed {
     let video_url = format!("https://www.youtube.com/watch?v={}", queued.track.video_id);
     let thumbnail_url = format!(
         "https://i.ytimg.com/vi/{}/hqdefault.jpg",
@@ -46,7 +50,7 @@ fn now_playing_embed(queued: &QueuedTrack, upcoming: &[QueuedTrack]) -> serenity
     );
 
     let mut embed = serenity::CreateEmbed::new()
-        .author(serenity::CreateEmbedAuthor::new("▶ Now Playing"))
+        .author(serenity::CreateEmbedAuthor::new(author_label))
         .color(ACCENT_COLOR)
         .title(&queued.track.title)
         .url(video_url)
@@ -59,6 +63,14 @@ fn now_playing_embed(queued: &QueuedTrack, upcoming: &[QueuedTrack]) -> serenity
     }
 
     embed
+}
+
+fn now_playing_embed(queued: &QueuedTrack, upcoming: &[QueuedTrack]) -> serenity::CreateEmbed {
+    track_embed("▶ Now Playing", queued, upcoming)
+}
+
+fn loading_embed(queued: &QueuedTrack, upcoming: &[QueuedTrack]) -> serenity::CreateEmbed {
+    track_embed("⏳ Buffering…", queued, upcoming)
 }
 
 fn upcoming_field(upcoming: &[QueuedTrack]) -> Option<(String, String)> {
@@ -184,24 +196,31 @@ pub(crate) async fn render(
     let radio_enabled = registry.is_radio_enabled(guild_id).await;
     let components = panel_components(&snapshot, paused, volume, radio_enabled);
 
-    match &snapshot.now_playing {
-        Some(queued) => (
+    if let Some(queued) = &snapshot.now_playing {
+        return (
             String::new(),
             Some(now_playing_embed(queued, &snapshot.upcoming)),
             components,
+        );
+    }
+    if let Some(queued) = &snapshot.loading {
+        return (
+            String::new(),
+            Some(loading_embed(queued, &snapshot.upcoming)),
+            components,
+        );
+    }
+    match &snapshot.last_played {
+        Some(queued) => (
+            "Queue finished — search or `/play` to add more.".to_string(),
+            Some(last_played_embed(queued)),
+            components,
         ),
-        None => match &snapshot.last_played {
-            Some(queued) => (
-                "Queue finished — search or `/play` to add more.".to_string(),
-                Some(last_played_embed(queued)),
-                components,
-            ),
-            None => (
-                "Nothing is playing — search or `/play` to get started.".to_string(),
-                None,
-                components,
-            ),
-        },
+        None => (
+            "Nothing is playing — search or `/play` to get started.".to_string(),
+            None,
+            components,
+        ),
     }
 }
 
@@ -329,6 +348,16 @@ mod tests {
     }
 
     #[test]
+    fn loading_embed_shows_buffering_header_and_track_details() {
+        let queued = sample_queued_track(Some(Duration::from_secs(213)));
+        let json = embed_json(loading_embed(&queued, &[]));
+
+        assert_eq!(json["author"]["name"], "⏳ Buffering…");
+        assert_eq!(json["title"], "Some Video");
+        assert_eq!(json["url"], "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    }
+
+    #[test]
     fn last_played_embed_shows_finished_header_with_title_and_url() {
         let queued = sample_queued_track(Some(Duration::from_secs(213)));
         let json = embed_json(last_played_embed(&queued));
@@ -354,6 +383,7 @@ mod tests {
     fn sample_queue_snapshot(now_playing: bool, upcoming_count: usize) -> QueueSnapshot {
         QueueSnapshot {
             now_playing: now_playing.then(|| sample_queued_track(Some(Duration::from_secs(120)))),
+            loading: None,
             last_played: None,
             upcoming: (0..upcoming_count)
                 .map(|i| QueuedTrack {

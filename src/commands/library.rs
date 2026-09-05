@@ -444,20 +444,12 @@ async fn enqueue_playlist_tracks(
             requested_by,
         })
         .collect();
-    let queued_count = data
-        .player
+    data.player
         .enqueue_many(guild_id, queued)
         .await
         .map_err(|err| format!("Failed to queue tracks: {err}"))?;
 
-    Ok(if queued_count == total {
-        format!("Queued {queued_count} track(s) from **{playlist_name}**.")
-    } else {
-        format!(
-            "Queued {queued_count}/{total} track(s) from **{playlist_name}** ({} failed).",
-            total - queued_count
-        )
-    })
+    Ok(format!("Queued {total} track(s) from **{playlist_name}**."))
 }
 
 async fn handle_playlist_play_button(
@@ -1081,28 +1073,17 @@ pub(super) async fn join_and_enqueue_all(
             requested_by: ctx.author().id,
         })
         .collect();
-    let queued_count = match ctx.data().player.enqueue_many(guild_id, queued).await {
-        Ok(count) => count,
-        Err(err) => {
-            ctx.send(
-                poise::CreateReply::default()
-                    .content(format!("Failed to queue tracks: {err}"))
-                    .ephemeral(true),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    let content = if queued_count == total {
-        format!("Queued {queued_count} track(s) from **{label}**.")
-    } else {
-        format!(
-            "Queued {queued_count}/{total} track(s) from **{label}** ({} failed).",
-            total - queued_count
+    if let Err(err) = ctx.data().player.enqueue_many(guild_id, queued).await {
+        ctx.send(
+            poise::CreateReply::default()
+                .content(format!("Failed to queue tracks: {err}"))
+                .ephemeral(true),
         )
-    };
-    super::playback::reply_public(ctx, content).await
+        .await?;
+        return Ok(());
+    }
+
+    super::playback::reply_public(ctx, format!("Queued {total} track(s) from **{label}**.")).await
 }
 
 #[poise::command(slash_command, guild_only)]

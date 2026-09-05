@@ -210,8 +210,15 @@ pub enum PanelRepost {
 
 pub struct QueueSnapshot {
     pub now_playing: Option<QueuedTrack>,
+    pub loading: Option<QueuedTrack>,
     pub last_played: Option<QueuedTrack>,
     pub upcoming: Vec<QueuedTrack>,
+}
+
+enum StartOutcome {
+    Committed,
+    Stale,
+    Failed(PlayerError),
 }
 
 struct SessionSnapshot {
@@ -299,6 +306,24 @@ impl PlayerRegistry {
         )
     }
 
+    #[cfg(test)]
+    async fn settle_playback_start(&self, guild_id: GuildId) {
+        for _ in 0..500 {
+            let settled = {
+                let guilds = self.guilds.lock().await;
+                match guilds.get(&guild_id) {
+                    Some(state) => state.current_track_id.is_some() || state.now_playing.is_none(),
+                    None => true,
+                }
+            };
+            if settled {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("background playback start did not settle for guild {guild_id}");
+    }
+
     pub async fn join(
         &self,
         guild_id: GuildId,
@@ -326,44 +351,19 @@ impl PlayerRegistry {
             return;
         };
 
-        let Some(candidate) = self
+        let Some((candidate, epoch)) = self
             .apply_restored_session(guild_id, &guild_id_str, session)
             .await
         else {
             return;
         };
 
-        let started = self
-            .drain_queue_until_playing(guild_id, call, candidate, None)
-            .await;
-
-        if !started {
-            self.schedule_idle_disconnect(guild_id);
+        match candidate {
+            Some(queued) => self.spawn_start_sequence(guild_id, call, queued, epoch, None),
+            None => self.schedule_idle_disconnect(guild_id),
         }
 
         self.refresh_panel(guild_id).await;
-    }
-
-    async fn drain_queue_until_playing(
-        &self,
-        guild_id: GuildId,
-        call: Arc<dyn VoiceCall>,
-        mut candidate: Option<QueuedTrack>,
-        mut prefetch: Option<Prefetch>,
-    ) -> bool {
-        while let Some(queued) = candidate {
-            match self
-                .start_playback(guild_id, call.clone(), queued, prefetch.take())
-                .await
-            {
-                Ok(()) => return true,
-                Err(err) => {
-                    tracing::warn!(%err, "failed to start queued track, trying the next one");
-                    candidate = self.promote_next(guild_id).await;
-                }
-            }
-        }
-        false
     }
 
     async fn guild_state_exists(&self, guild_id: GuildId) -> bool {
@@ -391,7 +391,7 @@ impl PlayerRegistry {
         guild_id: GuildId,
         guild_id_str: &str,
         session: db::PersistedSession,
-    ) -> Option<Option<QueuedTrack>> {
+    ) -> Option<(Option<QueuedTrack>, u64)> {
         let mut guilds = self.guilds.lock().await;
         let state = guilds.entry(guild_id).or_default();
         if state.now_playing.is_some() {
@@ -416,7 +416,7 @@ impl PlayerRegistry {
             };
             state.now_playing = next.clone();
         }
-        Some(state.now_playing.clone())
+        Some((state.now_playing.clone(), state.epoch))
     }
 
     async fn persist_session(&self, guild_id: GuildId) {
@@ -546,7 +546,7 @@ impl PlayerRegistry {
     }
 
     pub async fn enqueue(&self, guild_id: GuildId, queued: QueuedTrack) -> Result<(), PlayerError> {
-        let (call, should_start) = {
+        let (call, start) = {
             let mut guilds = self.guilds.lock().await;
             let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
             let state = guilds.entry(guild_id).or_default();
@@ -559,41 +559,31 @@ impl PlayerRegistry {
             {
                 return Err(PlayerError::Storage(err.to_string()));
             }
-            (call, should_start)
+            (call, should_start.then_some(state.epoch))
         };
 
-        let result = if should_start {
-            self.start_playback(guild_id, call, queued, None).await
-        } else {
-            Ok(())
-        };
-
-        if should_start && result.is_err() {
-            let mut guilds = self.guilds.lock().await;
-            if let Some(state) = guilds.get_mut(&guild_id) {
-                state.now_playing = None;
-            }
+        if let Some(epoch) = start {
+            self.spawn_start_sequence(guild_id, call, queued, epoch, None);
         }
 
         self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
-        result
+        Ok(())
     }
 
     pub async fn enqueue_many(
         &self,
         guild_id: GuildId,
         tracks: Vec<QueuedTrack>,
-    ) -> Result<usize, PlayerError> {
+    ) -> Result<(), PlayerError> {
         if tracks.is_empty() {
-            return Ok(0);
+            return Ok(());
         }
-        let total = tracks.len();
         let guild_id_str = guild_id.to_string();
         let mut tracks = tracks;
         let first = tracks.first().cloned();
 
-        let (call, needs_start) = {
+        let (call, start) = {
             let mut guilds = self.guilds.lock().await;
             let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
             let state = guilds.entry(guild_id).or_default();
@@ -617,30 +607,20 @@ impl PlayerRegistry {
                 return Err(PlayerError::Storage(err.to_string()));
             }
 
-            (call, needs_start)
+            let start = match (needs_start, &first) {
+                (true, Some(track)) => Some((track.clone(), state.epoch)),
+                _ => None,
+            };
+            (call, start)
         };
 
-        let mut failed = 0;
-        if needs_start {
-            let mut candidate = first;
-            while let Some(queued) = candidate {
-                match self
-                    .start_playback(guild_id, call.clone(), queued, None)
-                    .await
-                {
-                    Ok(()) => break,
-                    Err(err) => {
-                        tracing::warn!(%err, "failed to start a playlist track, trying the next one");
-                        failed += 1;
-                        candidate = self.promote_next(guild_id).await;
-                    }
-                }
-            }
+        if let Some((first, epoch)) = start {
+            self.spawn_start_sequence(guild_id, call, first, epoch, None);
         }
 
         self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
-        Ok(total - failed)
+        Ok(())
     }
 
     async fn resolve_prefetched(
@@ -671,7 +651,7 @@ impl PlayerRegistry {
         PlayerError::Playback(better_playback_error(err, preflight).to_string())
     }
 
-    async fn promote_next(&self, guild_id: GuildId) -> Option<QueuedTrack> {
+    async fn promote_next(&self, guild_id: GuildId) -> Option<(QueuedTrack, u64)> {
         let mut guilds = self.guilds.lock().await;
         if !guilds.contains_key(&guild_id) {
             return None;
@@ -685,30 +665,126 @@ impl PlayerRegistry {
         };
         let state = guilds.get_mut(&guild_id)?;
         state.now_playing = next.clone();
-        next
+        next.map(|queued| (queued, state.epoch))
     }
 
-    async fn start_playback(
+    fn spawn_start_sequence(
+        &self,
+        guild_id: GuildId,
+        call: Arc<dyn VoiceCall>,
+        first: QueuedTrack,
+        epoch: u64,
+        prefetch: Option<Prefetch>,
+    ) {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            registry
+                .run_start_sequence(guild_id, call, first, epoch, prefetch)
+                .await;
+        });
+    }
+
+    async fn run_start_sequence(
+        &self,
+        guild_id: GuildId,
+        call: Arc<dyn VoiceCall>,
+        first: QueuedTrack,
+        first_epoch: u64,
+        prefetch: Option<Prefetch>,
+    ) {
+        let mut candidate = Some((first, first_epoch));
+        let mut prefetch = prefetch;
+        let mut started = false;
+        while let Some((queued, epoch)) = candidate.take() {
+            match self
+                .try_start_playback(guild_id, call.clone(), queued, prefetch.take(), epoch)
+                .await
+            {
+                StartOutcome::Committed => {
+                    started = true;
+                    break;
+                }
+                StartOutcome::Stale => return,
+                StartOutcome::Failed(err) => {
+                    tracing::warn!(%err, "failed to start queued track, trying the next one");
+                    candidate = self.promote_next(guild_id).await;
+                }
+            }
+        }
+
+        if !started {
+            self.schedule_idle_disconnect(guild_id);
+        }
+
+        self.refresh_panel(guild_id).await;
+        self.persist_session(guild_id).await;
+    }
+
+    async fn try_start_playback(
         &self,
         guild_id: GuildId,
         call: Arc<dyn VoiceCall>,
         queued: QueuedTrack,
         prefetched: Option<Prefetch>,
-    ) -> Result<(), PlayerError> {
-        let resolved = match prefetched {
-            Some(handle) => self.resolve_prefetched(&queued, handle).await,
-            None => self.voice.buffered_source(&queued.track).await,
-        };
-        let source = match resolved {
+        expected_epoch: u64,
+    ) -> StartOutcome {
+        let source = match self
+            .resolve_for_start(guild_id, &queued, prefetched, expected_epoch)
+            .await
+        {
             Ok(source) => source,
-            Err(err) => {
-                return Err(self
-                    .classify_playback_failure(&queued.track.video_id, err)
-                    .await);
-            }
+            Err(outcome) => return outcome,
         };
 
-        let handle = call.play(source).await.map_err(PlayerError::Playback)?;
+        let handle = match call.play(source).await {
+            Ok(handle) => handle,
+            Err(err) => return StartOutcome::Failed(PlayerError::Playback(err)),
+        };
+
+        self.commit_started_track(guild_id, queued, handle, expected_epoch)
+            .await
+    }
+
+    async fn resolve_for_start(
+        &self,
+        guild_id: GuildId,
+        queued: &QueuedTrack,
+        prefetched: Option<Prefetch>,
+        expected_epoch: u64,
+    ) -> Result<AudioSource, StartOutcome> {
+        let still_current = {
+            let guilds = self.guilds.lock().await;
+            guilds
+                .get(&guild_id)
+                .is_some_and(|state| state.epoch == expected_epoch)
+        };
+        if !still_current {
+            if let Some(prefetch) = prefetched {
+                discard_prefetch(prefetch);
+            }
+            return Err(StartOutcome::Stale);
+        }
+
+        let resolved = match prefetched {
+            Some(handle) => self.resolve_prefetched(queued, handle).await,
+            None => self.voice.buffered_source(&queued.track).await,
+        };
+        match resolved {
+            Ok(source) => Ok(source),
+            Err(err) => Err(StartOutcome::Failed(
+                self.classify_playback_failure(&queued.track.video_id, err)
+                    .await,
+            )),
+        }
+    }
+
+    async fn commit_started_track(
+        &self,
+        guild_id: GuildId,
+        queued: QueuedTrack,
+        handle: Arc<dyn VoiceTrack>,
+        expected_epoch: u64,
+    ) -> StartOutcome {
         let track_id = handle.uuid();
 
         let volume = db::get_guild_volume(&self.db, &guild_id.to_string())
@@ -718,11 +794,19 @@ impl PlayerRegistry {
             tracing::warn!(%err, "failed to apply saved volume to new track");
         }
 
-        handle.notify_when_finished(guild_id, self.events());
-
         let mut guilds = self.guilds.lock().await;
+        let matches_epoch = guilds
+            .get(&guild_id)
+            .is_some_and(|state| state.epoch == expected_epoch);
+        if !matches_epoch {
+            drop(guilds);
+            let _ = handle.stop().await;
+            return StartOutcome::Stale;
+        }
+
         let mut needs_radio_refill = false;
         if let Some(state) = guilds.get_mut(&guild_id) {
+            handle.notify_when_finished(guild_id, self.events());
             state.current_handle = Some(handle);
             state.current_track_id = Some(track_id);
             state.last_played = Some(queued.clone());
@@ -751,11 +835,11 @@ impl PlayerRegistry {
             self.maybe_spawn_radio_refill(guild_id);
         }
 
-        Ok(())
+        StartOutcome::Committed
     }
 
     async fn advance(&self, guild_id: GuildId, track_id: Uuid) {
-        let (next, prefetch) = {
+        let (next, epoch, prefetch) = {
             let mut guilds = self.guilds.lock().await;
             let Some(state) = guilds.get_mut(&guild_id) else {
                 return;
@@ -773,19 +857,19 @@ impl PlayerRegistry {
                 }
             };
             state.now_playing = next.clone();
-            (next, state.prefetch.take())
+            (next, state.epoch, state.prefetch.take())
         };
 
-        let started = match self.voice.call(guild_id) {
-            Some(call) => {
-                self.drain_queue_until_playing(guild_id, call, next, prefetch)
-                    .await
+        match (next, self.voice.call(guild_id)) {
+            (Some(next), Some(call)) => {
+                self.spawn_start_sequence(guild_id, call, next, epoch, prefetch)
             }
-            None => false,
-        };
-
-        if !started {
-            self.schedule_idle_disconnect(guild_id);
+            _ => {
+                if let Some(prefetch) = prefetch {
+                    discard_prefetch(prefetch);
+                }
+                self.schedule_idle_disconnect(guild_id);
+            }
         }
 
         self.refresh_panel(guild_id).await;
@@ -807,6 +891,9 @@ impl PlayerRegistry {
             let Some(state) = guilds.get_mut(&guild_id) else {
                 return Err(PlayerError::NothingPlaying);
             };
+            if state.now_playing.is_none() {
+                return Err(PlayerError::NothingPlaying);
+            }
             state.now_playing = None;
             state.last_played = None;
             state.current_track_id = None;
@@ -826,22 +913,18 @@ impl PlayerRegistry {
             handle
         };
 
-        let Some(handle) = handle else {
-            return Err(PlayerError::NothingPlaying);
-        };
-
-        let result = handle
-            .stop()
-            .await
-            .map_err(|e| PlayerError::Playback(e.to_string()));
-        if result.is_ok() {
-            self.schedule_idle_disconnect(guild_id);
-            self.refresh_panel(guild_id).await;
-            if let Err(err) = db::clear_guild_session(&self.db, &guild_id.to_string()).await {
-                tracing::warn!(%guild_id, %err, "failed to clear the persisted session on stop");
-            }
+        if let Some(handle) = handle
+            && let Err(err) = handle.stop().await
+        {
+            return Err(PlayerError::Playback(err));
         }
-        result
+
+        self.schedule_idle_disconnect(guild_id);
+        self.refresh_panel(guild_id).await;
+        if let Err(err) = db::clear_guild_session(&self.db, &guild_id.to_string()).await {
+            tracing::warn!(%guild_id, %err, "failed to clear the persisted session on stop");
+        }
+        Ok(())
     }
 
     pub async fn skip(&self, guild_id: GuildId) -> Result<(), PlayerError> {
@@ -1103,12 +1186,9 @@ impl PlayerRegistry {
         let Some(call) = self.voice.call(guild_id) else {
             return;
         };
-        let candidate = self.promote_next(guild_id).await;
-        if !self
-            .drain_queue_until_playing(guild_id, call, candidate, None)
-            .await
-        {
-            self.schedule_idle_disconnect(guild_id);
+        match self.promote_next(guild_id).await {
+            Some((queued, epoch)) => self.spawn_start_sequence(guild_id, call, queued, epoch, None),
+            None => self.schedule_idle_disconnect(guild_id),
         }
     }
 
@@ -1199,18 +1279,16 @@ impl PlayerRegistry {
     }
 
     pub async fn queue_snapshot(&self, guild_id: GuildId) -> QueueSnapshot {
-        let (now_playing, last_played, has_entry) = {
+        let (now_playing, loading, last_played, has_entry) = {
             let guilds = self.guilds.lock().await;
             match guilds.get(&guild_id) {
                 Some(s) => {
-                    let now_playing = s
-                        .current_track_id
-                        .is_some()
-                        .then(|| s.now_playing.clone())
-                        .flatten();
-                    (now_playing, s.last_played.clone(), true)
+                    let playing = s.current_track_id.is_some();
+                    let now_playing = playing.then(|| s.now_playing.clone()).flatten();
+                    let loading = (!playing).then(|| s.now_playing.clone()).flatten();
+                    (now_playing, loading, s.last_played.clone(), true)
                 }
-                None => (None, None, false),
+                None => (None, None, None, false),
             }
         };
         let last_played = if has_entry {
@@ -1226,6 +1304,7 @@ impl PlayerRegistry {
             });
         QueueSnapshot {
             now_playing,
+            loading,
             last_played,
             upcoming,
         }
@@ -1331,6 +1410,8 @@ impl PlayerRegistry {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
+
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -1621,6 +1702,8 @@ mod tests {
         calls: HashMap<GuildId, Arc<FakeCall>>,
         events: HashMap<GuildId, Arc<dyn VoiceEvents>>,
         next_join_failure: Option<String>,
+        download_gate: Option<Arc<Notify>>,
+        failing_video_ids: HashMap<String, String>,
     }
 
     #[derive(Default)]
@@ -1635,6 +1718,20 @@ mod tests {
 
         fn fail_next_join(&self, message: &str) {
             self.state.lock().unwrap().next_join_failure = Some(message.to_string());
+        }
+
+        fn hold_downloads(&self) -> Arc<Notify> {
+            let notify = Arc::new(Notify::new());
+            self.state.lock().unwrap().download_gate = Some(notify.clone());
+            notify
+        }
+
+        fn fail_buffered_source_for(&self, video_id: &str, message: &str) {
+            self.state
+                .lock()
+                .unwrap()
+                .failing_video_ids
+                .insert(video_id.to_string(), message.to_string());
         }
 
         fn call_for(&self, guild_id: GuildId) -> Option<Arc<FakeCall>> {
@@ -1694,8 +1791,32 @@ mod tests {
         }
 
         async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError> {
+            let gate = self.state.lock().unwrap().download_gate.clone();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            let failure = self
+                .state
+                .lock()
+                .unwrap()
+                .failing_video_ids
+                .get(&track.video_id)
+                .cloned();
+            if let Some(message) = failure {
+                return Err(PlaybackError::Other(message));
+            }
             Ok(empty_source(&track.video_id))
         }
+    }
+
+    async fn wait_until(mut predicate: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if predicate() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        panic!("condition was not met in time");
     }
 
     fn empty_source(video_id: &str) -> AudioSource {
@@ -1744,6 +1865,7 @@ mod tests {
         let (registry, backend, guild_id) = joined_registry().await;
 
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
 
         let call = backend.call_for(guild_id).unwrap();
         assert_eq!(call.played_video_ids(), vec!["a"]);
@@ -1758,6 +1880,7 @@ mod tests {
 
         registry.enqueue(guild_id, queued("a")).await.unwrap();
         registry.enqueue(guild_id, queued("b")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
 
         let call = backend.call_for(guild_id).unwrap();
         assert_eq!(call.played_video_ids(), vec!["a"]);
@@ -1771,12 +1894,12 @@ mod tests {
     async fn enqueue_many_starts_the_first_track_on_an_empty_queue() {
         let (registry, backend, guild_id) = joined_registry().await;
 
-        let queued_count = registry
+        registry
             .enqueue_many(guild_id, vec![queued("a"), queued("b"), queued("c")])
             .await
             .unwrap();
+        registry.settle_playback_start(guild_id).await;
 
-        assert_eq!(queued_count, 3);
         let call = backend.call_for(guild_id).unwrap();
         assert_eq!(call.played_video_ids(), vec!["a"]);
         let snapshot = registry.queue_snapshot(guild_id).await;
@@ -1789,12 +1912,12 @@ mod tests {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
 
-        let queued_count = registry
+        registry
             .enqueue_many(guild_id, vec![queued("b"), queued("c")])
             .await
             .unwrap();
+        registry.settle_playback_start(guild_id).await;
 
-        assert_eq!(queued_count, 2);
         let call = backend.call_for(guild_id).unwrap();
         assert_eq!(call.played_video_ids(), vec!["a"]);
         let snapshot = registry.queue_snapshot(guild_id).await;
@@ -1807,9 +1930,11 @@ mod tests {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
         registry.enqueue(guild_id, queued("b")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         let a_id = current_track_id(&registry, guild_id).await;
 
         backend.finish_track(guild_id, a_id).await;
+        registry.settle_playback_start(guild_id).await;
 
         let call = backend.call_for(guild_id).unwrap();
         assert_eq!(call.played_video_ids(), vec!["a", "b"]);
@@ -1822,6 +1947,7 @@ mod tests {
     async fn advance_goes_idle_when_the_queue_is_empty() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         let a_id = current_track_id(&registry, guild_id).await;
 
         backend.finish_track(guild_id, a_id).await;
@@ -1835,6 +1961,7 @@ mod tests {
     async fn advance_into_an_empty_queue_preserves_radio_history_in_the_db() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         let a_id = current_track_id(&registry, guild_id).await;
 
         backend.finish_track(guild_id, a_id).await;
@@ -1851,6 +1978,7 @@ mod tests {
     async fn advance_into_an_empty_queue_keeps_the_finished_track_as_last_played() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         let a_id = current_track_id(&registry, guild_id).await;
 
         backend.finish_track(guild_id, a_id).await;
@@ -1878,6 +2006,7 @@ mod tests {
     async fn kick_off_if_idle_starts_a_freshly_queued_track_once_the_previous_one_drained() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         let a_id = current_track_id(&registry, guild_id).await;
         backend.finish_track(guild_id, a_id).await;
 
@@ -1885,6 +2014,7 @@ mod tests {
             .await
             .unwrap();
         registry.kick_off_if_idle(guild_id).await;
+        registry.settle_playback_start(guild_id).await;
 
         let call = backend.call_for(guild_id).unwrap();
         assert_eq!(call.played_video_ids(), vec!["a", "b"]);
@@ -1897,10 +2027,12 @@ mod tests {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
         registry.enqueue(guild_id, queued("b")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         let a_id = current_track_id(&registry, guild_id).await;
 
         backend.finish_track(guild_id, a_id).await;
         backend.finish_track(guild_id, a_id).await;
+        registry.settle_playback_start(guild_id).await;
 
         let call = backend.call_for(guild_id).unwrap();
         assert_eq!(call.played_video_ids(), vec!["a", "b"]);
@@ -1913,6 +2045,7 @@ mod tests {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
         registry.enqueue(guild_id, queued("b")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         let track = backend.call_for(guild_id).unwrap().last_track();
         let epoch_before = registry.guilds.lock().await.get(&guild_id).unwrap().epoch;
 
@@ -1950,6 +2083,7 @@ mod tests {
             .enqueue_many(guild_id, vec![queued("b"), queued("c")])
             .await
             .unwrap();
+        registry.settle_playback_start(guild_id).await;
         let a_track = backend.call_for(guild_id).unwrap().last_track();
 
         registry.clear_queue(guild_id).await.unwrap();
@@ -1992,6 +2126,7 @@ mod tests {
     async fn leave_if_idle_does_nothing_if_a_track_is_playing() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
 
         registry.leave_if_idle(guild_id).await;
 
@@ -2042,6 +2177,7 @@ mod tests {
     async fn pause_and_resume_toggle_the_current_track() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         let track = backend.call_for(guild_id).unwrap().last_track();
 
         registry.pause(guild_id).await.unwrap();
@@ -2055,6 +2191,7 @@ mod tests {
     async fn leave_if_idle_disconnects_a_track_that_is_still_paused() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         registry.pause(guild_id).await.unwrap();
 
         registry.leave_if_idle(guild_id).await;
@@ -2074,6 +2211,7 @@ mod tests {
     async fn leave_if_idle_does_nothing_if_the_track_was_resumed() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         registry.pause(guild_id).await.unwrap();
         registry.resume(guild_id).await.unwrap();
 
@@ -2086,6 +2224,7 @@ mod tests {
     async fn advance_into_an_empty_queue_then_idle_disconnect_still_shows_last_played() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         let a_id = current_track_id(&registry, guild_id).await;
         backend.finish_track(guild_id, a_id).await;
 
@@ -2103,6 +2242,7 @@ mod tests {
     async fn leave_preserves_last_played_for_the_next_queue_snapshot() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         let a_id = current_track_id(&registry, guild_id).await;
         backend.finish_track(guild_id, a_id).await;
 
@@ -2120,6 +2260,7 @@ mod tests {
     async fn set_volume_applies_to_the_current_track() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
         let call = backend.call_for(guild_id).unwrap();
         assert_eq!(call.played_video_ids().len(), 1);
         let track = call.last_track();
@@ -2221,6 +2362,7 @@ mod tests {
             .unwrap();
 
         registry.join(guild_id, ChannelId::new(2)).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
 
         let call = backend.call_for(guild_id).unwrap();
         assert_eq!(call.played_video_ids(), vec!["a"]);
@@ -2247,6 +2389,7 @@ mod tests {
 
         registry.join(guild_id, ChannelId::new(2)).await.unwrap();
         registry.enqueue(guild_id, queued("new")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
 
         let call = backend.call_for(guild_id).unwrap();
         assert_eq!(call.played_video_ids(), vec!["a"]);
@@ -2270,5 +2413,86 @@ mod tests {
         );
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert!(snapshot.now_playing.is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_shows_a_loading_track_before_the_background_start_completes() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        let gate = backend.hold_downloads();
+
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(
+            snapshot.loading.map(|q| q.track.video_id),
+            Some("a".to_string())
+        );
+        assert!(snapshot.now_playing.is_none());
+        assert!(
+            backend
+                .call_for(guild_id)
+                .unwrap()
+                .played_video_ids()
+                .is_empty()
+        );
+
+        gate.notify_one();
+        registry.settle_playback_start(guild_id).await;
+
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(
+            snapshot.now_playing.map(|q| q.track.video_id),
+            Some("a".to_string())
+        );
+        assert!(snapshot.loading.is_none());
+        assert_eq!(
+            backend.call_for(guild_id).unwrap().played_video_ids(),
+            vec!["a"]
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_retries_the_next_candidate_when_the_first_track_fails_to_start() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        backend.fail_buffered_source_for("a", "boom");
+
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.enqueue(guild_id, queued("b")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["b"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "b");
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_stop_discards_a_still_loading_track_and_stops_the_handle_it_creates() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        let gate = backend.hold_downloads();
+
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(registry.queue_snapshot(guild_id).await.loading.is_some());
+
+        registry.stop(guild_id).await.unwrap();
+        gate.notify_one();
+
+        let call = backend.call_for(guild_id).unwrap();
+        wait_until(|| !call.played_video_ids().is_empty() && call.last_track().was_stopped()).await;
+
+        assert!(call.last_track().was_stopped());
+        assert!(
+            registry
+                .queue_snapshot(guild_id)
+                .await
+                .now_playing
+                .is_none()
+        );
     }
 }
