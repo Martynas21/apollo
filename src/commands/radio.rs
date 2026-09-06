@@ -1,17 +1,9 @@
-use super::playback::{join_for_play, reply_error, reply_public};
+use super::playback::{join_for_play, reply_error, reply_public, require_guild_id};
 use super::{Context, Error};
 
 #[poise::command(slash_command, guild_only)]
 pub async fn radio(ctx: Context<'_>) -> Result<(), Error> {
-    let Some(guild_id) = ctx.guild_id() else {
-        ctx.send(
-            poise::CreateReply::default()
-                .content("This command can only be used in a server.")
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    };
+    let guild_id = require_guild_id(ctx)?;
 
     if let Err(err) = join_for_play(ctx, guild_id).await {
         return reply_error(ctx, err.to_string()).await;

@@ -16,6 +16,10 @@ const VOLUME_MODAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 const STATUS_REPLY_CLEANUP_DELAY: Duration = Duration::from_secs(15);
 
+const NOTHING_IS_PLAYING: &str = "nothing is playing";
+
+const RESUMED: &str = "Resumed.";
+
 pub(super) const REPLY_CLEANUP_DELAY: Duration = Duration::from_secs(30);
 
 fn extract_video_id(input: &str) -> Option<String> {
@@ -300,15 +304,6 @@ async fn handle_volume_button(
     apply_volume_modal(ctx, &modal, guild_id, data).await
 }
 
-fn voice_channel_of(ctx: Context<'_>) -> Option<serenity::ChannelId> {
-    ctx.guild().and_then(|guild| {
-        guild
-            .voice_states
-            .get(&ctx.author().id)
-            .and_then(|vs| vs.channel_id)
-    })
-}
-
 pub(super) async fn reply_public(
     ctx: Context<'_>,
     content: impl Into<String>,
@@ -344,9 +339,9 @@ pub(super) async fn reply_error(ctx: Context<'_>, content: impl Into<String>) ->
     Ok(())
 }
 
-fn require_guild_id(ctx: Context<'_>) -> Result<serenity::GuildId, Error> {
+pub(super) fn require_guild_id(ctx: Context<'_>) -> Result<serenity::GuildId, Error> {
     ctx.guild_id()
-        .ok_or_else(|| "this command can only be used in a server.".into())
+        .ok_or_else(|| library::SERVER_ONLY_COMMAND.into())
 }
 
 async fn play_playlist(ctx: Context<'_>, query: &str) -> Result<(), Error> {
@@ -355,7 +350,7 @@ async fn play_playlist(ctx: Context<'_>, query: &str) -> Result<(), Error> {
         Err(err) => return reply_error(ctx, err.to_string()).await,
     };
     if tracks.is_empty() {
-        return reply_error(ctx, "that playlist is empty (or couldn't be found).").await;
+        return reply_error(ctx, library::PLAYLIST_EMPTY_OR_NOT_FOUND).await;
     }
     library::join_and_enqueue_all(ctx, query, tracks).await
 }
@@ -364,7 +359,7 @@ pub(super) async fn join_for_play(
     ctx: Context<'_>,
     guild_id: serenity::GuildId,
 ) -> Result<(), Error> {
-    match voice_channel_of(ctx) {
+    match library::author_voice_channel(ctx) {
         Some(channel_id) => ctx
             .data()
             .player
@@ -372,7 +367,7 @@ pub(super) async fn join_for_play(
             .await
             .map_err(|err| err.to_string().into()),
         None if !ctx.data().player.is_connected(guild_id) => {
-            Err("join a voice channel first, or use `/join`.".into())
+            Err(library::JOIN_VOICE_CHANNEL_FIRST.into())
         }
         None => Ok(()),
     }
@@ -405,7 +400,7 @@ pub async fn play(
         ctx.defer_ephemeral().await?;
         let results = match library::search_with_cache(ctx.data(), guild_id, &query).await {
             Ok(results) => results,
-            Err(err) => return reply_error(ctx, format!("Search failed: {err}")).await,
+            Err(err) => return reply_error(ctx, library::search_failed(err)).await,
         };
         return library::present_search_results(ctx, &query, &results).await;
     };
@@ -481,7 +476,7 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
 
     match ctx.data().player.skip(guild_id).await {
         Ok(()) => reply_public(ctx, "Skipped.").await,
-        Err(PlayerError::NothingPlaying) => reply_error(ctx, "nothing is playing").await,
+        Err(PlayerError::NothingPlaying) => reply_error(ctx, NOTHING_IS_PLAYING).await,
         Err(err) => reply_error(ctx, err.to_string()).await,
     }
 }
@@ -492,7 +487,7 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
 
     match ctx.data().player.pause(guild_id).await {
         Ok(()) => reply_public(ctx, "Paused.").await,
-        Err(PlayerError::NothingPlaying) => reply_error(ctx, "nothing is playing").await,
+        Err(PlayerError::NothingPlaying) => reply_error(ctx, NOTHING_IS_PLAYING).await,
         Err(err) => reply_error(ctx, err.to_string()).await,
     }
 }
@@ -502,11 +497,11 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
     let guild_id = require_guild_id(ctx)?;
 
     match ctx.data().player.resume(guild_id).await {
-        Ok(()) => reply_public(ctx, "Resumed.").await,
+        Ok(()) => reply_public(ctx, RESUMED).await,
         Err(PlayerError::NothingPlaying) if !ctx.data().player.is_connected(guild_id) => {
             resume_by_rejoining(ctx, guild_id).await
         }
-        Err(PlayerError::NothingPlaying) => reply_error(ctx, "nothing is playing").await,
+        Err(PlayerError::NothingPlaying) => reply_error(ctx, NOTHING_IS_PLAYING).await,
         Err(err) => reply_error(ctx, err.to_string()).await,
     }
 }
@@ -518,9 +513,9 @@ async fn resume_by_rejoining(ctx: Context<'_>, guild_id: serenity::GuildId) -> R
 
     let snapshot = ctx.data().player.queue_snapshot(guild_id).await;
     if snapshot.now_playing.is_some() {
-        reply_public(ctx, "Resumed.").await
+        reply_public(ctx, RESUMED).await
     } else {
-        reply_error(ctx, "nothing is playing").await
+        reply_error(ctx, NOTHING_IS_PLAYING).await
     }
 }
 
@@ -530,7 +525,7 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
 
     match ctx.data().player.stop(guild_id).await {
         Ok(()) => reply_public(ctx, "Stopped and cleared the queue.").await,
-        Err(PlayerError::NothingPlaying) => reply_error(ctx, "nothing is playing").await,
+        Err(PlayerError::NothingPlaying) => reply_error(ctx, NOTHING_IS_PLAYING).await,
         Err(err) => reply_error(ctx, err.to_string()).await,
     }
 }

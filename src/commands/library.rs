@@ -14,6 +14,45 @@ const PLAYLIST_SELECT_LIMIT: usize = 25;
 
 const PLAYLIST_IMPORT_MODAL_TIMEOUT: Duration = Duration::from_secs(300);
 
+pub(super) const JOIN_VOICE_CHANNEL_FIRST: &str = "Join a voice channel first.";
+
+pub(super) const SERVER_ONLY_COMMAND: &str = "This command can only be used in a server.";
+
+pub(super) const PLAYLIST_EMPTY_OR_NOT_FOUND: &str =
+    "That playlist is empty (or couldn't be found).";
+
+const SOMETHING_WENT_WRONG: &str = "Something went wrong with that selection.";
+
+const PLAYLIST_NO_LONGER_EXISTS: &str = "That playlist no longer exists.";
+
+fn queued_message(title: &str, channel: &str) -> String {
+    format!("Queued: **{title}** — {channel}")
+}
+
+fn failed_to_queue_track(err: impl std::fmt::Display) -> String {
+    format!("Failed to queue track: {err}")
+}
+
+fn failed_to_join_voice_channel(err: impl std::fmt::Display) -> String {
+    format!("Failed to join voice channel: {err}")
+}
+
+fn failed_to_queue_tracks(err: impl std::fmt::Display) -> String {
+    format!("Failed to queue tracks: {err}")
+}
+
+fn failed_to_load_playlist(err: impl std::fmt::Display) -> String {
+    format!("Failed to load playlist: {err}")
+}
+
+fn failed_to_load_that_playlist(err: impl std::fmt::Display) -> String {
+    format!("Failed to load that playlist: {err}")
+}
+
+pub(super) fn search_failed(err: impl std::fmt::Display) -> String {
+    format!("Search failed: {err}")
+}
+
 fn format_track_line(index: usize, track: &Track) -> String {
     match track.duration {
         Some(duration) => format!(
@@ -170,35 +209,23 @@ async fn handle_queue_track(
 ) -> Result<(), Error> {
     let serenity::ComponentInteractionDataKind::StringSelect { values } = &component.data.kind
     else {
-        return update_picker(ctx, component, "Something went wrong with that selection.").await;
+        return update_picker(ctx, component, SOMETHING_WENT_WRONG).await;
     };
     let (Some(video_id), Some(guild_id)) = (values.first(), component.guild_id) else {
-        return update_picker(ctx, component, "Something went wrong with that selection.").await;
+        return update_picker(ctx, component, SOMETHING_WENT_WRONG).await;
     };
 
     let track = match data.youtube.get_video(video_id).await {
         Ok(track) => track,
-        Err(err) => {
-            return update_picker(ctx, component, format!("Failed to queue track: {err}")).await;
-        }
+        Err(err) => return update_picker(ctx, component, failed_to_queue_track(err)).await,
     };
 
     if !data.player.is_connected(guild_id) {
         let Some(channel_id) = voice_channel_of(ctx, guild_id, component.user.id) else {
-            return update_picker(
-                ctx,
-                component,
-                "Join a voice channel first, or use `/join`.",
-            )
-            .await;
+            return update_picker(ctx, component, JOIN_VOICE_CHANNEL_FIRST).await;
         };
         if let Err(err) = data.player.join(guild_id, channel_id).await {
-            return update_picker(
-                ctx,
-                component,
-                format!("Failed to join voice channel: {err}"),
-            )
-            .await;
+            return update_picker(ctx, component, failed_to_join_voice_channel(err)).await;
         }
     }
 
@@ -210,8 +237,8 @@ async fn handle_queue_track(
     };
 
     match data.player.enqueue(guild_id, queued).await {
-        Ok(()) => update_picker(ctx, component, format!("Queued: **{title}** — {channel}")).await,
-        Err(err) => update_picker(ctx, component, format!("Failed to queue track: {err}")).await,
+        Ok(()) => update_picker(ctx, component, queued_message(&title, &channel)).await,
+        Err(err) => update_picker(ctx, component, failed_to_queue_track(err)).await,
     }
 }
 
@@ -222,12 +249,12 @@ async fn load_owned_playlist(
 ) -> Result<SavedPlaylist, String> {
     let id: i64 = id_str
         .parse()
-        .map_err(|_| "Something went wrong with that selection.".to_string())?;
+        .map_err(|_| SOMETHING_WENT_WRONG.to_string())?;
 
     match crate::db::get_guild_playlist(&data.db, &guild_id.to_string(), id).await {
         Ok(Some(playlist)) => Ok(playlist),
-        Ok(None) => Err("That playlist no longer exists.".to_string()),
-        Err(err) => Err(format!("Failed to load playlist: {err}")),
+        Ok(None) => Err(PLAYLIST_NO_LONGER_EXISTS.to_string()),
+        Err(err) => Err(failed_to_load_playlist(err)),
     }
 }
 
@@ -239,7 +266,7 @@ async fn fetch_and_cache_playlist_tracks(
         .youtube
         .list_playlist_items(&playlist.url)
         .await
-        .map_err(|err| format!("Failed to load that playlist: {err}"))?;
+        .map_err(failed_to_load_that_playlist)?;
 
     crate::db::replace_playlist_tracks(&data.db, playlist.id, &listing.tracks)
         .await
@@ -334,15 +361,15 @@ async fn show_playlist_details(
         .await
     {
         Ok(Some(playlist)) => playlist,
-        Ok(None) => return update_picker(ctx, component, "That playlist no longer exists.").await,
+        Ok(None) => return update_picker(ctx, component, PLAYLIST_NO_LONGER_EXISTS).await,
         Err(err) => {
-            return update_picker(ctx, component, format!("Failed to load playlist: {err}")).await;
+            return update_picker(ctx, component, failed_to_load_playlist(err)).await;
         }
     };
     let track_count = match crate::db::get_playlist_tracks(&data.db, playlist.id).await {
         Ok(tracks) => tracks.len(),
         Err(err) => {
-            return update_picker(ctx, component, format!("Failed to load playlist: {err}")).await;
+            return update_picker(ctx, component, failed_to_load_playlist(err)).await;
         }
     };
 
@@ -365,10 +392,10 @@ async fn handle_playlist_select(
 ) -> Result<(), Error> {
     let serenity::ComponentInteractionDataKind::StringSelect { values } = &component.data.kind
     else {
-        return update_picker(ctx, component, "Something went wrong with that selection.").await;
+        return update_picker(ctx, component, SOMETHING_WENT_WRONG).await;
     };
     let (Some(id_str), Some(guild_id)) = (values.first(), component.guild_id) else {
-        return update_picker(ctx, component, "Something went wrong with that selection.").await;
+        return update_picker(ctx, component, SOMETHING_WENT_WRONG).await;
     };
 
     match load_owned_playlist(data, guild_id, id_str).await {
@@ -406,7 +433,7 @@ async fn load_tracks_for_playlist_play(
     match crate::db::get_playlist_tracks(&data.db, playlist.id).await {
         Ok(tracks) if !tracks.is_empty() => Ok(tracks),
         Ok(_) => fetch_and_cache_playlist_tracks(data, playlist).await,
-        Err(err) => Err(format!("Failed to load playlist: {err}")),
+        Err(err) => Err(failed_to_load_playlist(err)),
     }
 }
 
@@ -421,10 +448,10 @@ async fn ensure_connected_for_playlist_play(
     }
 
     let Some(channel_id) = voice_channel_of(ctx, guild_id, component.user.id) else {
-        return Err("Join a voice channel first, or use `/join`.".to_string());
+        return Err(JOIN_VOICE_CHANNEL_FIRST.to_string());
     };
     if let Err(err) = data.player.join(guild_id, channel_id).await {
-        return Err(format!("Failed to join voice channel: {err}"));
+        return Err(failed_to_join_voice_channel(err));
     }
     Ok(true)
 }
@@ -447,7 +474,7 @@ async fn enqueue_playlist_tracks(
     data.player
         .enqueue_many(guild_id, queued)
         .await
-        .map_err(|err| format!("Failed to queue tracks: {err}"))?;
+        .map_err(failed_to_queue_tracks)?;
 
     Ok(format!("Queued {total} track(s) from **{playlist_name}**."))
 }
@@ -470,12 +497,7 @@ async fn handle_playlist_play_button(
     let tracks = match load_tracks_for_playlist_play(data, &playlist).await {
         Ok(tracks) if !tracks.is_empty() => tracks,
         Ok(_) => {
-            return update_picker(
-                ctx,
-                component,
-                "That playlist is empty (or couldn't be found).",
-            )
-            .await;
+            return update_picker(ctx, component, PLAYLIST_EMPTY_OR_NOT_FOUND).await;
         }
         Err(message) => return update_picker(ctx, component, message).await,
     };
@@ -620,7 +642,7 @@ pub(super) async fn handle_search_modal_submit(
                 .edit_response(
                     &ctx.http,
                     serenity::EditInteractionResponse::new()
-                        .content(format!("Search failed: {err}")),
+                        .content(search_failed(err)),
                 )
                 .await?;
             return Ok(());
@@ -836,7 +858,7 @@ async fn fetch_playlist_for_import(
                 .edit_response(
                     &ctx.http,
                     serenity::EditInteractionResponse::new()
-                        .content(format!("Failed to load that playlist: {err}")),
+                        .content(failed_to_load_that_playlist(err)),
                 )
                 .await?;
             return Ok(None);
@@ -847,8 +869,7 @@ async fn fetch_playlist_for_import(
         modal
             .edit_response(
                 &ctx.http,
-                serenity::EditInteractionResponse::new()
-                    .content("That playlist is empty (or couldn't be found)."),
+                serenity::EditInteractionResponse::new().content(PLAYLIST_EMPTY_OR_NOT_FOUND),
             )
             .await?;
         return Ok(None);
@@ -975,7 +996,7 @@ async fn handle_playlist_import_modal_submit(
     .await
 }
 
-fn author_voice_channel(ctx: Context<'_>) -> Option<serenity::ChannelId> {
+pub(super) fn author_voice_channel(ctx: Context<'_>) -> Option<serenity::ChannelId> {
     ctx.guild().and_then(|guild| {
         guild
             .voice_states
@@ -991,7 +1012,7 @@ async fn ensure_connected(ctx: Context<'_>, guild_id: serenity::GuildId) -> Resu
         }
         ctx.send(
             poise::CreateReply::default()
-                .content("Join a voice channel first, or use `/join`.")
+                .content(JOIN_VOICE_CHANNEL_FIRST)
                 .ephemeral(true),
         )
         .await?;
@@ -1001,7 +1022,7 @@ async fn ensure_connected(ctx: Context<'_>, guild_id: serenity::GuildId) -> Resu
     if let Err(err) = ctx.data().player.join(guild_id, channel_id).await {
         ctx.send(
             poise::CreateReply::default()
-                .content(format!("Failed to join voice channel: {err}"))
+                .content(failed_to_join_voice_channel(err))
                 .ephemeral(true),
         )
         .await?;
@@ -1012,15 +1033,7 @@ async fn ensure_connected(ctx: Context<'_>, guild_id: serenity::GuildId) -> Resu
 }
 
 async fn join_and_enqueue(ctx: Context<'_>, track: Track) -> Result<(), Error> {
-    let Some(guild_id) = ctx.guild_id() else {
-        ctx.send(
-            poise::CreateReply::default()
-                .content("This command can only be used in a server.")
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    };
+    let guild_id = super::playback::require_guild_id(ctx)?;
 
     if !ensure_connected(ctx, guild_id).await? {
         return Ok(());
@@ -1036,14 +1049,14 @@ async fn join_and_enqueue(ctx: Context<'_>, track: Track) -> Result<(), Error> {
     if let Err(err) = ctx.data().player.enqueue(guild_id, queued).await {
         ctx.send(
             poise::CreateReply::default()
-                .content(format!("Failed to queue track: {err}"))
+                .content(failed_to_queue_track(err))
                 .ephemeral(true),
         )
         .await?;
         return Ok(());
     }
 
-    super::playback::reply_public(ctx, format!("Queued: **{title}** — {channel}")).await
+    super::playback::reply_public(ctx, queued_message(&title, &channel)).await
 }
 
 pub(super) async fn join_and_enqueue_all(
@@ -1051,15 +1064,7 @@ pub(super) async fn join_and_enqueue_all(
     label: &str,
     tracks: Vec<Track>,
 ) -> Result<(), Error> {
-    let Some(guild_id) = ctx.guild_id() else {
-        ctx.send(
-            poise::CreateReply::default()
-                .content("This command can only be used in a server.")
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    };
+    let guild_id = super::playback::require_guild_id(ctx)?;
 
     if !ensure_connected(ctx, guild_id).await? {
         return Ok(());
@@ -1076,7 +1081,7 @@ pub(super) async fn join_and_enqueue_all(
     if let Err(err) = ctx.data().player.enqueue_many(guild_id, queued).await {
         ctx.send(
             poise::CreateReply::default()
-                .content(format!("Failed to queue tracks: {err}"))
+                .content(failed_to_queue_tracks(err))
                 .ephemeral(true),
         )
         .await?;
@@ -1096,21 +1101,13 @@ pub async fn add_to_queue(
 ) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
 
-    let Some(guild_id) = ctx.guild_id() else {
-        ctx.send(
-            poise::CreateReply::default()
-                .content("This command can only be used in a server.")
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    };
+    let guild_id = super::playback::require_guild_id(ctx)?;
     let results = match search_with_cache(ctx.data(), guild_id, &query).await {
         Ok(results) => results,
         Err(err) => {
             ctx.send(
                 poise::CreateReply::default()
-                    .content(format!("Search failed: {err}"))
+                    .content(search_failed(err))
                     .ephemeral(true),
             )
             .await?;
