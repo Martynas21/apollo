@@ -14,7 +14,7 @@ async fn dispatch(sessions: &Sessions, request: Request) -> Result<Response, Str
             Ok(Response::Ok)
         }
         Request::Leave { guild_id } => {
-            sessions.leave(guild_id);
+            sessions.leave(guild_id).await;
             Ok(Response::Ok)
         }
         Request::Play {

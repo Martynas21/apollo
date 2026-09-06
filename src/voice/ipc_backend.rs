@@ -350,6 +350,13 @@ impl VoiceBackend for IpcBackend {
         }) as Arc<dyn VoiceCall>)
     }
 
+    async fn current_channel(&self, guild_id: GuildId) -> Option<ChannelId> {
+        let call = self.songbird.get(guild_id)?;
+        let call = call.lock().await;
+        let channel = call.current_channel()?;
+        Some(ChannelId::new(channel.0.get()))
+    }
+
     async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError> {
         let path = resolve::buffer_track_to_file(
             &track.video_id,

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use apollo_ipc::dto::{ConnectionInfoDto, TrackStatusDto};
 use apollo_ipc::proto::Event as IpcEvent;
@@ -18,10 +19,19 @@ use uuid::Uuid;
 struct GuildSession {
     driver: Driver,
     current: Option<(Uuid, TrackHandle)>,
+    /// Set just before this session's driver is intentionally replaced or
+    /// left, so its `DriverDisconnectHandler` can tell that an asynchronous
+    /// `DriverDisconnect` firing afterward is self-inflicted rather than a
+    /// genuine connection loss.
+    retired: Arc<AtomicBool>,
 }
 
 pub struct Sessions {
     guilds: Mutex<HashMap<u64, GuildSession>>,
+    /// Per-guild locks serializing `join`/`leave` so concurrent requests for
+    /// the same guild can't install/evict sessions out of order. Never
+    /// evicted; bounded by the number of distinct guilds ever joined.
+    join_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     events: UnboundedSender<IpcEvent>,
 }
 
@@ -82,12 +92,20 @@ fn delete_audio_file(path: &str) {
 
 struct DriverDisconnectHandler {
     guild_id: u64,
+    retired: Arc<AtomicBool>,
     events: UnboundedSender<IpcEvent>,
 }
 
 #[async_trait]
 impl SongbirdEventHandler for DriverDisconnectHandler {
     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        if self.retired.load(Ordering::SeqCst) {
+            tracing::debug!(
+                guild_id = self.guild_id,
+                "suppressing DriverDisconnect from a superseded/intentionally-left session"
+            );
+            return None;
+        }
         let _ = self.events.send(IpcEvent::ConnectionLost {
             guild_id: self.guild_id,
         });
@@ -99,45 +117,77 @@ impl Sessions {
     pub fn new(events: UnboundedSender<IpcEvent>) -> Self {
         Self {
             guilds: Mutex::new(HashMap::new()),
+            join_locks: Mutex::new(HashMap::new()),
             events,
         }
     }
 
+    fn join_lock_for(&self, guild_id: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.join_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(guild_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     pub async fn join(&self, guild_id: u64, info: ConnectionInfoDto) -> Result<(), String> {
+        let join_lock = self.join_lock_for(guild_id);
+        let _guard = join_lock.lock().await;
         let info = to_connection_info(info)?;
         let mut driver = Driver::new(Config::default());
         driver.connect(info).await.map_err(|e| e.to_string())?;
+
+        let retired = Arc::new(AtomicBool::new(false));
         driver.add_global_event(
             Event::Core(CoreEvent::DriverDisconnect),
             DriverDisconnectHandler {
                 guild_id,
+                retired: retired.clone(),
                 events: self.events.clone(),
             },
         );
+
+        self.install_session(
+            guild_id,
+            GuildSession {
+                driver,
+                current: None,
+                retired,
+            },
+        );
+        Ok(())
+    }
+
+    /// Installs `session` as the guild's current session, retiring and
+    /// leaving whatever session it replaces. Split out from `join` so it's
+    /// unit-testable without a real voice connection.
+    fn install_session(&self, guild_id: u64, session: GuildSession) {
         let old = self
             .guilds
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                guild_id,
-                GuildSession {
-                    driver,
-                    current: None,
-                },
-            );
+            .insert(guild_id, session);
         if let Some(mut old) = old {
+            // Must happen-before `old.driver.leave()`: leave() only enqueues
+            // an async Disconnect message, so the DriverDisconnect event is
+            // guaranteed to fire (if at all) strictly after this store is
+            // visible to the driver's background task.
+            old.retired.store(true, Ordering::SeqCst);
             old.driver.leave();
         }
-        Ok(())
     }
 
-    pub fn leave(&self, guild_id: u64) {
+    pub async fn leave(&self, guild_id: u64) {
+        let join_lock = self.join_lock_for(guild_id);
+        let _guard = join_lock.lock().await;
         if let Some(mut session) = self
             .guilds
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&guild_id)
         {
+            session.retired.store(true, Ordering::SeqCst);
             session.driver.leave();
         }
     }
@@ -148,6 +198,7 @@ impl Sessions {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, mut session) in guilds.drain() {
+            session.retired.store(true, Ordering::SeqCst);
             session.driver.leave();
         }
     }
@@ -224,10 +275,30 @@ impl Sessions {
 
     #[cfg(test)]
     fn insert_for_test(&self, guild_id: u64, driver: Driver, current: Option<(Uuid, TrackHandle)>) {
-        self.guilds
-            .lock()
-            .unwrap()
-            .insert(guild_id, GuildSession { driver, current });
+        self.insert_for_test_with_retired(
+            guild_id,
+            driver,
+            current,
+            Arc::new(AtomicBool::new(false)),
+        );
+    }
+
+    #[cfg(test)]
+    fn insert_for_test_with_retired(
+        &self,
+        guild_id: u64,
+        driver: Driver,
+        current: Option<(Uuid, TrackHandle)>,
+        retired: Arc<AtomicBool>,
+    ) {
+        self.guilds.lock().unwrap().insert(
+            guild_id,
+            GuildSession {
+                driver,
+                current,
+                retired,
+            },
+        );
     }
 
     pub async fn status(&self, guild_id: u64, track_id: Uuid) -> Result<TrackStatusDto, String> {
@@ -299,7 +370,52 @@ mod tests {
     #[tokio::test]
     async fn leave_and_leave_all_are_no_ops_on_an_unknown_guild() {
         let sessions = sessions();
-        sessions.leave(1);
+        sessions.leave(1).await;
         sessions.leave_all();
+    }
+
+    #[tokio::test]
+    async fn install_session_retires_the_superseded_session_before_leaving_it() {
+        let sessions = sessions();
+        let (old_driver, _old_handle) = offline_driver_with_track();
+        let old_retired = Arc::new(AtomicBool::new(false));
+        sessions.insert_for_test_with_retired(1, old_driver, None, old_retired.clone());
+
+        let (new_driver, _new_handle) = offline_driver_with_track();
+        let new_retired = Arc::new(AtomicBool::new(false));
+        sessions.install_session(
+            1,
+            GuildSession {
+                driver: new_driver,
+                current: None,
+                retired: new_retired.clone(),
+            },
+        );
+
+        assert!(old_retired.load(Ordering::SeqCst));
+        assert!(!new_retired.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn leave_retires_the_session_before_calling_driver_leave() {
+        let sessions = sessions();
+        let (driver, _handle) = offline_driver_with_track();
+        let retired = Arc::new(AtomicBool::new(false));
+        sessions.insert_for_test_with_retired(1, driver, None, retired.clone());
+
+        sessions.leave(1).await;
+
+        assert!(retired.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn join_lock_for_returns_the_same_lock_for_a_guild_and_different_locks_across_guilds() {
+        let sessions = sessions();
+        let a1 = sessions.join_lock_for(1);
+        let a2 = sessions.join_lock_for(1);
+        let b = sessions.join_lock_for(2);
+
+        assert!(Arc::ptr_eq(&a1, &a2));
+        assert!(!Arc::ptr_eq(&a1, &b));
     }
 }

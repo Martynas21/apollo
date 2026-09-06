@@ -5,7 +5,7 @@ use std::time::Duration;
 use poise::serenity_prelude as serenity;
 use rand::seq::SliceRandom;
 use serenity::{ChannelId, GuildId, MessageId, UserId};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -23,6 +23,12 @@ const MAX_VOLUME: u8 = 100;
 const RADIO_HISTORY_CAP: usize = 5;
 
 const RADIO_REFILL_BATCH: usize = 3;
+
+/// How long `advance()` will wait for an in-flight radio refill to finish
+/// before declaring the guild idle, when the queue is empty but a refill is
+/// already running. Best-effort only: `run_radio_refill`'s own
+/// `kick_off_if_idle` call remains the safety net if this wait elapses.
+const RADIO_ADVANCE_WAIT: Duration = Duration::from_secs(3);
 
 fn discard_prefetch(prefetch: Prefetch) {
     prefetch.abort();
@@ -148,6 +154,11 @@ pub trait VoiceBackend: Send + Sync + 'static {
 
     fn call(&self, guild_id: GuildId) -> Option<Arc<dyn VoiceCall>>;
 
+    /// Returns the voice channel currently connected (or connecting) to for
+    /// this guild, if any. Must be a cheap, local check — no IPC round trip
+    /// — since it's used to decide whether a `join()` call is a no-op.
+    async fn current_channel(&self, guild_id: GuildId) -> Option<ChannelId>;
+
     async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError>;
 }
 
@@ -181,7 +192,15 @@ struct GuildState {
     radio_requested_by: Option<UserId>,
     radio_played: HashSet<String>,
     radio_exhausted: bool,
+    radio_refill_running: bool,
+    radio_refill_notify: Option<Arc<Notify>>,
     epoch: u64,
+    /// Whether `restore_session_if_new` has already run for this guild.
+    /// Deliberately separate from "does this guild have a map entry at
+    /// all" (`toggle_radio`/`begin_panel_repost`/`set_panel` can create an
+    /// entry with no connection), so those actions can't accidentally
+    /// prevent a later real `join()` from restoring the persisted session.
+    restore_attempted: bool,
 }
 
 impl GuildState {
@@ -219,6 +238,12 @@ enum StartOutcome {
     Committed,
     Stale,
     Failed(PlayerError),
+}
+
+enum AdvanceFill {
+    Track(QueuedTrack, u64),
+    AlreadyStarted,
+    Idle,
 }
 
 struct SessionSnapshot {
@@ -329,10 +354,33 @@ impl PlayerRegistry {
         guild_id: GuildId,
         voice_channel_id: ChannelId,
     ) -> Result<(), PlayerError> {
+        if self.voice.current_channel(guild_id).await == Some(voice_channel_id) {
+            // Already connected to the requested channel: nothing to do.
+            // Skipping the backend join entirely avoids tearing down and
+            // reconnecting a driver that's already in the right place,
+            // which is both wasted latency and (on the real IPC backend)
+            // what used to cause a self-inflicted disconnect.
+            if let Some(call) = self.voice.call(guild_id) {
+                self.restore_session_if_new(guild_id, call).await;
+            }
+            return Ok(());
+        }
+
+        // A real rejoin (moving channels) is about to replace whatever
+        // driver is currently backing this guild, if any.
+        let was_replacing_existing_driver = self.voice.call(guild_id).is_some();
+
         self.voice
             .join(guild_id, voice_channel_id, self.events())
             .await
             .map_err(PlayerError::Join)?;
+
+        if was_replacing_existing_driver {
+            let mut guilds = self.guilds.lock().await;
+            if let Some(state) = guilds.get_mut(&guild_id) {
+                state.epoch = state.epoch.wrapping_add(1);
+            }
+        }
 
         if let Some(call) = self.voice.call(guild_id) {
             self.restore_session_if_new(guild_id, call).await;
@@ -342,8 +390,13 @@ impl PlayerRegistry {
     }
 
     async fn restore_session_if_new(&self, guild_id: GuildId, call: Arc<dyn VoiceCall>) {
-        if self.guild_state_exists(guild_id).await {
-            return;
+        {
+            let mut guilds = self.guilds.lock().await;
+            let state = guilds.entry(guild_id).or_default();
+            if state.restore_attempted {
+                return;
+            }
+            state.restore_attempted = true;
         }
 
         let guild_id_str = guild_id.to_string();
@@ -364,11 +417,6 @@ impl PlayerRegistry {
         }
 
         self.refresh_panel(guild_id).await;
-    }
-
-    async fn guild_state_exists(&self, guild_id: GuildId) -> bool {
-        let guilds = self.guilds.lock().await;
-        guilds.contains_key(&guild_id)
     }
 
     async fn load_persisted_session(
@@ -839,7 +887,7 @@ impl PlayerRegistry {
     }
 
     async fn advance(&self, guild_id: GuildId, track_id: Uuid) {
-        let (next, epoch, prefetch) = {
+        let (next, epoch, prefetch, refill_notify) = {
             let mut guilds = self.guilds.lock().await;
             let Some(state) = guilds.get_mut(&guild_id) else {
                 return;
@@ -856,13 +904,31 @@ impl PlayerRegistry {
                     None
                 }
             };
+            let refill_notify =
+                (next.is_none() && state.radio_enabled && state.radio_refill_running)
+                    .then(|| state.radio_refill_notify.clone())
+                    .flatten();
             state.now_playing = next.clone();
-            (next, state.epoch, state.prefetch.take())
+            (next, state.epoch, state.prefetch.take(), refill_notify)
         };
 
-        match (next, self.voice.call(guild_id)) {
-            (Some(next), Some(call)) => {
+        let fill = match (next, refill_notify) {
+            (Some(next), _) => AdvanceFill::Track(next, epoch),
+            (None, Some(notify)) => self.await_radio_refill_then_repop(guild_id, notify).await,
+            (None, None) => AdvanceFill::Idle,
+        };
+
+        match (fill, self.voice.call(guild_id)) {
+            (AdvanceFill::Track(next, epoch), Some(call)) => {
                 self.spawn_start_sequence(guild_id, call, next, epoch, prefetch)
+            }
+            (AdvanceFill::AlreadyStarted, _) => {
+                // The in-flight radio refill's own `kick_off_if_idle` beat
+                // us to it and already started a track; this prefetch was
+                // for a candidate that's no longer relevant.
+                if let Some(prefetch) = prefetch {
+                    discard_prefetch(prefetch);
+                }
             }
             _ => {
                 if let Some(prefetch) = prefetch {
@@ -874,6 +940,44 @@ impl PlayerRegistry {
 
         self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
+    }
+
+    /// Waits briefly for an in-flight radio refill to finish (or for its own
+    /// `kick_off_if_idle` to already have started something) before giving
+    /// up on filling the queue. Best-effort: on timeout, or if the refill
+    /// came back empty, the caller falls back to the normal idle path, and
+    /// `run_radio_refill`'s own `kick_off_if_idle` call remains the eventual
+    /// safety net.
+    async fn await_radio_refill_then_repop(
+        &self,
+        guild_id: GuildId,
+        notify: Arc<Notify>,
+    ) -> AdvanceFill {
+        let notified = notify.notified();
+        let _ = tokio::time::timeout(RADIO_ADVANCE_WAIT, notified).await;
+
+        let mut guilds = self.guilds.lock().await;
+        let Some(state) = guilds.get_mut(&guild_id) else {
+            return AdvanceFill::Idle;
+        };
+        if state.now_playing.is_some() {
+            return AdvanceFill::AlreadyStarted;
+        }
+        let next = match db::queue_pop_front(&self.db, &guild_id.to_string()).await {
+            Ok(next) => next,
+            Err(err) => {
+                tracing::warn!(
+                    %guild_id, %err,
+                    "failed to pop the next queued track after radio refill wait"
+                );
+                None
+            }
+        };
+        state.now_playing = next.clone();
+        match next {
+            Some(next) => AdvanceFill::Track(next, state.epoch),
+            None => AdvanceFill::Idle,
+        }
     }
 
     fn schedule_idle_disconnect(&self, guild_id: GuildId) {
@@ -1108,7 +1212,15 @@ impl PlayerRegistry {
         }
 
         self.refresh_panel(guild_id).await;
-        self.persist_session(guild_id).await;
+        if self.is_connected(guild_id) {
+            // Persisting here while disconnected would upsert a blank
+            // `now_playing`/`last_played` over whatever session is actually
+            // persisted for this guild, before the next real `join()` gets a
+            // chance to restore it (see `restore_session_if_new`). The
+            // toggle simply doesn't stick across a disconnect; restoring
+            // still picks up the DB's last real radio setting.
+            self.persist_session(guild_id).await;
+        }
         enabled
     }
 
@@ -1124,12 +1236,24 @@ impl PlayerRegistry {
         tokio::spawn(async move { registry.run_radio_refill(guild_id).await });
     }
 
+    /// Runs at most one radio refill per guild at a time (`radio_refill_snapshot`
+    /// claims `radio_refill_running` before any of this runs) and always
+    /// releases that claim via `finish_radio_refill` on the way out, so
+    /// `advance()` can safely wait on `radio_refill_notify` without a lost
+    /// wakeup or a stuck "always running" flag.
     async fn run_radio_refill(&self, guild_id: GuildId) {
-        let Some((history, requested_by, played, epoch)) =
-            self.radio_refill_snapshot(guild_id).await
-        else {
+        let Some(snapshot) = self.radio_refill_snapshot(guild_id).await else {
             return;
         };
+        self.run_radio_refill_body(guild_id, snapshot).await;
+        self.finish_radio_refill(guild_id).await;
+    }
+
+    async fn run_radio_refill_body(
+        &self,
+        guild_id: GuildId,
+        (history, requested_by, played, epoch): (Vec<String>, UserId, HashSet<String>, u64),
+    ) {
         let Some(seed) = pick_radio_seed(&history, &mut rand::rng()) else {
             return;
         };
@@ -1167,9 +1291,27 @@ impl PlayerRegistry {
             .await;
 
         if pushed > 0 {
+            // Must run before `finish_radio_refill` notifies any waiter in
+            // `advance()`, so a waiter that wakes up sees the fully-settled
+            // outcome (either a track already started here, or genuinely
+            // nothing to start) rather than racing this call.
             self.kick_off_if_idle(guild_id).await;
             self.refresh_panel(guild_id).await;
             self.persist_session(guild_id).await;
+        }
+    }
+
+    async fn finish_radio_refill(&self, guild_id: GuildId) {
+        let notify = {
+            let mut guilds = self.guilds.lock().await;
+            let Some(state) = guilds.get_mut(&guild_id) else {
+                return;
+            };
+            state.radio_refill_running = false;
+            state.radio_refill_notify.clone()
+        };
+        if let Some(notify) = notify {
+            notify.notify_waiters();
         }
     }
 
@@ -1196,14 +1338,18 @@ impl PlayerRegistry {
         &self,
         guild_id: GuildId,
     ) -> Option<(Vec<String>, UserId, HashSet<String>, u64)> {
-        let guilds = self.guilds.lock().await;
-        let state = guilds.get(&guild_id)?;
-        if state.radio_exhausted {
+        let mut guilds = self.guilds.lock().await;
+        let state = guilds.get_mut(&guild_id)?;
+        if state.radio_exhausted || state.radio_refill_running {
             return None;
         }
         let (true, Some(requested_by)) = (state.radio_enabled, state.radio_requested_by) else {
             return None;
         };
+        state.radio_refill_running = true;
+        state
+            .radio_refill_notify
+            .get_or_insert_with(|| Arc::new(Notify::new()));
         Some((
             Vec::from(state.radio_history.clone()),
             requested_by,
@@ -1701,6 +1847,9 @@ mod tests {
     struct FakeBackendState {
         calls: HashMap<GuildId, Arc<FakeCall>>,
         events: HashMap<GuildId, Arc<dyn VoiceEvents>>,
+        current_channel: HashMap<GuildId, ChannelId>,
+        join_call_count: HashMap<GuildId, u32>,
+        simulate_eviction_disconnect: bool,
         next_join_failure: Option<String>,
         download_gate: Option<Arc<Notify>>,
         failing_video_ids: HashMap<String, String>,
@@ -1738,6 +1887,26 @@ mod tests {
             self.state.lock().unwrap().calls.get(&guild_id).cloned()
         }
 
+        fn join_call_count(&self, guild_id: GuildId) -> u32 {
+            self.state
+                .lock()
+                .unwrap()
+                .join_call_count
+                .get(&guild_id)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        /// Reproduces the pre-fix audio-worker behavior: rejoining a guild
+        /// evicts whatever session was there and fires a spurious
+        /// `connection_lost` for it, as `Sessions::join` used to before the
+        /// `retired`-flag fix. Used to write a regression test proving the
+        /// same-channel short-circuit in `PlayerRegistry::join` prevents
+        /// `FakeBackend::join` from ever being reached in that case.
+        fn enable_eviction_simulation(&self) {
+            self.state.lock().unwrap().simulate_eviction_disconnect = true;
+        }
+
         async fn finish_track(&self, guild_id: GuildId, track_id: Uuid) {
             let registered = self
                 .call_for(guild_id)
@@ -1761,15 +1930,25 @@ mod tests {
         async fn join(
             &self,
             guild_id: GuildId,
-            _channel_id: ChannelId,
+            channel_id: ChannelId,
             events: Arc<dyn VoiceEvents>,
         ) -> Result<(), String> {
-            let mut state = self.state.lock().unwrap();
-            if let Some(message) = state.next_join_failure.take() {
-                return Err(message);
+            let (old_events, simulate) = {
+                let mut state = self.state.lock().unwrap();
+                if let Some(message) = state.next_join_failure.take() {
+                    return Err(message);
+                }
+                *state.join_call_count.entry(guild_id).or_default() += 1;
+                let old_events = state.events.get(&guild_id).cloned();
+                let simulate = state.simulate_eviction_disconnect;
+                state.calls.insert(guild_id, Arc::new(FakeCall::default()));
+                state.events.insert(guild_id, events);
+                state.current_channel.insert(guild_id, channel_id);
+                (old_events, simulate)
+            };
+            if simulate && let Some(old_events) = old_events {
+                old_events.connection_lost(guild_id).await;
             }
-            state.calls.insert(guild_id, Arc::new(FakeCall::default()));
-            state.events.insert(guild_id, events);
             Ok(())
         }
 
@@ -1777,6 +1956,7 @@ mod tests {
             let mut state = self.state.lock().unwrap();
             state.calls.remove(&guild_id);
             state.events.remove(&guild_id);
+            state.current_channel.remove(&guild_id);
             Ok(())
         }
 
@@ -1788,6 +1968,15 @@ mod tests {
                 .get(&guild_id)
                 .cloned()
                 .map(|call| call as Arc<dyn VoiceCall>)
+        }
+
+        async fn current_channel(&self, guild_id: GuildId) -> Option<ChannelId> {
+            self.state
+                .lock()
+                .unwrap()
+                .current_channel
+                .get(&guild_id)
+                .copied()
         }
 
         async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError> {
@@ -2494,5 +2683,319 @@ mod tests {
                 .now_playing
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn rejoining_the_same_channel_short_circuits_and_preserves_playing_state() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+        let track_id_before = current_track_id(&registry, guild_id).await;
+
+        registry.join(guild_id, ChannelId::new(2)).await.unwrap();
+
+        assert_eq!(backend.join_call_count(guild_id), 1);
+        assert_eq!(current_track_id(&registry, guild_id).await, track_id_before);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+    }
+
+    #[tokio::test]
+    async fn rejoining_the_same_channel_never_reaches_the_backend_even_with_eviction_simulation_enabled()
+     {
+        let (registry, backend, guild_id) = joined_registry().await;
+        backend.enable_eviction_simulation();
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        // If the short-circuit in `PlayerRegistry::join` didn't hold, this
+        // would reach `FakeBackend::join`, which (with eviction simulation
+        // enabled) fires a spurious `connection_lost` for the session this
+        // very call just re-registered, tearing the guild state down.
+        registry.join(guild_id, ChannelId::new(2)).await.unwrap();
+
+        assert_eq!(backend.join_call_count(guild_id), 1);
+        assert!(backend.call_for(guild_id).is_some());
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+    }
+
+    #[tokio::test]
+    async fn joining_a_different_channel_moves_and_bumps_epoch_for_a_real_rejoin() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        let epoch_before = registry.guilds.lock().await.get(&guild_id).unwrap().epoch;
+
+        registry.join(guild_id, ChannelId::new(3)).await.unwrap();
+
+        assert_eq!(backend.join_call_count(guild_id), 2);
+        assert_eq!(
+            backend.current_channel(guild_id).await,
+            Some(ChannelId::new(3))
+        );
+        let epoch_after = registry.guilds.lock().await.get(&guild_id).unwrap().epoch;
+        assert_eq!(epoch_after, epoch_before.wrapping_add(1));
+    }
+
+    #[tokio::test]
+    async fn toggling_radio_while_disconnected_does_not_block_a_later_session_restore() {
+        let (registry, backend, guild_id) = new_registry().await;
+        db::save_guild_session_meta(
+            &registry.db,
+            &guild_id.to_string(),
+            true,
+            Some("1"),
+            &["a".to_string()],
+            Some((&queued("a").track, "1")),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The panel's Radio button (and `begin_panel_repost`/`set_panel`)
+        // create a `GuildState` map entry with no connection precondition;
+        // that must not block the later real `join()` from restoring the
+        // persisted session.
+        registry.toggle_radio(guild_id).await;
+
+        registry.join(guild_id, ChannelId::new(2)).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+    }
+
+    #[tokio::test]
+    async fn radio_refill_snapshot_claims_the_running_flag_so_a_second_call_is_skipped() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        {
+            let mut guilds = registry.guilds.lock().await;
+            let state = guilds.entry(guild_id).or_default();
+            state.radio_enabled = true;
+            state.radio_requested_by = Some(UserId::new(1));
+            state.radio_history.push_back("seed".to_string());
+        }
+
+        let first = registry.radio_refill_snapshot(guild_id).await;
+        assert!(first.is_some());
+        assert!(
+            registry
+                .guilds
+                .lock()
+                .await
+                .get(&guild_id)
+                .unwrap()
+                .radio_refill_running
+        );
+
+        let second = registry.radio_refill_snapshot(guild_id).await;
+        assert!(second.is_none());
+
+        registry.finish_radio_refill(guild_id).await;
+        assert!(
+            !registry
+                .guilds
+                .lock()
+                .await
+                .get(&guild_id)
+                .unwrap()
+                .radio_refill_running
+        );
+
+        let third = registry.radio_refill_snapshot(guild_id).await;
+        assert!(third.is_some());
+    }
+
+    #[tokio::test]
+    async fn advance_waits_briefly_for_an_in_flight_radio_refill_before_going_idle() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+        let a_id = current_track_id(&registry, guild_id).await;
+
+        let notify = Arc::new(Notify::new());
+        {
+            let mut guilds = registry.guilds.lock().await;
+            let state = guilds.get_mut(&guild_id).unwrap();
+            state.radio_enabled = true;
+            state.radio_refill_running = true;
+            state.radio_refill_notify = Some(notify.clone());
+        }
+
+        // Simulates a radio refill that's still in flight when the track
+        // ends: it populates the DB queue and notifies shortly after, well
+        // within `advance()`'s `RADIO_ADVANCE_WAIT` bound.
+        let refill_db = registry.db.clone();
+        let refill_guild_id = guild_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            db::queue_push_back(&refill_db, &refill_guild_id, &queued("b"))
+                .await
+                .unwrap();
+            notify.notify_waiters();
+        });
+
+        backend.finish_track(guild_id, a_id).await;
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a", "b"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "b");
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum MatrixState {
+        Empty,
+        Buffering,
+        Playing,
+        Paused,
+        QueueFinished,
+    }
+
+    enum MatrixAction {
+        Pause,
+        Resume,
+        Skip,
+        Stop,
+        Shuffle,
+        ToggleRadio,
+        ClearQueue,
+        SetVolume,
+    }
+
+    impl MatrixAction {
+        const ALL: [MatrixAction; 8] = [
+            MatrixAction::Pause,
+            MatrixAction::Resume,
+            MatrixAction::Skip,
+            MatrixAction::Stop,
+            MatrixAction::Shuffle,
+            MatrixAction::ToggleRadio,
+            MatrixAction::ClearQueue,
+            MatrixAction::SetVolume,
+        ];
+
+        async fn invoke(&self, registry: &PlayerRegistry, guild_id: GuildId) {
+            match self {
+                MatrixAction::Pause => {
+                    let _ = registry.pause(guild_id).await;
+                }
+                MatrixAction::Resume => {
+                    let _ = registry.resume(guild_id).await;
+                }
+                MatrixAction::Skip => {
+                    let _ = registry.skip(guild_id).await;
+                }
+                MatrixAction::Stop => {
+                    let _ = registry.stop(guild_id).await;
+                }
+                MatrixAction::Shuffle => {
+                    let _ = registry.shuffle(guild_id).await;
+                }
+                MatrixAction::ToggleRadio => {
+                    registry.toggle_radio(guild_id).await;
+                }
+                MatrixAction::ClearQueue => {
+                    let _ = registry.clear_queue(guild_id).await;
+                }
+                MatrixAction::SetVolume => {
+                    let _ = registry.set_volume(guild_id, 42).await;
+                }
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            match self {
+                MatrixAction::Pause => "pause",
+                MatrixAction::Resume => "resume",
+                MatrixAction::Skip => "skip",
+                MatrixAction::Stop => "stop",
+                MatrixAction::Shuffle => "shuffle",
+                MatrixAction::ToggleRadio => "toggle_radio",
+                MatrixAction::ClearQueue => "clear_queue",
+                MatrixAction::SetVolume => "set_volume",
+            }
+        }
+    }
+
+    /// Drives a fresh registry into one of the five documented player states,
+    /// with `radio_enabled` set directly (never via the real `toggle_radio`,
+    /// which would spawn a real network-hitting refill for a guild that
+    /// already has radio history from having played a track). Radio history
+    /// is always cleared afterward for the same reason: it's what makes
+    /// calling the real `toggle_radio` safe as the *action under test* below,
+    /// since an empty history makes `pick_radio_seed` bail out before any
+    /// network call happens.
+    async fn setup_matrix_state(
+        state: MatrixState,
+        radio_enabled: bool,
+    ) -> (PlayerRegistry, Arc<FakeBackend>, GuildId) {
+        let (registry, backend, guild_id) = joined_registry().await;
+        match state {
+            MatrixState::Empty => {}
+            MatrixState::Buffering => {
+                let mut guilds = registry.guilds.lock().await;
+                let state = guilds.entry(guild_id).or_default();
+                state.now_playing = Some(queued("a"));
+            }
+            MatrixState::Playing => {
+                registry.enqueue(guild_id, queued("a")).await.unwrap();
+                registry.settle_playback_start(guild_id).await;
+            }
+            MatrixState::Paused => {
+                registry.enqueue(guild_id, queued("a")).await.unwrap();
+                registry.settle_playback_start(guild_id).await;
+                registry.pause(guild_id).await.unwrap();
+            }
+            MatrixState::QueueFinished => {
+                registry.enqueue(guild_id, queued("a")).await.unwrap();
+                registry.settle_playback_start(guild_id).await;
+                let a_id = current_track_id(&registry, guild_id).await;
+                backend.finish_track(guild_id, a_id).await;
+            }
+        }
+
+        {
+            let mut guilds = registry.guilds.lock().await;
+            let state = guilds.entry(guild_id).or_default();
+            state.radio_enabled = radio_enabled;
+            state.radio_history.clear();
+        }
+
+        (registry, backend, guild_id)
+    }
+
+    #[tokio::test]
+    async fn every_action_is_panic_free_and_keeps_the_handle_track_id_invariant_in_every_state() {
+        let states = [
+            MatrixState::Empty,
+            MatrixState::Buffering,
+            MatrixState::Playing,
+            MatrixState::Paused,
+            MatrixState::QueueFinished,
+        ];
+
+        for &state in &states {
+            for radio_enabled in [false, true] {
+                for action in MatrixAction::ALL {
+                    let (registry, _backend, guild_id) =
+                        setup_matrix_state(state, radio_enabled).await;
+
+                    action.invoke(&registry, guild_id).await;
+
+                    let guilds = registry.guilds.lock().await;
+                    if let Some(s) = guilds.get(&guild_id) {
+                        assert_eq!(
+                            s.current_handle.is_some(),
+                            s.current_track_id.is_some(),
+                            "handle/track_id invariant broken for state={state:?} radio={radio_enabled} action={}",
+                            action.name()
+                        );
+                    }
+                }
+            }
+        }
     }
 }
