@@ -187,6 +187,7 @@ struct GuildState {
     prefetch: Option<Prefetch>,
     panel: Option<(ChannelId, MessageId)>,
     panel_reserved: bool,
+    panel_edit_lock: Arc<Mutex<()>>,
     radio_enabled: bool,
     radio_history: VecDeque<String>,
     radio_requested_by: Option<UserId>,
@@ -195,11 +196,6 @@ struct GuildState {
     radio_refill_running: bool,
     radio_refill_notify: Option<Arc<Notify>>,
     epoch: u64,
-    /// Whether `restore_session_if_new` has already run for this guild.
-    /// Deliberately separate from "does this guild have a map entry at
-    /// all" (`toggle_radio`/`begin_panel_repost`/`set_panel` can create an
-    /// entry with no connection), so those actions can't accidentally
-    /// prevent a later real `join()` from restoring the persisted session.
     restore_attempted: bool,
 }
 
@@ -1538,15 +1534,18 @@ impl PlayerRegistry {
     }
 
     async fn refresh_panel(&self, guild_id: GuildId) {
-        let panel = {
+        let (panel, edit_lock) = {
             let guilds = self.guilds.lock().await;
-            guilds.get(&guild_id).and_then(|state| state.panel)
+            let Some(state) = guilds.get(&guild_id) else {
+                return;
+            };
+            (state.panel, state.panel_edit_lock.clone())
         };
         let Some(panel) = panel else {
             return;
         };
         let (channel_id, message_id) = panel;
-
+        let _guard = edit_lock.lock().await;
         if let Err(failure) = self.edit_panel(guild_id, channel_id, message_id).await {
             self.forget_panel_if_gone(guild_id, panel, &failure).await;
         }
