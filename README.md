@@ -174,15 +174,16 @@ anything — it's a separate process holding the actual voice connection
 (see Architecture above), not an optional extra. `docker compose up` starts
 both. Running directly with `cargo run`, start both binaries yourself, e.g.:
 ```sh
-mkdir -p /tmp/apollo-ipc /tmp/apollo-audio-buf
-AUDIO_WORKER_SOCKET=/tmp/apollo-ipc/audio.sock AUDIO_BUFFER_DIR=/tmp/apollo-audio-buf \
+mkdir -p /tmp/apollo-audio-buf
+AUDIO_WORKER_SOCKET=127.0.0.1:7878 AUDIO_BUFFER_DIR=/tmp/apollo-audio-buf \
   cargo run --bin apollo-audio-worker &
-AUDIO_WORKER_SOCKET=/tmp/apollo-ipc/audio.sock AUDIO_BUFFER_DIR=/tmp/apollo-audio-buf \
+AUDIO_WORKER_SOCKET=127.0.0.1:7878 AUDIO_BUFFER_DIR=/tmp/apollo-audio-buf \
   cargo run --bin apollo
 ```
-(the defaults, `/run/apollo-ipc/audio.sock` and `/audio-buf`, assume a
-container's own root filesystem — override them to a writable path like
-above when running outside Docker.)
+(the default, `audio-worker:7878`, assumes Docker's internal DNS — override
+it to a loopback address like above when running both processes directly
+on the same machine. `AUDIO_BUFFER_DIR` still needs a real writable path;
+`/audio-buf` is only valid inside a container.)
 
 For the `.env` route, restrictive file permissions (`chmod 600 .env`) are
 a genuinely sufficient way to hold secrets — there's no multi-tenant
@@ -193,9 +194,10 @@ For Docker: `Dockerfile` is a multi-target build producing two images from
 one Cargo workspace — `apollo` (with `yt-dlp`, upstream's standalone
 binary, `ffmpeg`, and Deno installed) and `apollo-audio-worker` (much
 smaller: no `yt-dlp`/`ffmpeg`/Deno, no Discord bot token, no DB access —
-just the audio driver). `compose.yaml` runs both, wired together with a
-Unix domain socket volume and a tmpfs-backed volume for handing off
-pre-buffered audio files, plus the usual volume for `DATABASE_URL`'s
+just the audio driver). `compose.yaml` runs both, wired together over a
+plain TCP connection (Docker's internal DNS resolves the `audio-worker`
+hostname) and a tmpfs-backed volume for handing off pre-buffered audio
+files, plus the usual volume for `DATABASE_URL`'s
 SQLite file (so it survives container recreation) — `docker compose up -d
 --build` is all you need. `.env` is read at runtime, not baked into the
 image — see `.dockerignore`.

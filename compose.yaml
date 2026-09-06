@@ -9,7 +9,6 @@ services:
       AUDIO_BUFFER_DIR: /audio-buf
     volumes:
       - apollo-data:/data
-      - apollo-ipc:/run/apollo-ipc
       - apollo-audio-buf:/audio-buf
     depends_on:
       audio-worker:
@@ -21,26 +20,24 @@ services:
   # traffic, DB writes, yt-dlp subprocess spawns) can no longer starve the
   # mixer's 20ms packet-send tick and cause audible stutter — see the
   # split-worker plan doc for the full rationale. Talks to `apollo` only
-  # over the shared `apollo-ipc` socket and `apollo-audio-buf` volume; it
-  # never touches yt-dlp/YouTube, the DB, or a Discord bot token.
+  # over a TCP connection (compose's internal DNS resolves the `audio-worker`
+  # hostname) and the `apollo-audio-buf` volume; it never touches
+  # yt-dlp/YouTube, the DB, or a Discord bot token.
   audio-worker:
     build:
       context: .
       target: audio-worker
     volumes:
-      - apollo-ipc:/run/apollo-ipc
       # Mounted (not read from an env var — the worker just opens whatever
       # absolute path `apollo` sends in each Play request) so those paths
       # resolve inside this container too.
       - apollo-audio-buf:/audio-buf
     # Neither service sets AUDIO_WORKER_SOCKET — both fall back to
-    # apollo_ipc::DEFAULT_SOCKET_PATH (currently
-    # /run/apollo-ipc/audio.sock), which is also what the healthcheck below
-    # and the `apollo-ipc` volume mount above assume. If that default ever
-    # moves outside `/run/apollo-ipc`, update the healthcheck `test` and the
-    # volume mount path to match.
+    # apollo_ipc::DEFAULT_SOCKET_ADDR ("audio-worker:7878"), which is also
+    # what the healthcheck below assumes. If that default ever changes,
+    # update the healthcheck `test` to match.
     healthcheck:
-      test: ["CMD", "nc", "-Uz", "/run/apollo-ipc/audio.sock"]
+      test: ["CMD", "nc", "-z", "localhost", "7878"]
       interval: 30s
       timeout: 2s
       retries: 15
@@ -50,7 +47,6 @@ services:
 
 volumes:
   apollo-data:
-  apollo-ipc:
   apollo-audio-buf:
     driver_opts:
       type: tmpfs

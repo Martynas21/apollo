@@ -30,7 +30,7 @@ impl Config {
             yt_dlp_cookies_file: apollo_ipc::optional_env_var(&lookup, "YT_DLP_COOKIES_FILE"),
             playlist_track_limit: playlist_track_limit(&lookup)?,
             audio_worker_socket: apollo_ipc::optional_env_var(&lookup, "AUDIO_WORKER_SOCKET")
-                .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_PATH.to_string()),
+                .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_ADDR.to_string()),
             audio_buffer_dir: apollo_ipc::optional_env_var(&lookup, "AUDIO_BUFFER_DIR")
                 .unwrap_or_else(|| DEFAULT_AUDIO_BUFFER_DIR.to_string()),
         })

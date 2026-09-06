@@ -6,8 +6,7 @@ mod session;
 use std::sync::Arc;
 
 use apollo_ipc::proto::Event as IpcEvent;
-use tokio::net::UnixListener;
-use tokio::signal::unix::{SignalKind, signal};
+use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tracing_subscriber::EnvFilter;
 
@@ -23,39 +22,24 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let socket_path =
-        apollo_ipc::optional_env_var(&|key| std::env::var(key), "AUDIO_WORKER_SOCKET")
-            .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_PATH.to_string());
+    let bind_addr = apollo_ipc::optional_env_var(&|key| std::env::var(key), "AUDIO_WORKER_SOCKET")
+        .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_ADDR.to_string());
 
-    if std::path::Path::new(&socket_path).exists() {
-        std::fs::remove_file(&socket_path)?;
-    }
-    if let Some(parent) = std::path::Path::new(&socket_path).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let listener = UnixListener::bind(&socket_path)?;
-    tracing::info!(socket_path, "apollo-audio-worker listening");
+    let listener = TcpListener::bind(&bind_addr).await?;
+    tracing::info!(bind_addr, "apollo-audio-worker listening");
 
     let (events_tx, events_rx) = mpsc::unbounded_channel::<IpcEvent>();
     let sessions = Arc::new(Sessions::new(events_tx));
     let events_rx = Arc::new(Mutex::new(events_rx));
-
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
 
     loop {
         tokio::select! {
             accept_result = accept_and_handle(&listener, &sessions, &events_rx) => {
                 accept_result?;
             }
-            _ = sigterm.recv() => {
-                tracing::info!("received SIGTERM; leaving all active voice sessions before exit");
-                sessions.leave_all();
-                return Ok(());
-            }
-            _ = sigint.recv() => {
-                tracing::info!("received SIGINT; leaving all active voice sessions before exit");
+            shutdown_result = wait_for_shutdown_signal() => {
+                shutdown_result?;
+                tracing::info!("received shutdown signal; leaving all active voice sessions before exit");
                 sessions.leave_all();
                 return Ok(());
             }
@@ -63,8 +47,26 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+    tokio::signal::ctrl_c().await?;
+    Ok(())
+}
+
 async fn accept_and_handle(
-    listener: &UnixListener,
+    listener: &TcpListener,
     sessions: &Arc<Sessions>,
     events_rx: &Arc<Mutex<mpsc::UnboundedReceiver<IpcEvent>>>,
 ) -> anyhow::Result<()> {

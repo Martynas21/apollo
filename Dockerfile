@@ -99,14 +99,13 @@ COPY --from=build /app/apollo /usr/local/bin/apollo
 
 # DATABASE_URL should point at a path under a mounted volume (e.g.
 # sqlite:///data/apollo.db with -v apollo-data:/data) so per-guild playback
-# settings survive container recreation — see README.md. `/run/apollo-ipc`
-# and `/audio-buf` are the shared volumes this container and
-# `apollo-audio-worker` both mount — see compose.yaml. All three are
-# pre-created and chowned here (rather than leaving Docker to create them
-# root-owned on first mount) so the non-root `apollo` user can actually use
-# them.
-RUN mkdir /data /run/apollo-ipc /audio-buf \
-    && chown apollo:apollo /data /run/apollo-ipc /audio-buf
+# settings survive container recreation — see README.md. `/audio-buf` is
+# the shared volume this container and `apollo-audio-worker` both mount —
+# see compose.yaml. Both are pre-created and chowned here (rather than
+# leaving Docker to create them root-owned on first mount) so the non-root
+# `apollo` user can actually use them.
+RUN mkdir /data /audio-buf \
+    && chown apollo:apollo /data /audio-buf
 USER apollo
 ENV RUST_LOG=info,apollo=info
 
@@ -120,8 +119,8 @@ ENTRYPOINT ["/usr/local/bin/apollo"]
 FROM debian:bookworm-slim AS audio-worker
 ARG APOLLO_UID
 
-# netcat-openbsd is only for compose.yaml's healthcheck (`nc -Uz` against
-# the IPC socket) — nothing in the worker itself uses it.
+# netcat-openbsd is only for compose.yaml's healthcheck (`nc -z` against
+# the IPC port) — nothing in the worker itself uses it.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
@@ -130,8 +129,8 @@ RUN useradd --system --uid ${APOLLO_UID} --create-home --home-dir /app apollo
 WORKDIR /app
 COPY --from=build /app/apollo-audio-worker /usr/local/bin/apollo-audio-worker
 
-RUN mkdir /run/apollo-ipc /audio-buf \
-    && chown apollo:apollo /run/apollo-ipc /audio-buf
+RUN mkdir /audio-buf \
+    && chown apollo:apollo /audio-buf
 USER apollo
 ENV RUST_LOG=info,apollo_audio_worker=info
 

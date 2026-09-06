@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, GuildId};
 use songbird::Songbird;
-use tokio::net::UnixStream;
-use tokio::net::unix::OwnedWriteHalf;
+use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{Mutex, oneshot};
 
 use crate::voice::player::{
@@ -31,7 +31,7 @@ struct Connection {
     pending: PendingMap,
     guild_events: EventsMap,
     next_id: AtomicU64,
-    socket_path: PathBuf,
+    socket_addr: String,
     epoch: AtomicU64,
     reconnecting: Mutex<()>,
 }
@@ -39,7 +39,7 @@ struct Connection {
 type PendingRx = oneshot::Receiver<Result<Response, String>>;
 
 enum Reconnected {
-    New(tokio::net::unix::OwnedReadHalf, u64),
+    New(tokio::net::tcp::OwnedReadHalf, u64),
     AlreadyDone,
 }
 
@@ -93,7 +93,7 @@ impl Connection {
         }
 
         for attempt in 1..=RECONNECT_ATTEMPTS {
-            match UnixStream::connect(&self.socket_path).await {
+            match TcpStream::connect(&self.socket_addr).await {
                 Ok(stream) => {
                     let (read_half, write_half) = stream.into_split();
                     *self.write.lock().await = write_half;
@@ -114,7 +114,7 @@ impl Connection {
 }
 
 async fn run_reader(
-    mut read_half: tokio::net::unix::OwnedReadHalf,
+    mut read_half: tokio::net::tcp::OwnedReadHalf,
     connection: Arc<Connection>,
     mut epoch: u64,
 ) {
@@ -241,19 +241,19 @@ pub struct IpcBackend {
 
 impl IpcBackend {
     pub async fn connect(
-        socket_path: &str,
+        socket_addr: &str,
         buffer_dir: PathBuf,
         songbird: Arc<Songbird>,
         cookies_file: Option<String>,
     ) -> std::io::Result<Self> {
-        let stream = UnixStream::connect(socket_path).await?;
+        let stream = TcpStream::connect(socket_addr).await?;
         let (read_half, write_half) = stream.into_split();
         let connection = Arc::new(Connection {
             write: Mutex::new(write_half),
             pending: StdMutex::new(HashMap::new()),
             guild_events: StdMutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
-            socket_path: PathBuf::from(socket_path),
+            socket_addr: socket_addr.to_string(),
             epoch: AtomicU64::new(0),
             reconnecting: Mutex::new(()),
         });
