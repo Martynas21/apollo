@@ -23,12 +23,8 @@ share with other people — some steps involve deliberately breaking things
 
 ## 1. Browsing
 
-- [ ] `/add_to_queue <query>` returns up to 5 results for a query you know
+- [ ] `/play <plain text query>` returns up to 5 results for a query you know
       has results (e.g. an artist name), with a select menu to queue one.
-- [ ] `/add_to_queue <query> <number>` queues that result directly, without
-      the menu.
-- [ ] `/add_to_queue <query> 0` (or any out-of-range number) replies
-      "Invalid selection" rather than panicking or hanging.
 - [ ] `/play <a public playlist URL>` queues every track in it and
       reports the count; `/queue` shows them all in order.
 - [ ] `/play <the same playlist's bare ID>` (no URL) is treated as a search
@@ -40,7 +36,6 @@ share with other people — some steps involve deliberately breaking things
 
 - [ ] Join a voice channel yourself, then `/play <a known YouTube URL>` —
       the bot joins your channel and audio plays.
-- [ ] `/play <plain text query>` (no URL) queues the top search result.
 - [ ] `/play <youtu.be short link>` and `/play <.../shorts/... link>` both
       resolve correctly (not just the full `/watch?v=` form).
 - [ ] While something is playing, `/play` a second track — it queues

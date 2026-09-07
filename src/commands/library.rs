@@ -8,7 +8,7 @@ use crate::voice::QueuedTrack;
 use crate::voice::panel::{format_duration, truncate_label};
 use crate::youtube::api::{PlaylistListing, Track, YouTubeApiError};
 
-const ADD_TO_QUEUE_DISPLAY_LIMIT: usize = 5;
+const SEARCH_RESULTS_DISPLAY_LIMIT: usize = 5;
 
 const PLAYLIST_SELECT_LIMIT: usize = 25;
 
@@ -660,7 +660,7 @@ pub(super) async fn handle_search_modal_submit(
         return Ok(());
     }
 
-    let listing = format_track_list(&results, ADD_TO_QUEUE_DISPLAY_LIMIT);
+    let listing = format_track_list(&results, SEARCH_RESULTS_DISPLAY_LIMIT);
     modal
         .edit_response(
             &ctx.http,
@@ -670,7 +670,7 @@ pub(super) async fn handle_search_modal_submit(
                 ))
                 .components(vec![track_select_menu(
                     &results,
-                    ADD_TO_QUEUE_DISPLAY_LIMIT,
+                    SEARCH_RESULTS_DISPLAY_LIMIT,
                 )]),
         )
         .await?;
@@ -1032,33 +1032,6 @@ async fn ensure_connected(ctx: Context<'_>, guild_id: serenity::GuildId) -> Resu
     Ok(true)
 }
 
-async fn join_and_enqueue(ctx: Context<'_>, track: Track) -> Result<(), Error> {
-    let guild_id = super::playback::require_guild_id(ctx)?;
-
-    if !ensure_connected(ctx, guild_id).await? {
-        return Ok(());
-    }
-
-    let title = track.title.clone();
-    let channel = track.channel.clone();
-    let queued = QueuedTrack {
-        track,
-        requested_by: ctx.author().id,
-    };
-
-    if let Err(err) = ctx.data().player.enqueue(guild_id, queued).await {
-        ctx.send(
-            poise::CreateReply::default()
-                .content(failed_to_queue_track(err))
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    super::playback::reply_public(ctx, queued_message(&title, &channel)).await
-}
-
 pub(super) async fn join_and_enqueue_all(
     ctx: Context<'_>,
     label: &str,
@@ -1091,47 +1064,6 @@ pub(super) async fn join_and_enqueue_all(
     super::playback::reply_public(ctx, format!("Queued {total} track(s) from **{label}**.")).await
 }
 
-#[poise::command(slash_command, guild_only)]
-pub async fn add_to_queue(
-    ctx: Context<'_>,
-    #[description = "Search query"] query: String,
-    #[description = "Result number from a previous /add_to_queue with this query"] number: Option<
-        u8,
-    >,
-) -> Result<(), Error> {
-    ctx.defer_ephemeral().await?;
-
-    let guild_id = super::playback::require_guild_id(ctx)?;
-    let results = match search_with_cache(ctx.data(), guild_id, &query).await {
-        Ok(results) => results,
-        Err(err) => {
-            ctx.send(
-                poise::CreateReply::default()
-                    .content(search_failed(err))
-                    .ephemeral(true),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-
-    let Some(number) = number else {
-        return present_search_results(ctx, &query, &results).await;
-    };
-
-    let Some(track) = select_by_number(&results, number) else {
-        ctx.send(
-            poise::CreateReply::default()
-                .content("Invalid selection.")
-                .ephemeral(true),
-        )
-        .await?;
-        return Ok(());
-    };
-
-    join_and_enqueue(ctx, track).await
-}
-
 pub(super) async fn present_search_results(
     ctx: Context<'_>,
     query: &str,
@@ -1147,15 +1079,14 @@ pub(super) async fn present_search_results(
         return Ok(());
     }
 
-    let listing = format_track_list(results, ADD_TO_QUEUE_DISPLAY_LIMIT);
+    let listing = format_track_list(results, SEARCH_RESULTS_DISPLAY_LIMIT);
     let handle = ctx
         .send(
             poise::CreateReply::default()
                 .content(format!(
-                    "Search results for \"{query}\":\n{listing}\n\nSelect one below to queue it, \
-                     or run `/add_to_queue {query} <number>` to do the same without the menu."
+                    "Search results for \"{query}\":\n{listing}\n\nSelect one below to queue it."
                 ))
-                .components(vec![track_select_menu(results, ADD_TO_QUEUE_DISPLAY_LIMIT)])
+                .components(vec![track_select_menu(results, SEARCH_RESULTS_DISPLAY_LIMIT)])
                 .ephemeral(true),
         )
         .await?;
@@ -1172,7 +1103,7 @@ pub(super) async fn search_with_cache(
         &data.db,
         &guild_id.to_string(),
         query,
-        ADD_TO_QUEUE_DISPLAY_LIMIT as i64,
+        SEARCH_RESULTS_DISPLAY_LIMIT as i64,
     )
     .await
     {
@@ -1184,13 +1115,6 @@ pub(super) async fn search_with_cache(
     }
 
     data.youtube.search(query).await
-}
-
-fn select_by_number<T: Clone>(items: &[T], number: u8) -> Option<T> {
-    if number == 0 {
-        return None;
-    }
-    items.get(number as usize - 1).cloned()
 }
 
 #[cfg(test)]
@@ -1232,20 +1156,6 @@ mod tests {
     fn formats_line_with_duration_past_an_hour_rolls_over() {
         let t = track("Long Mix", "Channel", Some(Duration::from_secs(88_623)));
         assert_eq!(format_track_line(1, &t), "1. Long Mix — Channel (24:37:03)");
-    }
-
-    #[test]
-    fn select_by_number_is_one_indexed() {
-        let items = vec![1, 2, 3];
-        assert_eq!(select_by_number(&items, 1), Some(1));
-        assert_eq!(select_by_number(&items, 3), Some(3));
-    }
-
-    #[test]
-    fn select_by_number_rejects_zero_and_out_of_range() {
-        let items = vec![1, 2, 3];
-        assert_eq!(select_by_number(&items, 0), None);
-        assert_eq!(select_by_number(&items, 4), None);
     }
 
     #[test]

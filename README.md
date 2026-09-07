@@ -142,14 +142,10 @@ See `.env.example` for the full list and inline docs:
 ## Commands
 
 - **Playback**: `/play <query|url|playlist-url>` (auto-joins your voice
-  channel) — plays a video, queues an entire playlist given its URL, or
-  searches and queues the top hit for free text. `/queue`, `/skip`,
-  `/pause`, `/resume`, `/stop`, `/player`, `/shuffle`, `/radio`,
-  `/volume <0-100>` (persists per-guild across restarts)
-- **Library browsing**: `/add_to_queue <query>` shows a numbered listing
-  alongside a select menu — clicking an entry queues it immediately. The
-  numbered form still works too: `/add_to_queue <query> <number>` queues a
-  search hit directly.
+  channel) — plays a video, queues an entire playlist given its URL, or for
+  free text shows up to 5 search results with a select menu to queue one.
+  `/queue`, `/skip`, `/pause`, `/resume`, `/stop`, `/player`, `/shuffle`,
+  `/radio`, `/volume <0-100>` (persists per-guild across restarts)
 - **Player panel**: `/player` posts a persistent per-guild panel (playback
   controls plus Search/Playlists buttons into the library, kept in sync as
   state changes) or points back at the existing one if it's already active.
@@ -158,7 +154,7 @@ See `.env.example` for the full list and inline docs:
   it later without re-pasting the URL into `/play`.
 
   There's no manual `/join`/`/leave` — the bot joins automatically on
-  `/play`/`/add_to_queue`/etc., and leaves on its own ~2.5 minutes after the
+  `/play`/etc., and leaves on its own ~2.5 minutes after the
   queue drains empty (see `IDLE_DISCONNECT` in `src/voice/player.rs`).
 
 ## Running it

@@ -76,7 +76,6 @@ off; where it doesn't, a single cell covers both.
 | `/radio` (`toggle_radio`) | flips the flag; refills if turning on with an empty queue | same | same | same | same |
 | Panel Clear Queue (`clear_queue`) | `QueueEmpty` | `QueueEmpty` unless upcoming tracks exist | drops upcoming, leaves `now_playing` alone; refills if radio is on | same as Playing | `QueueEmpty` |
 | Panel Volume (`set_volume`) | persists the setting; no current track to apply it to | persists; no handle yet | persists and applies to the current handle | same as Playing | persists |
-| `/add_to_queue` | same as `/play` | appends behind the loading track | appends | appends | starts immediately (queue was empty) |
 
 In every case, the action either succeeds, silently no-ops, or returns a
 well-typed `PlayerError` — never panics — and the invariant

@@ -28,7 +28,6 @@ pub fn commands() -> Vec<poise::Command<Data, Error>> {
         playback::clear(),
         playback::volume(),
         radio::radio(),
-        library::add_to_queue(),
     ]
 }
 
