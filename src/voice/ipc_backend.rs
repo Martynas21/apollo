@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -235,14 +234,12 @@ fn lookup(connection: &Connection, guild_id: u64) -> Option<Arc<dyn VoiceEvents>
 pub struct IpcBackend {
     songbird: Arc<Songbird>,
     cookies_file: Option<String>,
-    buffer_dir: PathBuf,
     connection: Arc<Connection>,
 }
 
 impl IpcBackend {
     pub async fn connect(
         socket_addr: &str,
-        buffer_dir: PathBuf,
         songbird: Arc<Songbird>,
         cookies_file: Option<String>,
     ) -> std::io::Result<Self> {
@@ -261,7 +258,6 @@ impl IpcBackend {
         Ok(Self {
             songbird,
             cookies_file,
-            buffer_dir,
             connection,
         })
     }
@@ -358,16 +354,16 @@ impl VoiceBackend for IpcBackend {
     }
 
     async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError> {
-        let path = resolve::buffer_track_to_file(
+        let resolved = resolve::resolve_stream(
             &track.video_id,
             track.duration,
             self.cookies_file.as_deref(),
-            &self.buffer_dir,
         )
         .await?;
         Ok(AudioSource {
             video_id: track.video_id.clone(),
-            path,
+            url: resolved.url,
+            headers: resolved.headers,
         })
     }
 }
@@ -381,11 +377,11 @@ struct IpcCall {
 impl VoiceCall for IpcCall {
     async fn play(&self, source: AudioSource) -> Result<Arc<dyn VoiceTrack>, String> {
         let track_id = uuid::Uuid::new_v4();
-        let audio_path = source.path.to_string_lossy().into_owned();
         let request = Request::Play {
             guild_id: self.guild_id.get(),
             track_id,
-            audio_path,
+            stream_url: source.url.clone(),
+            headers: source.headers.clone(),
         };
         tracing::debug!(video_id = %source.video_id, %track_id, "starting track playback");
         match self.connection.request(request).await {

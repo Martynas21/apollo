@@ -6,10 +6,8 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: sqlite:///data/apollo.db
-      AUDIO_BUFFER_DIR: /audio-buf
     volumes:
       - apollo-data:/data
-      - apollo-audio-buf:/audio-buf
     depends_on:
       audio-worker:
         condition: service_healthy
@@ -21,17 +19,13 @@ services:
   # mixer's 20ms packet-send tick and cause audible stutter — see the
   # split-worker plan doc for the full rationale. Talks to `apollo` only
   # over a TCP connection (compose's internal DNS resolves the `audio-worker`
-  # hostname) and the `apollo-audio-buf` volume; it never touches
-  # yt-dlp/YouTube, the DB, or a Discord bot token.
+  # hostname); it never touches yt-dlp/YouTube, the DB, or a Discord bot
+  # token — `apollo` resolves each track to a direct streamable URL and this
+  # service fetches it directly over HTTP straight into songbird.
   audio-worker:
     build:
       context: .
       target: audio-worker
-    volumes:
-      # Mounted (not read from an env var — the worker just opens whatever
-      # absolute path `apollo` sends in each Play request) so those paths
-      # resolve inside this container too.
-      - apollo-audio-buf:/audio-buf
     # Neither service sets AUDIO_WORKER_SOCKET — both fall back to
     # apollo_ipc::DEFAULT_SOCKET_ADDR ("audio-worker:7878"), which is also
     # what the healthcheck below assumes. If that default ever changes,
@@ -47,7 +41,3 @@ services:
 
 volumes:
   apollo-data:
-  apollo-audio-buf:
-    driver_opts:
-      type: tmpfs
-      device: tmpfs

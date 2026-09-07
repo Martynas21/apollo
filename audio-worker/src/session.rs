@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use apollo_ipc::dto::{ConnectionInfoDto, TrackStatusDto};
 use apollo_ipc::proto::Event as IpcEvent;
 use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use songbird::id::{ChannelId, GuildId, UserId};
-use songbird::input::File as SongbirdFile;
+use songbird::input::HttpRequest;
 use songbird::tracks::{PlayMode, TrackHandle};
 use songbird::{
     Config, ConnectionInfo, CoreEvent, Driver, Event, EventContext,
@@ -33,6 +34,7 @@ pub struct Sessions {
     /// evicted; bounded by the number of distinct guilds ever joined.
     join_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     events: UnboundedSender<IpcEvent>,
+    http: reqwest::Client,
 }
 
 fn nonzero(id: u64, what: &str) -> Result<NonZeroU64, String> {
@@ -54,23 +56,27 @@ fn to_connection_info(dto: ConnectionInfoDto) -> Result<ConnectionInfo, String> 
 struct TrackEndHandler {
     guild_id: u64,
     track_id: Uuid,
-    audio_path: String,
     events: UnboundedSender<IpcEvent>,
 }
 
 #[async_trait]
 impl SongbirdEventHandler for TrackEndHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        let errored = matches!(
-            ctx,
-            EventContext::Track(tracks)
-                if tracks.first().is_some_and(|(state, _)| matches!(state.playing, PlayMode::Errored(_)))
-        );
-        let event = if errored {
+        let error = match ctx {
+            EventContext::Track(tracks) => {
+                tracks.first().and_then(|(state, _)| match &state.playing {
+                    PlayMode::Errored(err) => Some(err.to_string()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        };
+        let event = if let Some(error) = error {
+            tracing::warn!(guild_id = self.guild_id, %error, "track playback failed");
             IpcEvent::TrackErrored {
                 guild_id: self.guild_id,
                 track_id: self.track_id,
-                error: "track playback failed".to_string(),
+                error,
             }
         } else {
             IpcEvent::TrackFinished {
@@ -79,14 +85,7 @@ impl SongbirdEventHandler for TrackEndHandler {
             }
         };
         let _ = self.events.send(event);
-        delete_audio_file(&self.audio_path);
         None
-    }
-}
-
-fn delete_audio_file(path: &str) {
-    if let Err(err) = std::fs::remove_file(path) {
-        tracing::warn!(%err, %path, "failed to delete buffered audio file");
     }
 }
 
@@ -119,6 +118,7 @@ impl Sessions {
             guilds: Mutex::new(HashMap::new()),
             join_locks: Mutex::new(HashMap::new()),
             events,
+            http: reqwest::Client::new(),
         }
     }
 
@@ -203,21 +203,37 @@ impl Sessions {
         }
     }
 
-    pub fn play(&self, guild_id: u64, track_id: Uuid, audio_path: String) -> Result<(), String> {
+    pub fn play(
+        &self,
+        guild_id: u64,
+        track_id: Uuid,
+        stream_url: String,
+        headers: Vec<(String, String)>,
+    ) -> Result<(), String> {
         let mut guilds = self
             .guilds
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(session) = guilds.get_mut(&guild_id) else {
-            delete_audio_file(&audio_path);
             return Err(format!("no active session for guild {guild_id}"));
         };
-        let input = SongbirdFile::new(audio_path.clone()).into();
+        let mut header_map = HeaderMap::new();
+        for (name, value) in headers {
+            match (
+                HeaderName::try_from(name.as_str()),
+                HeaderValue::try_from(value),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    header_map.insert(name, value);
+                }
+                _ => tracing::warn!(%name, "ignoring invalid stream header"),
+            }
+        }
+        let input = HttpRequest::new_with_headers(self.http.clone(), stream_url, header_map).into();
         let handle = session.driver.play_input(input);
         let end_handler = TrackEndHandler {
             guild_id,
             track_id,
-            audio_path,
             events: self.events.clone(),
         };
         if let Err(err) = handle.add_event(Event::Track(TrackEvent::End), end_handler.clone()) {
@@ -347,7 +363,8 @@ mod tests {
                 .play(
                     1,
                     Uuid::new_v4(),
-                    "/nonexistent/apollo-test.audio".to_string()
+                    "https://example.invalid/apollo-test.audio".to_string(),
+                    Vec::new()
                 )
                 .is_err()
         );

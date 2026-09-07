@@ -99,13 +99,11 @@ COPY --from=build /app/apollo /usr/local/bin/apollo
 
 # DATABASE_URL should point at a path under a mounted volume (e.g.
 # sqlite:///data/apollo.db with -v apollo-data:/data) so per-guild playback
-# settings survive container recreation — see README.md. `/audio-buf` is
-# the shared volume this container and `apollo-audio-worker` both mount —
-# see compose.yaml. Both are pre-created and chowned here (rather than
-# leaving Docker to create them root-owned on first mount) so the non-root
-# `apollo` user can actually use them.
-RUN mkdir /data /audio-buf \
-    && chown apollo:apollo /data /audio-buf
+# settings survive container recreation — see README.md. Pre-created and
+# chowned here (rather than leaving Docker to create it root-owned on first
+# mount) so the non-root `apollo` user can actually use it.
+RUN mkdir /data \
+    && chown apollo:apollo /data
 USER apollo
 ENV RUST_LOG=info,apollo=info
 
@@ -113,9 +111,9 @@ ENTRYPOINT ["/usr/local/bin/apollo"]
 
 # ---- apollo-audio-worker runtime ------------------------------------------
 # Deliberately minimal: no yt-dlp/ffmpeg/Deno, no Discord bot token, no DB —
-# this process only ever holds songbird `Driver`s and plays already-resolved
-# files from the shared buffer volume. `ca-certificates` is still needed for
-# the voice gateway's TLS websocket handshake.
+# this process only ever holds songbird `Driver`s and streams already-resolved
+# URLs straight into them over HTTP. `ca-certificates` is still needed for
+# the voice gateway's TLS websocket handshake and for the HTTPS audio stream.
 FROM debian:bookworm-slim AS audio-worker
 ARG APOLLO_UID
 
@@ -129,8 +127,6 @@ RUN useradd --system --uid ${APOLLO_UID} --create-home --home-dir /app apollo
 WORKDIR /app
 COPY --from=build /app/apollo-audio-worker /usr/local/bin/apollo-audio-worker
 
-RUN mkdir /audio-buf \
-    && chown apollo:apollo /audio-buf
 USER apollo
 ENV RUST_LOG=info,apollo_audio_worker=info
 

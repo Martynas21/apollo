@@ -1,9 +1,9 @@
+use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::Deserialize;
 use tokio::process::Command;
-use uuid::Uuid;
 
 const STDERR_TRUNCATE_LEN: usize = 200;
 
@@ -11,7 +11,7 @@ const MAX_TRACK_DURATION: Duration = Duration::from_hours(14);
 
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(15);
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const AUDIO_FORMAT_SELECTOR: &str = "ba[abr>0][vcodec=none]/best";
 
@@ -120,78 +120,56 @@ fn other_err(e: impl std::fmt::Display) -> PlaybackError {
     PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN))
 }
 
-async fn cleanup_stem(buffer_dir: &Path, stem: &str) {
-    let Ok(mut entries) = tokio::fs::read_dir(buffer_dir).await else {
-        return;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_name().to_string_lossy().starts_with(stem) {
-            let _ = tokio::fs::remove_file(entry.path()).await;
-        }
-    }
+pub struct ResolvedStream {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
 }
 
-async fn find_output_file(buffer_dir: &Path, stem: &str) -> Option<PathBuf> {
-    let prefix = format!("{stem}.");
-    let mut entries = tokio::fs::read_dir(buffer_dir).await.ok()?;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
-            return Some(entry.path());
-        }
-    }
-    None
+#[derive(Deserialize)]
+struct YtDlpJson {
+    url: String,
+    #[serde(default)]
+    http_headers: HashMap<String, String>,
 }
 
-pub async fn buffer_track_to_file(
+pub async fn resolve_stream(
     video_id: &str,
     duration: Option<Duration>,
     cookies_file: Option<&str>,
-    buffer_dir: &Path,
-) -> Result<PathBuf, PlaybackError> {
+) -> Result<ResolvedStream, PlaybackError> {
     if duration.is_none_or(|d| d > MAX_TRACK_DURATION) {
         return Err(PlaybackError::TooLong);
     }
 
     let url = format!("https://www.youtube.com/watch?v={video_id}");
-    let stem = Uuid::new_v4().to_string();
-    let output_template = buffer_dir.join(format!("{stem}.%(ext)s"));
 
     let mut command = Command::new("yt-dlp");
     command.kill_on_drop(true);
-    command.args([
-        "-f",
-        AUDIO_FORMAT_SELECTOR,
-        "--no-playlist",
-        "-x",
-        "--audio-format",
-        "best",
-        "-o",
-    ]);
-    command.arg(&output_template);
+    command.args(["-j", "-f", AUDIO_FORMAT_SELECTOR, "--no-playlist"]);
     if let Some(cookies_file) = cookies_file {
         command.args(["--cookies", cookies_file]);
     }
     command.arg(&url);
 
-    let output = match tokio::time::timeout(DOWNLOAD_TIMEOUT, command.output()).await {
+    let output = match tokio::time::timeout(RESOLVE_TIMEOUT, command.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(e)) if e.kind() == ErrorKind::NotFound => return Err(PlaybackError::YtDlpMissing),
         Ok(Err(e)) => return Err(other_err(e)),
-        Err(_elapsed) => {
-            cleanup_stem(buffer_dir, &stem).await;
-            return Err(PlaybackError::Timeout);
-        }
+        Err(_elapsed) => return Err(PlaybackError::Timeout),
     };
 
     if !output.status.success() {
-        cleanup_stem(buffer_dir, &stem).await;
         return Err(classify_ytdlp_stderr(&String::from_utf8_lossy(
             &output.stderr,
         )));
     }
 
-    find_output_file(buffer_dir, &stem).await.ok_or_else(|| {
-        PlaybackError::Other("yt-dlp reported success but produced no output file".to_string())
+    let parsed: YtDlpJson = serde_json::from_slice(&output.stdout)
+        .map_err(|e| PlaybackError::Other(format!("failed to parse yt-dlp output: {e}")))?;
+
+    Ok(ResolvedStream {
+        url: parsed.url,
+        headers: parsed.http_headers.into_iter().collect(),
     })
 }
 

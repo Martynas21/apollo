@@ -28,7 +28,8 @@ pub enum Request {
     Play {
         guild_id: u64,
         track_id: Uuid,
-        audio_path: String,
+        stream_url: String,
+        headers: Vec<(String, String)>,
     },
     Pause {
         guild_id: u64,

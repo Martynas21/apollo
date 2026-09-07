@@ -32,11 +32,6 @@ const RADIO_ADVANCE_WAIT: Duration = Duration::from_secs(3);
 
 fn discard_prefetch(prefetch: Prefetch) {
     prefetch.abort();
-    tokio::spawn(async move {
-        if let Ok(Ok(source)) = prefetch.await {
-            let _ = tokio::fs::remove_file(&source.path).await;
-        }
-    });
 }
 
 fn volume_multiplier(volume: u8) -> f32 {
@@ -125,7 +120,8 @@ impl std::error::Error for PlayerError {}
 
 pub struct AudioSource {
     pub(crate) video_id: String,
-    pub(crate) path: std::path::PathBuf,
+    pub(crate) url: String,
+    pub(crate) headers: Vec<(String, String)>,
 }
 
 pub struct TrackStatus {
@@ -2010,7 +2006,8 @@ mod tests {
     fn empty_source(video_id: &str) -> AudioSource {
         AudioSource {
             video_id: video_id.to_string(),
-            path: std::path::PathBuf::from("/dev/null"),
+            url: "https://example.invalid/apollo-test.audio".to_string(),
+            headers: Vec::new(),
         }
     }
 

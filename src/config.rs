@@ -9,12 +9,9 @@ pub struct Config {
     pub yt_dlp_cookies_file: Option<String>,
     pub playlist_track_limit: usize,
     pub audio_worker_socket: String,
-    pub audio_buffer_dir: String,
 }
 
 const DEFAULT_PLAYLIST_TRACK_LIMIT: usize = 500;
-
-const DEFAULT_AUDIO_BUFFER_DIR: &str = "/audio-buf";
 
 impl Config {
     pub fn from_env() -> Result<Self> {
@@ -31,8 +28,6 @@ impl Config {
             playlist_track_limit: playlist_track_limit(&lookup)?,
             audio_worker_socket: apollo_ipc::optional_env_var(&lookup, "AUDIO_WORKER_SOCKET")
                 .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_ADDR.to_string()),
-            audio_buffer_dir: apollo_ipc::optional_env_var(&lookup, "AUDIO_BUFFER_DIR")
-                .unwrap_or_else(|| DEFAULT_AUDIO_BUFFER_DIR.to_string()),
         })
     }
 }

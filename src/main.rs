@@ -59,7 +59,6 @@ async fn connect_backends(
         async {
             IpcBackend::connect(
                 &config.audio_worker_socket,
-                std::path::PathBuf::from(&config.audio_buffer_dir),
                 songbird,
                 config.yt_dlp_cookies_file.clone(),
             )

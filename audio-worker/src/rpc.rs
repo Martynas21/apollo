@@ -20,9 +20,10 @@ async fn dispatch(sessions: &Sessions, request: Request) -> Result<Response, Str
         Request::Play {
             guild_id,
             track_id,
-            audio_path,
+            stream_url,
+            headers,
         } => {
-            sessions.play(guild_id, track_id, audio_path)?;
+            sessions.play(guild_id, track_id, stream_url, headers)?;
             Ok(Response::Ok)
         }
         Request::Pause { guild_id, track_id } => {
