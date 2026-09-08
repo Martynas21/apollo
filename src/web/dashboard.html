@@ -19,6 +19,13 @@
     --accent-2: #d9784a;
     --danger: #d9534f;
   }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      transition-duration: 0.001ms !important;
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+    }
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
@@ -54,6 +61,17 @@
   .primary-btn:hover:not(:disabled) { filter: brightness(1.1); }
   .primary-btn.small { width: auto; padding: 6px 12px; font-size: 12px; font-weight: 700; border-radius: 7px; align-self: flex-start; }
 
+  /* ---- Shared button tactile feedback ---- */
+  .icon-btn, .play-btn, .chip-btn, .ghost-btn, .outline-btn, .primary-btn,
+  .mini-icon-btn, .server-btn, .logout-link {
+    transition: transform .12s ease, background-color .15s ease, border-color .15s ease, color .15s ease;
+  }
+  .icon-btn:active:not(:disabled), .play-btn:active:not(:disabled), .chip-btn:active:not(:disabled),
+  .ghost-btn:active:not(:disabled), .outline-btn:active:not(:disabled), .primary-btn:active:not(:disabled),
+  .mini-icon-btn:active:not(:disabled), .server-btn:active:not(:disabled), .logout-link:active:not(:disabled) {
+    transform: scale(0.93);
+  }
+
   /* ---- Dashboard ---- */
   #dashboard {
     display: none; width: 100%; min-height: 100vh;
@@ -86,9 +104,12 @@
     position: absolute; top: calc(100% + 8px); right: 0; width: 220px;
     background: var(--bg-elevated); border: 1px solid var(--border-soft);
     border-radius: 12px; padding: 6px; box-shadow: 0 12px 28px rgba(0,0,0,.4);
-    z-index: 20; display: none; flex-direction: column; gap: 2px;
+    z-index: 20; display: flex; flex-direction: column; gap: 2px;
     max-height: 320px; overflow-y: auto;
+    opacity: 0; transform: translateY(-6px); pointer-events: none;
+    transition: opacity .15s ease-out, transform .15s ease-out;
   }
+  .server-menu.open { opacity: 1; transform: translateY(0); pointer-events: auto; }
   .server-row {
     display: flex; align-items: center; gap: 10px; width: 100%;
     padding: 9px 10px; border-radius: 8px; background: none; border: none;
@@ -137,7 +158,14 @@
     box-shadow: 0 0 50px 6px color-mix(in oklch, var(--accent) 40%, transparent);
     display: flex; align-items: center; justify-content: center;
   }
-  .np-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+  @keyframes np-glow-pulse {
+    0% { box-shadow: 0 0 50px 6px color-mix(in oklch, var(--accent) 40%, transparent); }
+    35% { box-shadow: 0 0 70px 14px color-mix(in oklch, var(--accent) 65%, transparent); }
+    100% { box-shadow: 0 0 50px 6px color-mix(in oklch, var(--accent) 40%, transparent); }
+  }
+  .np-art.np-pulse { animation: np-glow-pulse .6s ease-out; }
+  .np-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; transition: opacity .15s ease; }
+  .np-info.np-fade-out { opacity: 0; }
   .eyebrow { font-size: 11.5px; font-weight: 700; letter-spacing: .12em; color: var(--accent); text-transform: uppercase; }
   .np-title { font-family: 'Spectral', serif; font-size: 25px; font-weight: 600; margin: 0; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .np-channel { font-size: 14px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -158,11 +186,17 @@
   .icon-btn:hover:not(:disabled) { background: var(--bg-hover); }
   .icon-btn.danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
   .play-btn {
+    position: relative;
     width: 50px; height: 50px; border-radius: 50%; flex-shrink: 0;
     background: var(--accent); border: none; color: var(--bg);
     display: flex; align-items: center; justify-content: center;
   }
   .play-btn:hover:not(:disabled) { filter: brightness(1.1); }
+  .play-btn svg {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    opacity: 0; transition: opacity .12s ease;
+  }
+  .play-btn svg.visible { opacity: 1; }
   .chip-btn {
     display: flex; align-items: center; gap: 7px; padding: 9px 14px; border-radius: 999px;
     background: var(--bg); border: 1px solid var(--border-soft); color: var(--text-muted);
@@ -178,7 +212,14 @@
   .volume input[type="range"]::-webkit-slider-thumb {
     appearance: none; -webkit-appearance: none; width: 13px; height: 13px;
     border-radius: 50%; background: var(--accent); border: 2px solid var(--bg-elevated); cursor: pointer;
+    transition: transform .12s ease;
   }
+  .volume input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.15); }
+  .volume input[type="range"]::-moz-range-thumb {
+    width: 13px; height: 13px; border-radius: 50%; background: var(--accent);
+    border: 2px solid var(--bg-elevated); cursor: pointer; transition: transform .12s ease;
+  }
+  .volume input[type="range"]:active::-moz-range-thumb { transform: scale(1.15); }
   .volume-label { font-size: 11.5px; width: 30px; text-align: right; color: var(--text-faint); }
   .ghost-btn {
     background: none; border: 1px solid var(--border-soft); color: var(--text-muted);
@@ -197,8 +238,18 @@
   .search-bar input { flex: 1; background: none; border: none; outline: none; color: var(--text); font-size: 13.5px; }
   .search-bar input::placeholder { color: var(--text-faint); }
   .scroll-list { display: flex; flex-direction: column; gap: 2px; max-height: 178px; overflow-y: auto; }
-  .compact-row { display: grid; grid-template-columns: 34px 1fr auto auto; gap: 10px; align-items: center; padding: 7px 4px; border-radius: 8px; }
+  .compact-row {
+    display: grid; grid-template-columns: 34px 1fr auto auto; gap: 10px; align-items: center; padding: 7px 4px; border-radius: 8px;
+    max-height: 64px; overflow: hidden;
+    transition: opacity .18s ease-out, transform .18s ease-out,
+      max-height .16s ease-in, padding-top .16s ease-in, padding-bottom .16s ease-in,
+      margin-top .16s ease-in, margin-bottom .16s ease-in, background-color .12s ease;
+  }
   .compact-row:hover { background: var(--bg); }
+  .compact-row.row-enter { opacity: 0; transform: translateY(-6px); }
+  .compact-row.row-exit {
+    opacity: 0; max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; margin-bottom: 0;
+  }
   .compact-thumb { width: 34px; height: 34px; border-radius: 7px; flex-shrink: 0; }
   .compact-meta { min-width: 0; }
   .compact-title-line { display: flex; align-items: center; gap: 6px; }
@@ -226,6 +277,12 @@
   .playlist-chip {
     flex: 0 0 148px; display: flex; flex-direction: column; gap: 8px;
     background: var(--bg); border: 1px solid var(--border-soft); border-radius: 14px; padding: 12px;
+    transition: opacity .18s ease-out, transform .18s ease-out,
+      flex-basis .16s ease-in, max-width .16s ease-in, padding .16s ease-in, margin-right .16s ease-in;
+  }
+  .playlist-chip.row-enter { opacity: 0; transform: translateY(-6px); }
+  .playlist-chip.row-exit {
+    opacity: 0; transform: scale(.94); flex-basis: 0; max-width: 0; padding: 12px 0; margin-right: 0; overflow: hidden;
   }
   .playlist-cover {
     width: 100%; aspect-ratio: 1; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: rgba(255,255,255,.9);
@@ -233,7 +290,12 @@
   .playlist-name { font-family: 'Spectral', serif; font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .playlist-count { font-size: 11.5px; color: var(--text-muted); margin-top: -4px; }
 
-  #status-line { min-height: 18px; font-size: 12.5px; color: var(--danger); padding: 0 40px 20px; }
+  #status-line {
+    min-height: 18px; font-size: 12.5px; color: var(--text-muted); padding: 0 40px 20px;
+    opacity: 0; transition: opacity .18s ease;
+  }
+  #status-line.status-visible { opacity: 1; }
+  #status-line.status-error { color: var(--danger); }
 </style>
 </head>
 <body>
@@ -289,7 +351,7 @@
   <div class="dashboard-grid">
     <section class="card now-card">
       <div id="np-hero" class="np-hero">
-        <div class="np-art">
+        <div class="np-art" id="np-art">
           <svg width="44" height="44" viewBox="0 0 28 28" fill="none" stroke="white" stroke-opacity="0.9" stroke-width="1.5" stroke-linecap="round">
             <circle cx="14" cy="14" r="5"/>
             <line x1="23" y1="14" x2="26" y2="14"/><line x1="20.4" y1="20.4" x2="22.5" y2="22.5"/>
@@ -298,7 +360,7 @@
             <line x1="14" y1="5" x2="14" y2="2"/><line x1="20.4" y1="7.6" x2="22.5" y2="5.5"/>
           </svg>
         </div>
-        <div class="np-info">
+        <div class="np-info" id="np-info">
           <div class="eyebrow" id="np-eyebrow">NOTHING PLAYING</div>
           <div class="np-title" id="np-title">&mdash;</div>
           <div class="np-channel" id="np-channel"></div>
@@ -324,8 +386,8 @@
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg>
           </button>
           <button class="play-btn" id="toggle-btn" title="Play/Pause">
-            <svg id="play-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M7 5l11 7-11 7V5z"/></svg>
-            <svg id="pause-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" style="display:none"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
+            <svg id="play-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5l11 7-11 7V5z"/></svg>
+            <svg id="pause-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
           </button>
           <button class="icon-btn" id="skip-btn" title="Skip">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M6 5l9 7-9 7V5z"/><line x1="18" y1="5" x2="18" y2="19"/></svg>
@@ -406,11 +468,32 @@
   let searchDebounce = null;
   let searchSeq = 0;
   let lastSeenPlayingVideoId = null;
+  let statusDismissTimeout = null;
+  let npCrossfadeTimeout = null;
 
   const loginScreen = document.getElementById('login-screen');
   const dashboard = document.getElementById('dashboard');
   const loginError = document.getElementById('login-error');
   const statusLine = document.getElementById('status-line');
+
+  // Shows a status message. Non-error messages fade in and auto-dismiss after
+  // a few seconds; error messages stay up until the next status change so
+  // they actually get read. Any pending auto-dismiss is cleared whenever a
+  // new message arrives, so rapid actions don't cut each other off mid-fade.
+  function showStatus(message, options = {}) {
+    const isError = !!options.isError;
+    clearTimeout(statusDismissTimeout);
+    statusDismissTimeout = null;
+    statusLine.textContent = message || '';
+    statusLine.classList.toggle('status-error', isError);
+    statusLine.classList.toggle('status-visible', !!message);
+    if (message && !isError) {
+      statusDismissTimeout = setTimeout(() => {
+        statusLine.classList.remove('status-visible');
+        statusDismissTimeout = null;
+      }, 4000);
+    }
+  }
 
   function showDashboard() {
     loginScreen.style.display = 'none';
@@ -488,12 +571,12 @@
   const serverName = document.getElementById('server-name');
 
   function closeServerMenu() {
-    serverMenu.style.display = 'none';
+    serverMenu.classList.remove('open');
   }
 
   serverBtn.addEventListener('click', (event) => {
     event.stopPropagation();
-    serverMenu.style.display = serverMenu.style.display === 'flex' ? 'none' : 'flex';
+    serverMenu.classList.toggle('open');
   });
 
   document.addEventListener('click', (event) => {
@@ -538,7 +621,7 @@
       renderServerMenu();
       selectGuild(guilds[0].id);
     } else {
-      statusLine.textContent = 'Apollo is not in any servers yet.';
+      showStatus('Apollo is not in any servers yet.');
     }
   }
 
@@ -598,6 +681,91 @@
     }
   }
 
+  // ---- Keyed list reconciliation ----
+  // Diffs `items` against the container's current children (matched by
+  // dataset.key) instead of wiping and rebuilding the list. Persisting rows
+  // are reused in place (so hover/focus state and CSS transitions survive),
+  // new rows are created and enter-animated, and rows no longer present are
+  // exit-animated before being removed. Duplicate keys are matched in order
+  // via a Map<key, Element[]> so two same-keyed items don't collapse onto a
+  // single DOM node.
+  function animateEnter(el) {
+    el.classList.add('row-enter');
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        el.classList.remove('row-enter');
+      });
+    });
+  }
+
+  function animateExit(el, onDone) {
+    let done = false;
+    let fallback = null;
+    function finish() {
+      if (done) return;
+      done = true;
+      clearTimeout(fallback);
+      el.removeEventListener('transitionend', onTransitionEnd);
+      onDone();
+    }
+    function onTransitionEnd(event) {
+      if (event.target !== el) return;
+      finish();
+    }
+    el.addEventListener('transitionend', onTransitionEnd);
+    fallback = setTimeout(finish, 250);
+    el.classList.add('row-exit');
+  }
+
+  function reconcileList(container, items, keyOf, createRow, updateRow) {
+    const existingByKey = new Map();
+    for (const el of Array.from(container.children)) {
+      if (el.dataset.exiting === 'true') continue;
+      const key = el.dataset.key;
+      if (key == null) continue;
+      let bucket = existingByKey.get(key);
+      if (!bucket) { bucket = []; existingByKey.set(key, bucket); }
+      bucket.push(el);
+    }
+
+    const usedElements = new Set();
+    let prevSibling = null;
+
+    items.forEach((item, index) => {
+      const key = String(keyOf(item));
+      const bucket = existingByKey.get(key);
+      let el = bucket && bucket.length ? bucket.shift() : null;
+
+      if (el) {
+        updateRow(el, item, index, items);
+        if (prevSibling === null) {
+          if (container.firstChild !== el) container.insertBefore(el, container.firstChild);
+        } else if (prevSibling.nextSibling !== el) {
+          container.insertBefore(el, prevSibling.nextSibling);
+        }
+      } else {
+        el = createRow(item, index, items);
+        el.dataset.key = key;
+        if (prevSibling === null) {
+          container.insertBefore(el, container.firstChild);
+        } else {
+          container.insertBefore(el, prevSibling.nextSibling);
+        }
+        animateEnter(el);
+      }
+      usedElements.add(el);
+      prevSibling = el;
+    });
+
+    for (const el of Array.from(container.children)) {
+      if (usedElements.has(el) || el.dataset.exiting === 'true') continue;
+      el.dataset.exiting = 'true';
+      animateExit(el, () => {
+        if (el.parentNode === container) container.removeChild(el);
+      });
+    }
+  }
+
   // Builds the shared thumb + title/channel + duration layout used by both
   // the search results list and the queue list; callers append their own
   // trailing action button(s).
@@ -633,6 +801,16 @@
     return row;
   }
 
+  // Mutates an existing row's thumb/title/channel/duration in place, without
+  // recreating the element — used by every list's updateRow so persisting
+  // rows keep their identity across reconciles.
+  function updateTrackRowContent(row, track) {
+    row.querySelector('.compact-thumb').style.background = hueGradient(hueFromId(track.video_id));
+    row.querySelector('.compact-title').textContent = track.title;
+    row.querySelector('.compact-channel').textContent = track.channel;
+    row.querySelector('.compact-duration').textContent = formatDuration(track.duration_secs);
+  }
+
   const UP_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>';
   const DOWN_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
   const REMOVE_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
@@ -647,6 +825,49 @@
     return btn;
   }
 
+  // The queue's move-up/move-down/remove buttons act on the row's position,
+  // which can change across renders even when the row itself persists (e.g.
+  // a track at position 2 moves to position 1). The row's current index is
+  // stashed on `dataset.index` by updateQueueRow on every reconcile, and the
+  // click handlers read it at click-time instead of closing over a stale
+  // index captured when the row was first created.
+  function createQueueRow(track, index, items) {
+    const row = createTrackRow(track);
+    const actions = document.createElement('div');
+    actions.className = 'compact-actions';
+
+    const upBtn = makeMiniIconBtn(UP_ICON, 'Move up', false, false);
+    upBtn.addEventListener('click', () => {
+      const i = Number(row.dataset.index);
+      moveQueueTrack(i, i - 1);
+    });
+    actions.appendChild(upBtn);
+
+    const downBtn = makeMiniIconBtn(DOWN_ICON, 'Move down', false, false);
+    downBtn.addEventListener('click', () => {
+      const i = Number(row.dataset.index);
+      moveQueueTrack(i, i + 1);
+    });
+    actions.appendChild(downBtn);
+
+    const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Remove', false, true);
+    removeBtn.addEventListener('click', () => removeQueueTrack(Number(row.dataset.index)));
+    actions.appendChild(removeBtn);
+
+    row.appendChild(actions);
+    row._upBtn = upBtn;
+    row._downBtn = downBtn;
+    updateQueueRow(row, track, index, items);
+    return row;
+  }
+
+  function updateQueueRow(row, track, index, items) {
+    updateTrackRowContent(row, track);
+    row.dataset.index = String(index);
+    row._upBtn.disabled = index === 0;
+    row._downBtn.disabled = index === items.length - 1;
+  }
+
   function renderQueue(snapshot) {
     const upcoming = snapshot.upcoming;
     document.getElementById('queue-count-badge').textContent = upcoming.length;
@@ -656,43 +877,59 @@
 
     const list = document.getElementById('queue-list');
     const emptyNote = document.getElementById('queue-empty-note');
-    list.innerHTML = '';
     emptyNote.style.display = upcoming.length === 0 ? 'block' : 'none';
 
-    upcoming.forEach((track, index) => {
-      const row = createTrackRow(track);
-      const actions = document.createElement('div');
-      actions.className = 'compact-actions';
+    reconcileList(list, upcoming, (track) => track.video_id, createQueueRow, updateQueueRow);
+  }
 
-      const upBtn = makeMiniIconBtn(UP_ICON, 'Move up', index === 0, false);
-      upBtn.addEventListener('click', () => moveQueueTrack(index, index - 1));
-      actions.appendChild(upBtn);
+  // Fades `.np-info` out, swaps its text, then lets the same transition fade
+  // it back in. Any pending swap from a previous rapid track change is
+  // cleared first so overlapping calls don't cut each other's fade short.
+  function crossfadeNowPlaying(applyContent) {
+    const npInfo = document.getElementById('np-info');
+    clearTimeout(npCrossfadeTimeout);
+    npInfo.classList.add('np-fade-out');
+    npCrossfadeTimeout = setTimeout(() => {
+      applyContent();
+      npInfo.classList.remove('np-fade-out');
+      npCrossfadeTimeout = null;
+    }, 150);
+  }
 
-      const downBtn = makeMiniIconBtn(DOWN_ICON, 'Move down', index === upcoming.length - 1, false);
-      downBtn.addEventListener('click', () => moveQueueTrack(index, index + 1));
-      actions.appendChild(downBtn);
-
-      const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Remove', false, true);
-      removeBtn.addEventListener('click', () => removeQueueTrack(index));
-      actions.appendChild(removeBtn);
-
-      row.appendChild(actions);
-      list.appendChild(row);
-    });
+  // One-shot glow pulse on the art tile when a new track starts.
+  function pulseNowPlayingArt() {
+    const npArt = document.getElementById('np-art');
+    npArt.classList.remove('np-pulse');
+    void npArt.offsetWidth; // restart the animation if one is already mid-flight
+    npArt.classList.add('np-pulse');
+    npArt.addEventListener('animationend', () => npArt.classList.remove('np-pulse'), { once: true });
   }
 
   function renderSnapshot(snapshot) {
     const playingVideoId = snapshot.track ? snapshot.track.video_id : null;
-    if (snapshot.state === 'playing' && playingVideoId !== lastSeenPlayingVideoId) {
+    const trackChanged = playingVideoId !== lastSeenPlayingVideoId;
+    if (snapshot.state === 'playing' && trackChanged) {
       loadFavourites(currentGuildId);
     }
+    // Only crossfade on an actual track-to-track switch — not on initial
+    // load or on stopping, where there's no "before" text worth fading out.
+    const shouldCrossfade = trackChanged && lastSeenPlayingVideoId !== null && playingVideoId !== null;
     lastSeenPlayingVideoId = playingVideoId;
 
-    document.getElementById('np-eyebrow').textContent = STATE_LABELS[snapshot.state] || snapshot.state;
-    const hasTrack = !!snapshot.track;
-    document.getElementById('np-title').textContent = hasTrack ? snapshot.track.title : '';
-    document.getElementById('np-channel').textContent = hasTrack ? snapshot.track.channel : '';
-    document.getElementById('np-duration').textContent = hasTrack ? formatDuration(snapshot.track.duration_secs) : '';
+    function applyNowPlayingContent() {
+      document.getElementById('np-eyebrow').textContent = STATE_LABELS[snapshot.state] || snapshot.state;
+      const hasTrack = !!snapshot.track;
+      document.getElementById('np-title').textContent = hasTrack ? snapshot.track.title : '';
+      document.getElementById('np-channel').textContent = hasTrack ? snapshot.track.channel : '';
+      document.getElementById('np-duration').textContent = hasTrack ? formatDuration(snapshot.track.duration_secs) : '';
+    }
+
+    if (shouldCrossfade) {
+      crossfadeNowPlaying(applyNowPlayingContent);
+      pulseNowPlayingArt();
+    } else {
+      applyNowPlayingContent();
+    }
 
     renderHeroOrEmpty(snapshot);
     renderQueue(snapshot);
@@ -702,8 +939,8 @@
     document.getElementById('skip-btn').disabled = transportDisabled;
     document.getElementById('stop-btn').disabled = transportDisabled;
 
-    document.getElementById('play-icon').style.display = snapshot.state === 'playing' ? 'none' : 'block';
-    document.getElementById('pause-icon').style.display = snapshot.state === 'playing' ? 'block' : 'none';
+    document.getElementById('play-icon').classList.toggle('visible', snapshot.state !== 'playing');
+    document.getElementById('pause-icon').classList.toggle('visible', snapshot.state === 'playing');
 
     const radioBtn = document.getElementById('radio-btn');
     radioBtn.classList.toggle('active', !!snapshot.radio_enabled);
@@ -719,10 +956,10 @@
       const response = await api(`/api/guilds/${currentGuildId}/${path}`, options);
       const body = await response.json();
       if (!response.ok) {
-        statusLine.textContent = body.error || 'Something went wrong.';
+        showStatus(body.error || 'Something went wrong.', { isError: true });
         return;
       }
-      statusLine.textContent = '';
+      showStatus('');
       renderSnapshot(body);
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
@@ -771,19 +1008,28 @@
     searchEmptyNote.style.display = 'none';
   }
 
+  function createSearchRow(track) {
+    const row = createTrackRow(track);
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'outline-btn';
+    addBtn.textContent = 'Add';
+    addBtn.addEventListener('click', () => addToQueue(row._videoId, row._title));
+    row.appendChild(addBtn);
+    row._videoId = track.video_id;
+    row._title = track.title;
+    return row;
+  }
+
+  function updateSearchRow(row, track) {
+    updateTrackRowContent(row, track);
+    row._videoId = track.video_id;
+    row._title = track.title;
+  }
+
   function renderSearchResults(tracks) {
-    searchResults.innerHTML = '';
     searchEmptyNote.style.display = tracks.length === 0 ? 'block' : 'none';
-    for (const track of tracks) {
-      const row = createTrackRow(track);
-      const addBtn = document.createElement('button');
-      addBtn.type = 'button';
-      addBtn.className = 'outline-btn';
-      addBtn.textContent = 'Add';
-      addBtn.addEventListener('click', () => addToQueue(track.video_id, track.title));
-      row.appendChild(addBtn);
-      searchResults.appendChild(row);
-    }
+    reconcileList(searchResults, tracks, (track) => track.video_id, createSearchRow, updateSearchRow);
   }
 
   async function runSearch(query) {
@@ -793,12 +1039,12 @@
       const body = await response.json();
       if (seq !== searchSeq) return; // a newer search superseded this one
       if (!response.ok) {
-        statusLine.textContent = body.error || 'Search failed.';
+        showStatus(body.error || 'Search failed.', { isError: true });
         searchResults.innerHTML = '';
         searchEmptyNote.style.display = 'none';
         return;
       }
-      statusLine.textContent = '';
+      showStatus('');
       renderSearchResults(body);
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
@@ -823,11 +1069,11 @@
       });
       const body = await response.json();
       if (!response.ok) {
-        statusLine.textContent = body.error || 'Could not add that track.';
+        showStatus(body.error || 'Could not add that track.', { isError: true });
         return;
       }
       renderSnapshot(body);
-      statusLine.textContent = `Added "${title}" to the queue.`;
+      showStatus(`Added "${title}" to the queue.`);
       loadFavourites(currentGuildId);
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
@@ -883,11 +1129,11 @@
       const response = await api(`/api/guilds/${currentGuildId}/playlists/${id}/play`, { method: 'POST' });
       const body = await response.json();
       if (!response.ok) {
-        statusLine.textContent = body.error || 'Could not start that playlist.';
+        showStatus(body.error || 'Could not start that playlist.', { isError: true });
         return;
       }
       renderSnapshot(body);
-      statusLine.textContent = `Playing "${name}".`;
+      showStatus(`Playing "${name}".`);
       loadFavourites(currentGuildId);
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
@@ -898,59 +1144,76 @@
   const favouritePlaylistsRow = document.getElementById('favourite-playlists');
   const favouritePlaylistsEmptyNote = document.getElementById('favourite-playlists-empty-note');
 
+  function applyFavouriteDuration(row, track) {
+    const durationEl = row.querySelector('.compact-duration');
+    const base = formatDuration(track.duration_secs);
+    const playCountText = `played ${track.play_count}×`;
+    durationEl.textContent = base ? `${base} · ${playCountText}` : playCountText;
+  }
+
+  function createFavouriteTrackRow(track) {
+    const row = createTrackRow(track);
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'outline-btn';
+    addBtn.textContent = 'Add';
+    addBtn.addEventListener('click', () => addToQueue(row._videoId, row._title));
+    row.appendChild(addBtn);
+    updateFavouriteTrackRow(row, track);
+    return row;
+  }
+
+  function updateFavouriteTrackRow(row, track) {
+    updateTrackRowContent(row, track);
+    applyFavouriteDuration(row, track);
+    row._videoId = track.video_id;
+    row._title = track.title;
+  }
+
   function renderFavouriteTracks(tracks) {
-    favouriteTracksList.innerHTML = '';
     favouriteTracksEmptyNote.style.display = tracks.length === 0 ? 'block' : 'none';
-    for (const track of tracks) {
-      const row = createTrackRow(track);
-      const durationEl = row.querySelector('.compact-duration');
-      const playCountText = `played ${track.play_count}×`;
-      durationEl.textContent = durationEl.textContent
-        ? `${durationEl.textContent} · ${playCountText}`
-        : playCountText;
+    reconcileList(favouriteTracksList, tracks, (track) => track.video_id, createFavouriteTrackRow, updateFavouriteTrackRow);
+  }
 
-      const addBtn = document.createElement('button');
-      addBtn.type = 'button';
-      addBtn.className = 'outline-btn';
-      addBtn.textContent = 'Add';
-      addBtn.addEventListener('click', () => addToQueue(track.video_id, track.title));
-      row.appendChild(addBtn);
+  function createFavPlaylistChip(playlist) {
+    const chip = document.createElement('div');
+    chip.className = 'playlist-chip';
 
-      favouriteTracksList.appendChild(row);
-    }
+    const cover = document.createElement('div');
+    cover.className = 'playlist-cover';
+    chip.appendChild(cover);
+
+    const name = document.createElement('div');
+    name.className = 'playlist-name';
+    chip.appendChild(name);
+
+    const count = document.createElement('div');
+    count.className = 'playlist-count';
+    chip.appendChild(count);
+
+    const playBtn = document.createElement('button');
+    playBtn.type = 'button';
+    playBtn.className = 'primary-btn small';
+    playBtn.textContent = 'Play';
+    playBtn.addEventListener('click', () => playPlaylist(chip._playlistId, chip._playlistName));
+    chip.appendChild(playBtn);
+
+    updateFavPlaylistChip(chip, playlist);
+    return chip;
+  }
+
+  function updateFavPlaylistChip(chip, playlist) {
+    chip.querySelector('.playlist-cover').style.background = hueGradient(hueFromId(String(playlist.id)));
+    chip.querySelector('.playlist-name').textContent = playlist.name;
+    chip.querySelector('.playlist-count').textContent =
+      `Played ${playlist.play_count} time${playlist.play_count === 1 ? '' : 's'}`;
+    chip._playlistId = playlist.id;
+    chip._playlistName = playlist.name;
   }
 
   function renderFavouritePlaylists(playlists) {
-    favouritePlaylistsRow.innerHTML = '';
     favouritePlaylistsEmptyNote.style.display = playlists.length === 0 ? 'block' : 'none';
-    for (const playlist of playlists) {
-      const chip = document.createElement('div');
-      chip.className = 'playlist-chip';
-
-      const cover = document.createElement('div');
-      cover.className = 'playlist-cover';
-      cover.style.background = hueGradient(hueFromId(String(playlist.id)));
-      chip.appendChild(cover);
-
-      const name = document.createElement('div');
-      name.className = 'playlist-name';
-      name.textContent = playlist.name;
-      chip.appendChild(name);
-
-      const count = document.createElement('div');
-      count.className = 'playlist-count';
-      count.textContent = `Played ${playlist.play_count} time${playlist.play_count === 1 ? '' : 's'}`;
-      chip.appendChild(count);
-
-      const playBtn = document.createElement('button');
-      playBtn.type = 'button';
-      playBtn.className = 'primary-btn small';
-      playBtn.textContent = 'Play';
-      playBtn.addEventListener('click', () => playPlaylist(playlist.id, playlist.name));
-      chip.appendChild(playBtn);
-
-      favouritePlaylistsRow.appendChild(chip);
-    }
+    reconcileList(favouritePlaylistsRow, playlists, (playlist) => String(playlist.id), createFavPlaylistChip, updateFavPlaylistChip);
   }
 
   async function loadFavourites(guildId) {
