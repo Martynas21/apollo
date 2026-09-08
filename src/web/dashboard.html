@@ -256,7 +256,7 @@
   }
   .search-bar input { flex: 1; background: none; border: none; outline: none; color: var(--text); font-size: 13.5px; }
   .search-bar input::placeholder { color: var(--text-faint); }
-  .scroll-list { display: flex; flex-direction: column; gap: 2px; max-height: 178px; overflow-y: auto; }
+  .scroll-list { display: flex; flex-direction: column; gap: 2px; max-height: 178px; overflow-y: auto; overflow-x: hidden; }
   .compact-row {
     position: relative;
     display: grid; grid-template-columns: 34px 1fr auto auto; gap: 10px; align-items: center; padding: 7px 4px; border-radius: 8px;
@@ -919,8 +919,6 @@
     row.querySelector('.compact-duration').textContent = formatDuration(track.duration_secs);
   }
 
-  const UP_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>';
-  const DOWN_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
   const REMOVE_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
   const GRIP_ICON = '<svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="2.5" cy="2.5" r="1.5"/><circle cx="7.5" cy="2.5" r="1.5"/><circle cx="2.5" cy="8" r="1.5"/><circle cx="7.5" cy="8" r="1.5"/><circle cx="2.5" cy="13.5" r="1.5"/><circle cx="7.5" cy="13.5" r="1.5"/></svg>';
 
@@ -1099,12 +1097,12 @@
     return handle;
   }
 
-  // The queue's move-up/move-down/remove buttons act on the row's position,
-  // which can change across renders even when the row itself persists (e.g.
-  // a track at position 2 moves to position 1). The row's current index is
-  // stashed on `dataset.index` by updateQueueRow on every reconcile, and the
-  // click handlers read it at click-time instead of closing over a stale
-  // index captured when the row was first created.
+  // The queue's remove button acts on the row's position, which can change
+  // across renders even when the row itself persists (e.g. a track at
+  // position 2 moves to position 1). The row's current index is stashed on
+  // `dataset.index` by updateQueueRow on every reconcile, and the click
+  // handler reads it at click-time instead of closing over a stale index
+  // captured when the row was first created.
   function createQueueRow(track, index, items) {
     const row = createTrackRow(track);
     row.classList.add('queue-row');
@@ -1113,36 +1111,18 @@
     const actions = document.createElement('div');
     actions.className = 'compact-actions';
 
-    const upBtn = makeMiniIconBtn(UP_ICON, 'Move up', false, false);
-    upBtn.addEventListener('click', () => {
-      const i = Number(row.dataset.index);
-      moveQueueTrack(i, i - 1);
-    });
-    actions.appendChild(upBtn);
-
-    const downBtn = makeMiniIconBtn(DOWN_ICON, 'Move down', false, false);
-    downBtn.addEventListener('click', () => {
-      const i = Number(row.dataset.index);
-      moveQueueTrack(i, i + 1);
-    });
-    actions.appendChild(downBtn);
-
     const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Remove', false, true);
     removeBtn.addEventListener('click', () => removeQueueTrack(Number(row.dataset.index)));
     actions.appendChild(removeBtn);
 
     row.appendChild(actions);
-    row._upBtn = upBtn;
-    row._downBtn = downBtn;
     updateQueueRow(row, track, index, items);
     return row;
   }
 
-  function updateQueueRow(row, track, index, items) {
+  function updateQueueRow(row, track, index) {
     updateTrackRowContent(row, track);
     row.dataset.index = String(index);
-    row._upBtn.disabled = index === 0;
-    row._downBtn.disabled = index === items.length - 1;
   }
 
   function renderQueue(snapshot) {
