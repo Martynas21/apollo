@@ -304,7 +304,9 @@
 
   /* Favourites card */
   .favourites-card { grid-area: favourites; }
-  .favourites-section + .favourites-section { margin-top: 20px; }
+  .favourites-section + .favourites-section {
+    margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--border-soft);
+  }
 
   /* Playlists bottom strip */
   .playlists-strip { grid-area: playlists; }
@@ -1074,9 +1076,9 @@
     const { row, handle, pointerId, startIndex, tentativeIndex, moveHandler, upHandler, cancelHandler } = dragState;
 
     try { handle.releasePointerCapture(pointerId); } catch (err) { /* already released */ }
-    handle.removeEventListener('pointermove', moveHandler);
-    handle.removeEventListener('pointerup', upHandler);
-    handle.removeEventListener('pointercancel', cancelHandler);
+    document.removeEventListener('pointermove', moveHandler);
+    document.removeEventListener('pointerup', upHandler);
+    document.removeEventListener('pointercancel', cancelHandler);
 
     row.classList.remove('dragging');
     row.style.transform = '';
@@ -1092,6 +1094,19 @@
   function onDragPointerDown(event, row, handle) {
     if (dragState || event.button !== 0) return;
     event.preventDefault();
+    // setPointerCapture keeps the initial press pinned to `handle` even if
+    // the cursor slips off it before the first move. It doesn't survive the
+    // rest of the drag, though: reorderDom moves `row` (and thus `handle`)
+    // to a new spot in the list via insertBefore/appendChild, and that DOM
+    // reparenting silently drops capture. Once dropped, move/up would only
+    // reach `handle` while the cursor happens to still be exactly over its
+    // 18px width -- reliable when dragging slowly, but a fast drag easily
+    // outruns the row's per-frame transform compensation and slips off,
+    // silently killing the rest of the drag (dragState never clears,
+    // queueDragActive stays stuck true, freezing all further queue
+    // reconciliation). Listening on `document` instead means move/up keep
+    // arriving regardless of where the cursor actually is or whether
+    // capture survived.
     handle.setPointerCapture(event.pointerId);
 
     const rows = getQueueRows();
@@ -1119,9 +1134,9 @@
     document.body.style.userSelect = 'none';
     queueDragActive = true;
 
-    handle.addEventListener('pointermove', dragState.moveHandler);
-    handle.addEventListener('pointerup', dragState.upHandler);
-    handle.addEventListener('pointercancel', dragState.cancelHandler);
+    document.addEventListener('pointermove', dragState.moveHandler);
+    document.addEventListener('pointerup', dragState.upHandler);
+    document.addEventListener('pointercancel', dragState.cancelHandler);
   }
 
   function makeDragHandle(row) {
