@@ -429,6 +429,61 @@ pub async fn list_playlists(
     Json(playlists_json).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct ImportPlaylistRequest {
+    url: String,
+}
+
+pub async fn import_playlist(
+    State(state): State<WebState>,
+    Path(guild_id): Path<String>,
+    Json(body): Json<ImportPlaylistRequest>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+
+    let listing = match state.player.list_playlist(&body.url).await {
+        Ok(listing) => listing,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    if listing.tracks.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "that playlist is empty or could not be found",
+        );
+    }
+
+    let name = listing.title.clone().unwrap_or_else(|| body.url.clone());
+    let added_by = state.cache.current_user().id.to_string();
+    let id = match db::save_guild_playlist(
+        &state.db,
+        &guild_id.to_string(),
+        &name,
+        &body.url,
+        &added_by,
+    )
+    .await
+    {
+        Ok(id) => id,
+        Err(err) => {
+            tracing::warn!(%err, "dashboard failed to save imported playlist");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to save playlist");
+        }
+    };
+
+    if let Err(err) = db::replace_playlist_tracks(&state.db, id, &listing.tracks).await {
+        tracing::warn!(%err, playlist_id = id, "failed to cache playlist tracks after import");
+    }
+
+    Json(PlaylistJson {
+        id,
+        name,
+        track_count: listing.tracks.len(),
+    })
+    .into_response()
+}
+
 pub async fn play_playlist(
     State(state): State<WebState>,
     Path((guild_id, playlist_id)): Path<(String, i64)>,

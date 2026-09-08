@@ -1238,6 +1238,17 @@
     return null;
   }
 
+  // Faithful mirror of the backend's looks_like_playlist_url
+  // (src/commands/playback.rs) so "is this a playlist link" is decided
+  // identically client-side and server-side.
+  function looksLikePlaylistUrl(input) {
+    let url;
+    try { url = new URL(input); } catch { return false; }
+    const host = url.hostname;
+    const recognizedHost = host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com');
+    return recognizedHost && url.searchParams.has('list');
+  }
+
   const topbarSearch = document.getElementById('topbar-search');
   const searchDropdown = document.getElementById('search-dropdown');
   const searchInput = document.getElementById('search-input');
@@ -1324,12 +1335,17 @@
       return;
     }
     const isLink = extractVideoId(query) !== null;
-    if (isLink) {
+    const isPlaylistLink = !isLink && looksLikePlaylistUrl(query);
+    if (isLink || isPlaylistLink) {
       // There's nothing meaningful to show while a link resolves — clear any
       // stale result list immediately instead of leaving it visible mid-flight.
       searchResults.innerHTML = '';
       searchEmptyNote.style.display = 'none';
       closeSearchDropdown();
+    }
+    if (isPlaylistLink) {
+      searchDebounce = setTimeout(() => importPlaylistFromSearch(query), 300);
+      return;
     }
     searchDebounce = setTimeout(() => runSearch(query, isLink), 300);
   });
@@ -1353,6 +1369,24 @@
       renderSnapshot(body);
       showStatus(`Added "${title}" to the queue.`);
       loadFavourites(currentGuildId);
+    } catch (err) { /* showLogin already handled unauthorized */ }
+  }
+
+  async function importPlaylistFromSearch(url) {
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/playlists/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        showStatus(body.error || 'Could not import that playlist.', { isError: true });
+        return;
+      }
+      searchInput.value = '';
+      showStatus(`Imported "${body.name}" (${body.track_count} track${body.track_count === 1 ? '' : 's'}).`);
+      loadPlaylists(currentGuildId);
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
 

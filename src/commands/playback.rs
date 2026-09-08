@@ -51,7 +51,7 @@ pub(crate) fn extract_video_id(input: &str) -> Option<String> {
     None
 }
 
-fn looks_like_playlist_url(input: &str) -> bool {
+pub(crate) fn looks_like_playlist_url(input: &str) -> bool {
     let Ok(url) = url::Url::parse(input) else {
         return false;
     };
