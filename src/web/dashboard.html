@@ -101,10 +101,11 @@
     flex: 1;
     display: grid;
     grid-template-columns: 1.55fr 1fr;
-    grid-template-rows: auto auto auto;
+    grid-template-rows: auto auto auto auto;
     grid-template-areas:
       "now search"
       "now queue"
+      "favourites favourites"
       "playlists playlists";
     gap: 24px;
     padding: 32px 40px;
@@ -117,6 +118,10 @@
   .card-title {
     font-family: 'Spectral', serif; font-size: 15px; font-weight: 600; margin: 0 0 16px;
     display: flex; align-items: center;
+  }
+  .section-label {
+    font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--text-faint); margin: 0 0 8px;
   }
   .count-badge { margin-left: 8px; font-size: 11.5px; font-weight: 600; font-family: 'Manrope'; background: var(--bg); color: var(--text-muted); padding: 2px 8px; border-radius: 999px; }
   .card-header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
@@ -210,6 +215,10 @@
   }
   .outline-btn:hover { background: color-mix(in oklch, var(--accent) 15%, transparent); }
   .muted-note { font-size: 12.5px; color: var(--text-faint); margin: 6px 2px; }
+
+  /* Favourites card */
+  .favourites-card { grid-area: favourites; }
+  .favourites-section + .favourites-section { margin-top: 20px; }
 
   /* Playlists bottom strip */
   .playlists-strip { grid-area: playlists; }
@@ -361,6 +370,22 @@
       <div class="muted-note" id="queue-empty-note" style="display:none">Queue is empty — add something from Search.</div>
     </section>
 
+    <section class="card favourites-card">
+      <h2 class="card-title">Favourites</h2>
+
+      <div class="favourites-section">
+        <div class="section-label">Most Played Tracks</div>
+        <div class="scroll-list" id="favourite-tracks"></div>
+        <div class="muted-note" id="favourite-tracks-empty-note" style="display:none">No plays yet — favourites show up once tracks have been played.</div>
+      </div>
+
+      <div class="favourites-section">
+        <div class="section-label">Most Played Playlists</div>
+        <div class="playlist-row" id="favourite-playlists"></div>
+        <div class="muted-note" id="favourite-playlists-empty-note" style="display:none">No playlists played yet.</div>
+      </div>
+    </section>
+
     <section class="card playlists-strip">
       <h2 class="card-title">Playlists</h2>
       <div class="playlist-row" id="playlist-row"></div>
@@ -380,6 +405,7 @@
   let volumeDebounce = null;
   let searchDebounce = null;
   let searchSeq = 0;
+  let lastSeenPlayingVideoId = null;
 
   const loginScreen = document.getElementById('login-screen');
   const dashboard = document.getElementById('dashboard');
@@ -524,6 +550,7 @@
     connectSocket(guildId);
     clearSearch();
     loadPlaylists(guildId);
+    loadFavourites(guildId);
   }
 
   function connectSocket(guildId) {
@@ -655,6 +682,12 @@
   }
 
   function renderSnapshot(snapshot) {
+    const playingVideoId = snapshot.track ? snapshot.track.video_id : null;
+    if (snapshot.state === 'playing' && playingVideoId !== lastSeenPlayingVideoId) {
+      loadFavourites(currentGuildId);
+    }
+    lastSeenPlayingVideoId = playingVideoId;
+
     document.getElementById('np-eyebrow').textContent = STATE_LABELS[snapshot.state] || snapshot.state;
     const hasTrack = !!snapshot.track;
     document.getElementById('np-title').textContent = hasTrack ? snapshot.track.title : '';
@@ -795,6 +828,7 @@
       }
       renderSnapshot(body);
       statusLine.textContent = `Added "${title}" to the queue.`;
+      loadFavourites(currentGuildId);
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
 
@@ -854,6 +888,82 @@
       }
       renderSnapshot(body);
       statusLine.textContent = `Playing "${name}".`;
+      loadFavourites(currentGuildId);
+    } catch (err) { /* showLogin already handled unauthorized */ }
+  }
+
+  // ---- Favourites ----
+  const favouriteTracksList = document.getElementById('favourite-tracks');
+  const favouriteTracksEmptyNote = document.getElementById('favourite-tracks-empty-note');
+  const favouritePlaylistsRow = document.getElementById('favourite-playlists');
+  const favouritePlaylistsEmptyNote = document.getElementById('favourite-playlists-empty-note');
+
+  function renderFavouriteTracks(tracks) {
+    favouriteTracksList.innerHTML = '';
+    favouriteTracksEmptyNote.style.display = tracks.length === 0 ? 'block' : 'none';
+    for (const track of tracks) {
+      const row = createTrackRow(track);
+      const durationEl = row.querySelector('.compact-duration');
+      const playCountText = `played ${track.play_count}×`;
+      durationEl.textContent = durationEl.textContent
+        ? `${durationEl.textContent} · ${playCountText}`
+        : playCountText;
+
+      const addBtn = document.createElement('button');
+      addBtn.type = 'button';
+      addBtn.className = 'outline-btn';
+      addBtn.textContent = 'Add';
+      addBtn.addEventListener('click', () => addToQueue(track.video_id, track.title));
+      row.appendChild(addBtn);
+
+      favouriteTracksList.appendChild(row);
+    }
+  }
+
+  function renderFavouritePlaylists(playlists) {
+    favouritePlaylistsRow.innerHTML = '';
+    favouritePlaylistsEmptyNote.style.display = playlists.length === 0 ? 'block' : 'none';
+    for (const playlist of playlists) {
+      const chip = document.createElement('div');
+      chip.className = 'playlist-chip';
+
+      const cover = document.createElement('div');
+      cover.className = 'playlist-cover';
+      cover.style.background = hueGradient(hueFromId(String(playlist.id)));
+      chip.appendChild(cover);
+
+      const name = document.createElement('div');
+      name.className = 'playlist-name';
+      name.textContent = playlist.name;
+      chip.appendChild(name);
+
+      const count = document.createElement('div');
+      count.className = 'playlist-count';
+      count.textContent = `Played ${playlist.play_count} time${playlist.play_count === 1 ? '' : 's'}`;
+      chip.appendChild(count);
+
+      const playBtn = document.createElement('button');
+      playBtn.type = 'button';
+      playBtn.className = 'primary-btn small';
+      playBtn.textContent = 'Play';
+      playBtn.addEventListener('click', () => playPlaylist(playlist.id, playlist.name));
+      chip.appendChild(playBtn);
+
+      favouritePlaylistsRow.appendChild(chip);
+    }
+  }
+
+  async function loadFavourites(guildId) {
+    try {
+      const response = await api(`/api/guilds/${guildId}/favourites`);
+      if (!response.ok) {
+        renderFavouriteTracks([]);
+        renderFavouritePlaylists([]);
+        return;
+      }
+      const body = await response.json();
+      renderFavouriteTracks(body.tracks);
+      renderFavouritePlaylists(body.playlists);
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
 
