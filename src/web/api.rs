@@ -448,6 +448,7 @@ struct PlaylistJson {
     id: i64,
     name: String,
     track_count: usize,
+    thumbnail_video_id: Option<String>,
 }
 
 pub async fn list_playlists(
@@ -471,8 +472,8 @@ pub async fn list_playlists(
 
     let mut playlists_json = Vec::with_capacity(playlists.len());
     for playlist in playlists {
-        let track_count = match db::get_playlist_tracks(&state.db, playlist.id).await {
-            Ok(tracks) => tracks.len(),
+        let tracks = match db::get_playlist_tracks(&state.db, playlist.id).await {
+            Ok(tracks) => tracks,
             Err(err) => {
                 tracing::warn!(%err, "dashboard failed to load playlist track count");
                 return error_response(
@@ -481,10 +482,12 @@ pub async fn list_playlists(
                 );
             }
         };
+        let thumbnail_video_id = tracks.first().map(|track| track.video_id.clone());
         playlists_json.push(PlaylistJson {
             id: playlist.id,
             name: playlist.name,
-            track_count,
+            track_count: tracks.len(),
+            thumbnail_video_id,
         });
     }
 
@@ -538,10 +541,12 @@ pub async fn import_playlist(
         tracing::warn!(%err, playlist_id = id, "failed to cache playlist tracks after import");
     }
 
+    let thumbnail_video_id = listing.tracks.first().map(|track| track.video_id.clone());
     Json(PlaylistJson {
         id,
         name,
         track_count: listing.tracks.len(),
+        thumbnail_video_id,
     })
     .into_response()
 }
@@ -606,6 +611,7 @@ struct FavouritePlaylistJson {
     id: i64,
     name: String,
     play_count: i64,
+    thumbnail_video_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -652,14 +658,26 @@ pub async fn favourites(State(state): State<WebState>, Path(guild_id): Path<Stri
             play_count: t.play_count,
         })
         .collect();
-    let playlists = playlists
-        .into_iter()
-        .map(|p| FavouritePlaylistJson {
+    let mut playlists_json = Vec::with_capacity(playlists.len());
+    for p in playlists {
+        let thumbnail_video_id = match db::get_playlist_thumbnail_video_id(&state.db, p.id).await {
+            Ok(thumbnail_video_id) => thumbnail_video_id,
+            Err(err) => {
+                tracing::warn!(%err, "dashboard failed to load favourite playlist thumbnail");
+                None
+            }
+        };
+        playlists_json.push(FavouritePlaylistJson {
             id: p.id,
             name: p.name,
             play_count: p.play_count,
-        })
-        .collect();
+            thumbnail_video_id,
+        });
+    }
 
-    Json(FavouritesJson { tracks, playlists }).into_response()
+    Json(FavouritesJson {
+        tracks,
+        playlists: playlists_json,
+    })
+    .into_response()
 }

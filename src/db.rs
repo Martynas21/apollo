@@ -193,6 +193,21 @@ pub async fn delete_guild_playlist(pool: &SqlitePool, guild_id: &str, id: i64) -
     Ok(result.rows_affected() > 0)
 }
 
+pub async fn get_playlist_thumbnail_video_id(
+    pool: &SqlitePool,
+    playlist_id: i64,
+) -> Result<Option<String>> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT video_id FROM playlist_tracks WHERE playlist_id = ?1 ORDER BY position LIMIT 1",
+    )
+    .bind(playlist_id)
+    .fetch_optional(pool)
+    .await
+    .context("failed to fetch playlist thumbnail track")?;
+
+    Ok(row.map(|(video_id,)| video_id))
+}
+
 pub async fn get_playlist_tracks(pool: &SqlitePool, playlist_id: i64) -> Result<Vec<Track>> {
     let rows: Vec<(String, String, String, Option<i64>)> = sqlx::query_as(
         "SELECT video_id, title, channel, duration_secs FROM playlist_tracks \

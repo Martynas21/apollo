@@ -282,7 +282,8 @@
   }
   .drag-handle:hover { color: var(--text-muted); }
   .drag-handle:active { cursor: grabbing; }
-  .compact-thumb { width: 34px; height: 34px; border-radius: 7px; flex-shrink: 0; }
+  .compact-thumb { width: 34px; height: 34px; border-radius: 7px; flex-shrink: 0; position: relative; overflow: hidden; }
+  .compact-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
   .compact-meta { min-width: 0; }
   .compact-title-line { display: flex; align-items: center; gap: 6px; }
   .compact-title { font-size: 12.5px; color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -318,7 +319,9 @@
   }
   .playlist-cover {
     width: 100%; aspect-ratio: 1; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: rgba(255,255,255,.9);
+    position: relative; overflow: hidden;
   }
+  .playlist-cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
   .playlist-name { font-family: 'Spectral', serif; font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .playlist-count { font-size: 11.5px; color: var(--text-muted); margin-top: -4px; }
 
@@ -657,6 +660,21 @@
     return `linear-gradient(135deg, hsl(${hue}, 65%, 55%), hsl(${hue2}, 70%, 45%))`;
   }
 
+  // Lays the gradient down first (so it's there instantly and stays as the
+  // fallback), then loads a real YouTube thumbnail over it in the background
+  // — dropping the img on error/no-id leaves the gradient showing through.
+  function applyThumbnail(el, videoId, gradientSeed) {
+    el.style.background = hueGradient(hueFromId(gradientSeed));
+    el.innerHTML = '';
+    if (!videoId) return;
+    const img = document.createElement('img');
+    img.src = `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
+    img.alt = '';
+    img.loading = 'lazy';
+    img.addEventListener('error', () => img.remove());
+    el.appendChild(img);
+  }
+
   // ---- Server switcher ----
   const serverSwitcher = document.getElementById('server-switcher');
   const serverMenu = document.getElementById('server-menu');
@@ -883,7 +901,7 @@
 
     const thumb = document.createElement('div');
     thumb.className = 'compact-thumb';
-    thumb.style.background = hueGradient(hueFromId(track.video_id));
+    applyThumbnail(thumb, track.video_id, track.video_id);
     row.appendChild(thumb);
 
     const meta = document.createElement('div');
@@ -913,7 +931,7 @@
   // recreating the element — used by every list's updateRow so persisting
   // rows keep their identity across reconciles.
   function updateTrackRowContent(row, track) {
-    row.querySelector('.compact-thumb').style.background = hueGradient(hueFromId(track.video_id));
+    applyThumbnail(row.querySelector('.compact-thumb'), track.video_id, track.video_id);
     row.querySelector('.compact-title').textContent = track.title;
     row.querySelector('.compact-channel').textContent = track.channel;
     row.querySelector('.compact-duration').textContent = formatDuration(track.duration_secs);
@@ -1580,6 +1598,10 @@
   // ---- Playlists ----
   const playlistRow = document.getElementById('playlist-row');
 
+  function applyPlaylistCover(cover, playlist) {
+    applyThumbnail(cover, playlist.thumbnail_video_id, String(playlist.id));
+  }
+
   function renderPlaylists(playlists) {
     playlistRow.innerHTML = '';
     for (const playlist of playlists) {
@@ -1588,7 +1610,7 @@
 
       const cover = document.createElement('div');
       cover.className = 'playlist-cover';
-      cover.style.background = hueGradient(hueFromId(String(playlist.id)));
+      applyPlaylistCover(cover, playlist);
       chip.appendChild(cover);
 
       const name = document.createElement('div');
@@ -1706,7 +1728,7 @@
   }
 
   function updateFavPlaylistChip(chip, playlist) {
-    chip.querySelector('.playlist-cover').style.background = hueGradient(hueFromId(String(playlist.id)));
+    applyPlaylistCover(chip.querySelector('.playlist-cover'), playlist);
     chip.querySelector('.playlist-name').textContent = playlist.name;
     chip.querySelector('.playlist-count').textContent =
       `Played ${playlist.play_count} time${playlist.play_count === 1 ? '' : 's'}`;
