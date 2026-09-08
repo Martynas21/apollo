@@ -118,13 +118,24 @@
   .server-row:hover { background: var(--bg-hover); color: var(--text); }
   .server-row.active { color: var(--accent); background: color-mix(in oklch, var(--accent) 12%, transparent); }
 
+  .topbar-search { position: relative; flex: 1; max-width: 480px; margin: 0 28px; }
+  .search-dropdown {
+    position: absolute; top: calc(100% + 8px); left: 0; right: 0;
+    background: var(--bg-elevated); border: 1px solid var(--border-soft);
+    border-radius: 12px; padding: 10px; box-shadow: 0 12px 28px rgba(0,0,0,.4);
+    z-index: 20;
+    opacity: 0; transform: translateY(-6px); pointer-events: none;
+    transition: opacity .15s ease-out, transform .15s ease-out;
+  }
+  .search-dropdown.open { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  .search-dropdown .scroll-list { max-height: 320px; }
+
   .dashboard-grid {
     flex: 1;
     display: grid;
-    grid-template-columns: 1.55fr 1fr;
-    grid-template-rows: auto auto auto auto;
+    grid-template-columns: 2fr 1fr;
+    grid-template-rows: auto auto auto;
     grid-template-areas:
-      "now search"
       "now queue"
       "favourites favourites"
       "playlists playlists";
@@ -228,12 +239,11 @@
   .ghost-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
   .ghost-btn.danger:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
 
-  /* Search + Queue side cards */
-  .search-card { grid-area: search; }
+  /* Queue side card */
   .queue-card { grid-area: queue; }
   .search-bar {
     display: flex; align-items: center; gap: 10px; background: var(--bg); border: 1px solid var(--border-soft);
-    border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; color: var(--text-faint);
+    border-radius: 10px; padding: 10px 14px; color: var(--text-faint);
   }
   .search-bar input { flex: 1; background: none; border: none; outline: none; color: var(--text); font-size: 13.5px; }
   .search-bar input::placeholder { color: var(--text-faint); }
@@ -347,6 +357,16 @@
       </svg>
       <span class="brand-word">APOLLO</span>
     </div>
+    <div class="topbar-search" id="topbar-search">
+      <div class="search-bar">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="search-input" placeholder="Search YouTube or paste a URL">
+      </div>
+      <div class="search-dropdown" id="search-dropdown">
+        <div class="scroll-list" id="search-results"></div>
+        <div class="muted-note" id="search-empty-note" style="display:none">No matches — try a different search term.</div>
+      </div>
+    </div>
     <div class="topbar-right">
       <div class="server-switcher" id="server-switcher">
         <button class="server-btn" id="server-btn" type="button">
@@ -420,16 +440,6 @@
           </div>
         </div>
       </div>
-    </section>
-
-    <section class="card search-card">
-      <h2 class="card-title">Search</h2>
-      <div class="search-bar">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <input type="text" id="search-input" placeholder="Search YouTube or paste a URL">
-      </div>
-      <div class="scroll-list" id="search-results"></div>
-      <div class="muted-note" id="search-empty-note" style="display:none">No matches — try a different search term.</div>
     </section>
 
     <section class="card queue-card">
@@ -597,6 +607,7 @@
 
   document.addEventListener('click', (event) => {
     if (!serverSwitcher.contains(event.target)) closeServerMenu();
+    if (!topbarSearch.contains(event.target)) closeSearchDropdown();
   });
 
   function renderServerMenu() {
@@ -1215,14 +1226,25 @@
     return null;
   }
 
+  const topbarSearch = document.getElementById('topbar-search');
+  const searchDropdown = document.getElementById('search-dropdown');
   const searchInput = document.getElementById('search-input');
   const searchResults = document.getElementById('search-results');
   const searchEmptyNote = document.getElementById('search-empty-note');
+
+  function openSearchDropdown() {
+    searchDropdown.classList.add('open');
+  }
+
+  function closeSearchDropdown() {
+    searchDropdown.classList.remove('open');
+  }
 
   function clearSearch() {
     searchInput.value = '';
     searchResults.innerHTML = '';
     searchEmptyNote.style.display = 'none';
+    closeSearchDropdown();
   }
 
   function createSearchRow(track) {
@@ -1231,7 +1253,10 @@
     addBtn.type = 'button';
     addBtn.className = 'outline-btn';
     addBtn.textContent = 'Add';
-    addBtn.addEventListener('click', () => addToQueue(row._videoId, row._title));
+    addBtn.addEventListener('click', () => {
+      addToQueue(row._videoId, row._title);
+      closeSearchDropdown();
+    });
     row.appendChild(addBtn);
     row._videoId = track.video_id;
     row._title = track.title;
@@ -1247,6 +1272,7 @@
   function renderSearchResults(tracks) {
     searchEmptyNote.style.display = tracks.length === 0 ? 'block' : 'none';
     reconcileList(searchResults, tracks, (track) => track.video_id, createSearchRow, updateSearchRow);
+    openSearchDropdown();
   }
 
   async function runSearch(query, isLink) {
@@ -1259,6 +1285,7 @@
         showStatus(body.error || 'Search failed.', { isError: true });
         searchResults.innerHTML = '';
         searchEmptyNote.style.display = 'none';
+        closeSearchDropdown();
         return;
       }
       showStatus('');
@@ -1267,6 +1294,7 @@
         searchInput.value = '';
         searchResults.innerHTML = '';
         searchEmptyNote.style.display = 'none';
+        closeSearchDropdown();
         addToQueue(body[0].video_id, body[0].title);
         return;
       }
@@ -1280,6 +1308,7 @@
     if (!query) {
       searchResults.innerHTML = '';
       searchEmptyNote.style.display = 'none';
+      closeSearchDropdown();
       return;
     }
     const isLink = extractVideoId(query) !== null;
@@ -1288,8 +1317,13 @@
       // stale result list immediately instead of leaving it visible mid-flight.
       searchResults.innerHTML = '';
       searchEmptyNote.style.display = 'none';
+      closeSearchDropdown();
     }
     searchDebounce = setTimeout(() => runSearch(query, isLink), 300);
+  });
+
+  searchInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeSearchDropdown();
   });
 
   async function addToQueue(videoId, title) {
