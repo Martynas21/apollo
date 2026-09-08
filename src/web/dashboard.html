@@ -417,6 +417,12 @@
   .channel-row:hover { background: var(--bg-hover); }
   .channel-row-icon { display: flex; flex-shrink: 0; color: var(--text-faint); }
   .channel-row:hover .channel-row-icon { color: var(--accent); }
+  .channel-row-icon.last-used {
+    width: 26px; height: 26px; align-items: center; justify-content: center;
+    border-radius: 8px; color: var(--accent);
+    background: color-mix(in oklch, var(--accent) 16%, transparent);
+    box-shadow: 0 0 16px 2px color-mix(in oklch, var(--accent) 45%, transparent);
+  }
   .channel-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 </head>
@@ -606,6 +612,11 @@
 <script>
 (() => {
   const TOKEN_KEY = 'apollo-dashboard-token';
+  const LAST_GUILD_KEY = 'apollo-dashboard-last-guild';
+  const LAST_CHANNEL_KEY_PREFIX = 'apollo-dashboard-last-channel-';
+  function lastChannelKey(guildId) {
+    return LAST_CHANNEL_KEY_PREFIX + guildId;
+  }
   let token = sessionStorage.getItem(TOKEN_KEY);
   let currentGuildId = null;
   let guilds = [];
@@ -800,7 +811,9 @@
     guilds = await response.json();
     if (guilds.length > 0) {
       renderServerMenu();
-      selectGuild(guilds[0].id);
+      const lastGuildId = localStorage.getItem(LAST_GUILD_KEY);
+      const stillPresent = lastGuildId && guilds.some((g) => g.id === lastGuildId);
+      selectGuild(stillPresent ? lastGuildId : guilds[0].id);
     } else {
       showStatus('Apollo is not in any servers yet.');
     }
@@ -808,6 +821,7 @@
 
   function selectGuild(guildId) {
     currentGuildId = guildId;
+    localStorage.setItem(LAST_GUILD_KEY, guildId);
     const guild = guilds.find((g) => g.id === guildId);
     if (guild) updateServerButton(guild);
     renderServerMenu();
@@ -1492,13 +1506,13 @@
     pendingRetryAction = null;
   }
 
-  function createChannelRow(channel) {
+  function createChannelRow(channel, isLastUsed) {
     const row = document.createElement('button');
     row.type = 'button';
     row.className = 'channel-row';
 
     const icon = document.createElement('span');
-    icon.className = 'channel-row-icon';
+    icon.className = 'channel-row-icon' + (isLastUsed ? ' last-used' : '');
     icon.innerHTML = VOICE_ICON;
     row.appendChild(icon);
 
@@ -1524,8 +1538,11 @@
         joinChannelEmptyNote.style.display = 'block';
         return;
       }
+      const lastChannelId = localStorage.getItem(lastChannelKey(currentGuildId));
+      const lastIndex = channels.findIndex((c) => c.id === lastChannelId);
+      if (lastIndex > 0) channels.unshift(channels.splice(lastIndex, 1)[0]);
       for (const channel of channels) {
-        joinChannelList.appendChild(createChannelRow(channel));
+        joinChannelList.appendChild(createChannelRow(channel, channel.id === lastChannelId));
       }
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
@@ -1542,6 +1559,7 @@
         showStatus(body.error || 'Could not join that channel.', { isError: true });
         return;
       }
+      localStorage.setItem(lastChannelKey(currentGuildId), channelId);
       renderSnapshot(body);
       showStatus(`Joined "${channelName}".`);
       const retry = pendingRetryAction;
