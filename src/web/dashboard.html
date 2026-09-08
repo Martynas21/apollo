@@ -235,23 +235,42 @@
   }
   .chip-btn:hover { border-color: var(--border); color: var(--text); }
   .chip-btn.active { background: color-mix(in oklch, var(--accent) 20%, var(--bg-elevated)); border-color: var(--accent); color: var(--accent); }
-  .volume { display: flex; align-items: center; gap: 9px; color: var(--text-muted); flex: 1; }
-  .volume input[type="range"] {
-    appearance: none; -webkit-appearance: none; flex: 1; height: 4px;
+  .volume-popover-wrap { position: relative; }
+  #volume-btn.active { background: color-mix(in oklch, var(--accent) 20%, var(--bg-elevated)); border-color: var(--accent); color: var(--accent); }
+  .volume-popover {
+    position: absolute; bottom: calc(100% + 10px); left: 50%;
+    transform: translateX(-50%) translateY(6px) scale(.96);
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    background: var(--bg-elevated); border: 1px solid var(--border-soft); border-radius: 14px;
+    padding: 14px 11px 16px; box-shadow: 0 14px 32px rgba(0,0,0,.4);
+    opacity: 0; pointer-events: none;
+    transition: opacity .14s ease, transform .14s ease;
+    z-index: 20;
+  }
+  .volume-popover::after {
+    content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+    border: 6px solid transparent; border-top-color: var(--bg-elevated);
+  }
+  .volume-popover.open { opacity: 1; pointer-events: auto; transform: translateX(-50%) translateY(0) scale(1); }
+  .volume-popover-label { font-size: 11.5px; font-weight: 600; color: var(--text-muted); }
+  .volume-slider-wrap { position: relative; width: 24px; height: 108px; }
+  .volume-slider-wrap input[type="range"] {
+    position: absolute; top: 50%; left: 50%; width: 108px; height: 4px;
+    transform: translate(-50%, -50%) rotate(-90deg); transform-origin: center center;
+    appearance: none; -webkit-appearance: none;
     border-radius: 2px; background: var(--bg); outline: none;
   }
-  .volume input[type="range"]::-webkit-slider-thumb {
+  .volume-slider-wrap input[type="range"]::-webkit-slider-thumb {
     appearance: none; -webkit-appearance: none; width: 13px; height: 13px;
     border-radius: 50%; background: var(--accent); border: 2px solid var(--bg-elevated); cursor: pointer;
     transition: transform .12s ease;
   }
-  .volume input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.15); }
-  .volume input[type="range"]::-moz-range-thumb {
+  .volume-slider-wrap input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.15); }
+  .volume-slider-wrap input[type="range"]::-moz-range-thumb {
     width: 13px; height: 13px; border-radius: 50%; background: var(--accent);
     border: 2px solid var(--bg-elevated); cursor: pointer; transition: transform .12s ease;
   }
-  .volume input[type="range"]:active::-moz-range-thumb { transform: scale(1.15); }
-  .volume-label { font-size: 11.5px; width: 30px; text-align: right; color: var(--text-faint); }
+  .volume-slider-wrap input[type="range"]:active::-moz-range-thumb { transform: scale(1.15); }
   .ghost-btn {
     background: none; border: 1px solid var(--border-soft); color: var(--text-muted);
     padding: 7px 12px; border-radius: 8px; font-size: 12.5px; font-weight: 600;
@@ -512,17 +531,21 @@
           <button class="icon-btn danger" id="stop-btn" title="Stop">
             <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
           </button>
+          <div class="volume-popover-wrap">
+            <button class="icon-btn" id="volume-btn" title="Volume" aria-expanded="false">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+            </button>
+            <div class="volume-popover" id="volume-popover">
+              <span class="volume-popover-label" id="volume-label">0%</span>
+              <div class="volume-slider-wrap">
+                <input type="range" id="volume-slider" min="0" max="100" value="0">
+              </div>
+            </div>
+          </div>
           <button class="chip-btn" id="radio-btn">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 16.24a6 6 0 0 1 0-8.49M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14"/></svg>
             Radio
           </button>
-        </div>
-        <div class="control-row">
-          <div class="volume">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
-            <input type="range" id="volume-slider" min="0" max="100" value="0">
-            <span class="volume-label" id="volume-label">0%</span>
-          </div>
         </div>
       </div>
     </section>
@@ -1409,6 +1432,31 @@
   function removeQueueTrack(index) {
     sendAction(`queue/${index}/remove`, { method: 'POST' });
   }
+
+  const volumeBtn = document.getElementById('volume-btn');
+  const volumePopover = document.getElementById('volume-popover');
+
+  function closeVolumePopover() {
+    volumePopover.classList.remove('open');
+    volumeBtn.classList.remove('active');
+    volumeBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  volumeBtn.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const opening = !volumePopover.classList.contains('open');
+    volumePopover.classList.toggle('open', opening);
+    volumeBtn.classList.toggle('active', opening);
+    volumeBtn.setAttribute('aria-expanded', String(opening));
+  });
+  document.addEventListener('click', (event) => {
+    if (!volumePopover.classList.contains('open')) return;
+    if (volumeBtn.contains(event.target) || volumePopover.contains(event.target)) return;
+    closeVolumePopover();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && volumePopover.classList.contains('open')) closeVolumePopover();
+  });
 
   document.getElementById('volume-slider').addEventListener('input', (event) => {
     document.getElementById('volume-label').textContent = `${event.target.value}%`;
