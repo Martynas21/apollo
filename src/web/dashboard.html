@@ -137,7 +137,7 @@
     grid-template-rows: auto auto auto;
     grid-template-areas:
       "now queue"
-      "favourites favourites"
+      "favourites queue"
       "playlists playlists";
     gap: 24px;
     padding: 32px 40px;
@@ -240,7 +240,8 @@
   .ghost-btn.danger:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
 
   /* Queue side card */
-  .queue-card { grid-area: queue; }
+  .queue-card { grid-area: queue; overflow: hidden; }
+  .queue-card .scroll-list { flex: 1; min-height: 0; max-height: none; }
   .search-bar {
     display: flex; align-items: center; gap: 10px; background: var(--bg); border: 1px solid var(--border-soft);
     border-radius: 10px; padding: 10px 14px; color: var(--text-faint);
@@ -545,6 +546,21 @@
   const dashboard = document.getElementById('dashboard');
   const loginError = document.getElementById('login-error');
   const statusLine = document.getElementById('status-line');
+
+  // The queue card spans the now-playing + favourites rows and must match
+  // their combined height exactly so its own list scrolls internally rather
+  // than growing the grid rows to fit — CSS grid has no way to cap a
+  // spanning item's height to its siblings' natural size, so it's measured
+  // here instead.
+  const nowCard = document.querySelector('.now-card');
+  const favouritesCard = document.querySelector('.favourites-card');
+  const queueCard = document.querySelector('.queue-card');
+  function syncQueueCardHeight() {
+    const gap = parseFloat(getComputedStyle(document.querySelector('.dashboard-grid')).rowGap) || 0;
+    queueCard.style.height = `${nowCard.offsetHeight + gap + favouritesCard.offsetHeight}px`;
+  }
+  new ResizeObserver(syncQueueCardHeight).observe(nowCard);
+  new ResizeObserver(syncQueueCardHeight).observe(favouritesCard);
 
   // Shows a status message. Non-error messages fade in and auto-dismiss after
   // a few seconds; error messages stay up until the next status change so
@@ -1196,7 +1212,11 @@
     renderQueue(snapshot);
 
     const transportDisabled = snapshot.state !== 'playing' && snapshot.state !== 'paused';
-    document.getElementById('toggle-btn').disabled = transportDisabled;
+    // A restart clears in-memory playback state but the queue is reloaded
+    // straight from the DB (queue_snapshot), so `upcoming` can be non-empty
+    // while `state` is still 'empty' — that's a resumable queue, not
+    // nothing to do, so keep Play clickable (see togglePauseOrResume).
+    document.getElementById('toggle-btn').disabled = transportDisabled && snapshot.upcoming.length === 0;
     document.getElementById('skip-btn').disabled = transportDisabled;
     document.getElementById('stop-btn').disabled = transportDisabled;
 
@@ -1225,7 +1245,7 @@
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
 
-  document.getElementById('toggle-btn').addEventListener('click', () => sendAction('toggle-pause', { method: 'POST' }));
+  document.getElementById('toggle-btn').addEventListener('click', () => togglePauseOrResume());
   document.getElementById('skip-btn').addEventListener('click', () => sendAction('skip', { method: 'POST' }));
   document.getElementById('stop-btn').addEventListener('click', () => sendAction('stop', { method: 'POST' }));
   document.getElementById('np-shuffle-btn').addEventListener('click', () => sendAction('shuffle', { method: 'POST' }));
@@ -1266,6 +1286,7 @@
   // a channel picker and — once the user picks one and the join succeeds —
   // replay whatever action triggered the modal.
   const NOT_CONNECTED_ERROR = 'not connected to a voice channel';
+  const NOTHING_PLAYING_ERROR = 'nothing is playing';
   const VOICE_ICON = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>';
 
   const joinModalOverlay = document.getElementById('join-modal-overlay');
@@ -1333,6 +1354,33 @@
       const retry = pendingRetryAction;
       closeJoinModal();
       if (retry) retry();
+    } catch (err) { /* showLogin already handled unauthorized */ }
+  }
+
+  // The toggle button doubles as "resume a persisted queue" after a
+  // restart: the process reloads `upcoming` straight from the DB (see
+  // queue_snapshot in src/voice/player.rs) so it's non-empty even though
+  // nothing is playing yet, but pause()/resume() only ever look at the
+  // in-memory current-track handle and fail with "nothing is playing"
+  // until the bot rejoins a voice channel. Joining is what actually starts
+  // the persisted queue (restore_session_if_new), so surface the same
+  // channel picker used for queueing/playlists instead of leaving the
+  // button inert.
+  async function togglePauseOrResume() {
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/toggle-pause`, { method: 'POST' });
+      const body = await response.json();
+      if (!response.ok) {
+        const upcomingCount = Number(document.getElementById('queue-count-badge').textContent) || 0;
+        if (body.error === NOTHING_PLAYING_ERROR && upcomingCount > 0) {
+          openJoinModal(null);
+          return;
+        }
+        showStatus(body.error || 'Something went wrong.', { isError: true });
+        return;
+      }
+      showStatus('');
+      renderSnapshot(body);
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
 
