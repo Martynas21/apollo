@@ -239,6 +239,7 @@
   .search-bar input::placeholder { color: var(--text-faint); }
   .scroll-list { display: flex; flex-direction: column; gap: 2px; max-height: 178px; overflow-y: auto; }
   .compact-row {
+    position: relative;
     display: grid; grid-template-columns: 34px 1fr auto auto; gap: 10px; align-items: center; padding: 7px 4px; border-radius: 8px;
     max-height: 64px; overflow: hidden;
     transition: opacity .18s ease-out, transform .18s ease-out,
@@ -250,6 +251,17 @@
   .compact-row.row-exit {
     opacity: 0; max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; margin-bottom: 0;
   }
+  .compact-row.queue-row { grid-template-columns: 18px 34px 1fr auto auto; }
+  .compact-row.dragging {
+    z-index: 30; transition: none; background: var(--bg-hover);
+    box-shadow: 0 8px 20px rgba(0,0,0,.4);
+  }
+  .drag-handle {
+    width: 18px; height: 34px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--text-faint); cursor: grab; touch-action: none;
+  }
+  .drag-handle:hover { color: var(--text-muted); }
+  .drag-handle:active { cursor: grabbing; }
   .compact-thumb { width: 34px; height: 34px; border-radius: 7px; flex-shrink: 0; }
   .compact-meta { min-width: 0; }
   .compact-title-line { display: flex; align-items: center; gap: 6px; }
@@ -470,6 +482,10 @@
   let lastSeenPlayingVideoId = null;
   let statusDismissTimeout = null;
   let npCrossfadeTimeout = null;
+  // True while a queue row is being dragged for reorder — while set,
+  // renderQueue must not let the live snapshot feed reconcile row DOM/order
+  // out from under the user's cursor.
+  let queueDragActive = false;
 
   const loginScreen = document.getElementById('login-screen');
   const dashboard = document.getElementById('dashboard');
@@ -814,6 +830,7 @@
   const UP_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>';
   const DOWN_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
   const REMOVE_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+  const GRIP_ICON = '<svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="2.5" cy="2.5" r="1.5"/><circle cx="7.5" cy="2.5" r="1.5"/><circle cx="2.5" cy="8" r="1.5"/><circle cx="7.5" cy="8" r="1.5"/><circle cx="2.5" cy="13.5" r="1.5"/><circle cx="7.5" cy="13.5" r="1.5"/></svg>';
 
   function makeMiniIconBtn(iconSvg, title, disabled, danger) {
     const btn = document.createElement('button');
@@ -825,6 +842,171 @@
     return btn;
   }
 
+  // ---- Queue drag-to-reorder ----
+  // Pointer-events-based drag (not native HTML5 DnD, whose default ghost
+  // image feels clunky). The dragged row stays in normal flow and is offset
+  // with an inline `transform: translateY(...)`; siblings that get displaced
+  // by a reorder mid-drag are animated into their new slot with a FLIP
+  // transition (capture old position, move, capture new position, animate
+  // the difference away).
+  const queueList = document.getElementById('queue-list');
+  let dragState = null;
+
+  function getQueueRows() {
+    return Array.from(queueList.children).filter((el) => el.dataset.exiting !== 'true');
+  }
+
+  // FLIP-animates `el` from its previous position (expressed as `deltaY`, the
+  // signed distance from where it used to be to where it now is) into its
+  // current position. Cancels and replaces any FLIP transition already in
+  // flight on the same element so rapid successive reorders within one drag
+  // don't leave a stale transitionend/timeout pair clobbering a newer one.
+  function flipTransition(el, deltaY) {
+    if (el._flipCleanup) el._flipCleanup();
+    el.style.transition = 'none';
+    el.style.transform = `translateY(${deltaY}px)`;
+    void el.offsetHeight; // force reflow before re-enabling the transition
+    el.style.transition = 'transform 150ms ease';
+    el.style.transform = '';
+    let done = false;
+    let fallback = null;
+    function finish() {
+      if (done) return;
+      done = true;
+      clearTimeout(fallback);
+      el.removeEventListener('transitionend', onTransitionEnd);
+      el.style.transition = '';
+      if (el._flipCleanup === finish) el._flipCleanup = null;
+    }
+    function onTransitionEnd(event) {
+      if (event.target !== el) return;
+      finish();
+    }
+    el.addEventListener('transitionend', onTransitionEnd);
+    fallback = setTimeout(finish, 250);
+    el._flipCleanup = finish;
+  }
+
+  // Moves the dragged row to sit before `others[newIndex]` (or at the end),
+  // FLIP-animating every other row whose layout position changes as a
+  // result, and updates `state.layoutTopDelta` so the caller can keep the
+  // dragged row's rendered position under the cursor with no visual jump.
+  function reorderDom(state, others, newIndex) {
+    const { row, startRect } = state;
+    const rows = getQueueRows();
+    const beforeRects = new Map();
+    for (const r of rows) {
+      if (r === row) continue;
+      beforeRects.set(r, r.getBoundingClientRect());
+    }
+
+    const refRow = others[newIndex] || null;
+    row.style.transform = ''; // measure true layout position, ignoring the drag offset
+    if (refRow) {
+      queueList.insertBefore(row, refRow);
+    } else {
+      queueList.appendChild(row);
+    }
+    const layoutTop = row.getBoundingClientRect().top;
+    state.layoutTopDelta = layoutTop - startRect.top;
+
+    for (const r of rows) {
+      if (r === row) continue;
+      const before = beforeRects.get(r);
+      const after = r.getBoundingClientRect();
+      const diff = before.top - after.top;
+      if (diff !== 0) flipTransition(r, diff);
+    }
+  }
+
+  function onDragPointerMove(event) {
+    if (!dragState || event.pointerId !== dragState.pointerId) return;
+    const { row, startRect, startClientY } = dragState;
+    const deltaY = event.clientY - startClientY;
+
+    const rows = getQueueRows();
+    const others = rows.filter((r) => r !== row);
+    const draggedCenter = startRect.top + deltaY + startRect.height / 2;
+
+    let newIndex = others.length;
+    for (let i = 0; i < others.length; i++) {
+      const rect = others[i].getBoundingClientRect();
+      const mid = rect.top + rect.height / 2;
+      if (draggedCenter < mid) { newIndex = i; break; }
+    }
+
+    if (newIndex !== dragState.tentativeIndex) {
+      reorderDom(dragState, others, newIndex);
+      dragState.tentativeIndex = newIndex;
+    }
+
+    row.style.transform = `translateY(${deltaY - dragState.layoutTopDelta}px) scale(1.02)`;
+  }
+
+  function onDragPointerEnd(event) {
+    if (!dragState || event.pointerId !== dragState.pointerId) return;
+    const { row, handle, pointerId, startIndex, tentativeIndex, moveHandler, upHandler, cancelHandler } = dragState;
+
+    try { handle.releasePointerCapture(pointerId); } catch (err) { /* already released */ }
+    handle.removeEventListener('pointermove', moveHandler);
+    handle.removeEventListener('pointerup', upHandler);
+    handle.removeEventListener('pointercancel', cancelHandler);
+
+    row.classList.remove('dragging');
+    row.style.transform = '';
+    document.body.style.userSelect = '';
+    queueDragActive = false;
+    dragState = null;
+
+    if (tentativeIndex !== startIndex) {
+      moveQueueTrack(startIndex, tentativeIndex);
+    }
+  }
+
+  function onDragPointerDown(event, row, handle) {
+    if (dragState || event.button !== 0) return;
+    event.preventDefault();
+    handle.setPointerCapture(event.pointerId);
+
+    const rows = getQueueRows();
+    const startIndex = rows.indexOf(row);
+    if (startIndex === -1) return;
+
+    dragState = {
+      pointerId: event.pointerId,
+      row,
+      handle,
+      startIndex,
+      tentativeIndex: startIndex,
+      startRect: row.getBoundingClientRect(),
+      startClientY: event.clientY,
+      layoutTopDelta: 0,
+      moveHandler: null,
+      upHandler: null,
+      cancelHandler: null,
+    };
+    dragState.moveHandler = (e) => onDragPointerMove(e);
+    dragState.upHandler = (e) => onDragPointerEnd(e);
+    dragState.cancelHandler = (e) => onDragPointerEnd(e);
+
+    row.classList.add('dragging');
+    document.body.style.userSelect = 'none';
+    queueDragActive = true;
+
+    handle.addEventListener('pointermove', dragState.moveHandler);
+    handle.addEventListener('pointerup', dragState.upHandler);
+    handle.addEventListener('pointercancel', dragState.cancelHandler);
+  }
+
+  function makeDragHandle(row) {
+    const handle = document.createElement('div');
+    handle.className = 'drag-handle';
+    handle.title = 'Drag to reorder';
+    handle.innerHTML = GRIP_ICON;
+    handle.addEventListener('pointerdown', (event) => onDragPointerDown(event, row, handle));
+    return handle;
+  }
+
   // The queue's move-up/move-down/remove buttons act on the row's position,
   // which can change across renders even when the row itself persists (e.g.
   // a track at position 2 moves to position 1). The row's current index is
@@ -833,6 +1015,9 @@
   // index captured when the row was first created.
   function createQueueRow(track, index, items) {
     const row = createTrackRow(track);
+    row.classList.add('queue-row');
+    row.insertBefore(makeDragHandle(row), row.firstChild);
+
     const actions = document.createElement('div');
     actions.className = 'compact-actions';
 
@@ -874,6 +1059,14 @@
     document.getElementById('queue-shuffle-btn').disabled = upcoming.length < 2;
     document.getElementById('queue-clear-btn').disabled = upcoming.length === 0;
     document.getElementById('np-shuffle-btn').disabled = upcoming.length < 2;
+
+    // A live snapshot (WebSocket push, ~every 1.5s, or an action response)
+    // reflects server-confirmed state, which is stale mid-drag since the
+    // move hasn't been sent yet — reconciling now would yank the dragged row
+    // back out from under the cursor. Skip touching row DOM/order entirely
+    // until the drag ends; normal reconciliation resumes on the next
+    // snapshot after that.
+    if (queueDragActive) return;
 
     const list = document.getElementById('queue-list');
     const emptyNote = document.getElementById('queue-empty-note');
@@ -998,6 +1191,30 @@
   });
 
   // ---- Search ----
+  // Faithful mirror of the backend's extract_video_id (src/commands/playback.rs)
+  // so "is this a link" is decided identically client-side and server-side.
+  function extractVideoId(input) {
+    let url;
+    try { url = new URL(input); } catch { return null; }
+    const host = url.hostname;
+    if (host === 'youtu.be') {
+      const seg = url.pathname.split('/').filter(Boolean)[0];
+      return seg || null;
+    }
+    if (host === 'youtube.com' || host.endsWith('.youtube.com')) {
+      if (url.pathname === '/watch') {
+        return url.searchParams.get('v');
+      }
+      if (url.pathname.startsWith('/shorts/')) {
+        const rest = url.pathname.slice('/shorts/'.length);
+        const id = rest.split('/')[0];
+        return id || null;
+      }
+      return null;
+    }
+    return null;
+  }
+
   const searchInput = document.getElementById('search-input');
   const searchResults = document.getElementById('search-results');
   const searchEmptyNote = document.getElementById('search-empty-note');
@@ -1032,7 +1249,7 @@
     reconcileList(searchResults, tracks, (track) => track.video_id, createSearchRow, updateSearchRow);
   }
 
-  async function runSearch(query) {
+  async function runSearch(query, isLink) {
     const seq = ++searchSeq;
     try {
       const response = await api(`/api/guilds/${currentGuildId}/search?q=${encodeURIComponent(query)}`);
@@ -1045,6 +1262,14 @@
         return;
       }
       showStatus('');
+      if (isLink && Array.isArray(body) && body.length > 0) {
+        // Nothing to disambiguate for a recognized link — add it straight away.
+        searchInput.value = '';
+        searchResults.innerHTML = '';
+        searchEmptyNote.style.display = 'none';
+        addToQueue(body[0].video_id, body[0].title);
+        return;
+      }
       renderSearchResults(body);
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
@@ -1057,7 +1282,14 @@
       searchEmptyNote.style.display = 'none';
       return;
     }
-    searchDebounce = setTimeout(() => runSearch(query), 300);
+    const isLink = extractVideoId(query) !== null;
+    if (isLink) {
+      // There's nothing meaningful to show while a link resolves — clear any
+      // stale result list immediately instead of leaving it visible mid-flight.
+      searchResults.innerHTML = '';
+      searchEmptyNote.style.display = 'none';
+    }
+    searchDebounce = setTimeout(() => runSearch(query, isLink), 300);
   });
 
   async function addToQueue(videoId, title) {
