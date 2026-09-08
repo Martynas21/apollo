@@ -9,9 +9,14 @@ pub struct Config {
     pub yt_dlp_cookies_file: Option<String>,
     pub playlist_track_limit: usize,
     pub audio_worker_socket: String,
+    pub dashboard_bind_addr: String,
+    pub dashboard_username: Option<String>,
+    pub dashboard_password: Option<String>,
 }
 
 const DEFAULT_PLAYLIST_TRACK_LIMIT: usize = 500;
+
+const DEFAULT_DASHBOARD_BIND_ADDR: &str = "127.0.0.1:8787";
 
 impl Config {
     pub fn from_env() -> Result<Self> {
@@ -28,6 +33,10 @@ impl Config {
             playlist_track_limit: playlist_track_limit(&lookup)?,
             audio_worker_socket: apollo_ipc::optional_env_var(&lookup, "AUDIO_WORKER_SOCKET")
                 .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_ADDR.to_string()),
+            dashboard_bind_addr: apollo_ipc::optional_env_var(&lookup, "DASHBOARD_BIND_ADDR")
+                .unwrap_or_else(|| DEFAULT_DASHBOARD_BIND_ADDR.to_string()),
+            dashboard_username: apollo_ipc::optional_env_var(&lookup, "DASHBOARD_USERNAME"),
+            dashboard_password: apollo_ipc::optional_env_var(&lookup, "DASHBOARD_PASSWORD"),
         })
     }
 }
@@ -100,6 +109,27 @@ mod tests {
         assert_eq!(config.discord_guild_id, None);
         assert_eq!(config.yt_dlp_cookies_file, None);
         assert_eq!(config.playlist_track_limit, 500);
+        assert_eq!(config.dashboard_bind_addr, "127.0.0.1:8787");
+        assert_eq!(config.dashboard_username, None);
+        assert_eq!(config.dashboard_password, None);
+    }
+
+    #[test]
+    fn dashboard_bind_addr_present_overrides_default() {
+        let mut vars = full_vars();
+        vars.insert("DASHBOARD_BIND_ADDR", "0.0.0.0:9000");
+        let config = Config::from_source(lookup(&vars)).unwrap();
+        assert_eq!(config.dashboard_bind_addr, "0.0.0.0:9000");
+    }
+
+    #[test]
+    fn dashboard_credentials_present_are_some() {
+        let mut vars = full_vars();
+        vars.insert("DASHBOARD_USERNAME", "admin");
+        vars.insert("DASHBOARD_PASSWORD", "hunter2");
+        let config = Config::from_source(lookup(&vars)).unwrap();
+        assert_eq!(config.dashboard_username, Some("admin".to_string()));
+        assert_eq!(config.dashboard_password, Some("hunter2".to_string()));
     }
 
     #[test]

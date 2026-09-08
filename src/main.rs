@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod db;
 mod voice;
+mod web;
 mod youtube;
 
 use anyhow::Context;
@@ -26,7 +27,16 @@ async fn main() -> anyhow::Result<()> {
 
     let songbird = songbird::Songbird::serenity();
     let (db_pool, voice_backend) = connect_backends(&config, songbird.clone()).await?;
-    let data = build_data(&config, db_pool, voice_backend);
+
+    web::bootstrap_user_if_needed(
+        &db_pool,
+        config.dashboard_username.as_deref(),
+        config.dashboard_password.as_deref(),
+    )
+    .await?;
+
+    let data = build_data(&config, db_pool.clone(), voice_backend);
+    let dashboard_player = data.player.clone();
 
     let framework = build_framework(config.discord_guild_id, data);
 
@@ -36,9 +46,26 @@ async fn main() -> anyhow::Result<()> {
         .register_songbird_with(songbird)
         .await?;
 
+    spawn_dashboard(&config, dashboard_player, db_pool, client.cache.clone());
+
     client.start().await?;
 
     Ok(())
+}
+
+fn spawn_dashboard(
+    config: &config::Config,
+    player: voice::PlayerRegistry,
+    db_pool: sqlx::SqlitePool,
+    cache: std::sync::Arc<serenity::Cache>,
+) {
+    let bind_addr = config.dashboard_bind_addr.clone();
+    let state = web::WebState::new(player, db_pool, cache);
+    tokio::spawn(async move {
+        if let Err(err) = web::serve(&bind_addr, state).await {
+            tracing::error!(%err, "dashboard server exited");
+        }
+    });
 }
 
 fn init_tracing() {

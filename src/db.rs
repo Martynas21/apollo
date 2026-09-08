@@ -776,6 +776,41 @@ pub async fn search_cached_tracks(
         .collect())
 }
 
+pub async fn dashboard_user_count(pool: &SqlitePool) -> Result<i64> {
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM dashboard_users")
+        .fetch_one(pool)
+        .await
+        .context("failed to count dashboard users")?;
+    Ok(count)
+}
+
+pub async fn insert_dashboard_user(
+    pool: &SqlitePool,
+    username: &str,
+    password_hash: &str,
+) -> Result<()> {
+    sqlx::query("INSERT INTO dashboard_users (username, password_hash) VALUES (?1, ?2)")
+        .bind(username)
+        .bind(password_hash)
+        .execute(pool)
+        .await
+        .context("failed to insert dashboard user")?;
+    Ok(())
+}
+
+pub async fn dashboard_user_password_hash(
+    pool: &SqlitePool,
+    username: &str,
+) -> Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT password_hash FROM dashboard_users WHERE username = ?1")
+            .bind(username)
+            .fetch_optional(pool)
+            .await
+            .context("failed to fetch dashboard user")?;
+    Ok(row.map(|(hash,)| hash))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

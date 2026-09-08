@@ -1,0 +1,77 @@
+//! The web dashboard: a small HTTP+WebSocket surface exposing "Now Playing"
+//! state and transport controls, mirroring what the Discord `/player` panel
+//! already does (see `voice::panel`) but reachable from a browser instead of
+//! a Discord message.
+//!
+//! Scope is deliberately narrow for now: now-playing state and transport
+//! controls (pause/resume/skip/stop/shuffle/radio/volume) for whichever
+//! guild the dashboard's server switcher has selected. Queue management,
+//! search, and playlists are not implemented here yet.
+
+mod api;
+mod auth;
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::middleware::from_fn_with_state;
+use axum::routing::{get, post};
+use poise::serenity_prelude as serenity;
+
+pub use auth::bootstrap_user_if_needed;
+
+const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
+#[derive(Clone)]
+pub struct WebState {
+    pub player: crate::voice::PlayerRegistry,
+    pub db: sqlx::SqlitePool,
+    pub cache: Arc<serenity::Cache>,
+    pub sessions: auth::SessionStore,
+}
+
+impl WebState {
+    pub fn new(
+        player: crate::voice::PlayerRegistry,
+        db: sqlx::SqlitePool,
+        cache: Arc<serenity::Cache>,
+    ) -> Self {
+        Self {
+            player,
+            db,
+            cache,
+            sessions: auth::SessionStore::default(),
+        }
+    }
+}
+
+pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {
+    let protected = Router::new()
+        .route("/api/guilds", get(api::list_guilds))
+        .route("/api/guilds/{guild_id}/now-playing", get(api::now_playing))
+        .route("/api/guilds/{guild_id}/ws", get(api::now_playing_ws))
+        .route(
+            "/api/guilds/{guild_id}/toggle-pause",
+            post(api::toggle_pause),
+        )
+        .route("/api/guilds/{guild_id}/skip", post(api::skip))
+        .route("/api/guilds/{guild_id}/stop", post(api::stop))
+        .route("/api/guilds/{guild_id}/shuffle", post(api::shuffle))
+        .route(
+            "/api/guilds/{guild_id}/toggle-radio",
+            post(api::toggle_radio),
+        )
+        .route("/api/guilds/{guild_id}/volume", post(api::set_volume))
+        .route_layer(from_fn_with_state(state.clone(), auth::require_session));
+
+    let public = Router::new()
+        .route("/", get(|| async { axum::response::Html(DASHBOARD_HTML) }))
+        .route("/api/login", post(api::login));
+
+    let app = public.merge(protected).with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    tracing::info!(%bind_addr, "dashboard listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}

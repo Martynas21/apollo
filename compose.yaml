@@ -6,6 +6,13 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: sqlite:///data/apollo.db
+      # Docker can only publish a port that's bound to a container-wide
+      # interface — 127.0.0.1 (the app's own default, correct for running
+      # directly on a host) is unreachable from outside this container.
+      # The `127.0.0.1:8787:` below still keeps it host-loopback-only.
+      DASHBOARD_BIND_ADDR: 0.0.0.0:8787
+    ports:
+      - "127.0.0.1:8787:8787"
     volumes:
       - apollo-data:/data
     depends_on:

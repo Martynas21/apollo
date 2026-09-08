@@ -138,6 +138,39 @@ See `.env.example` for the full list and inline docs:
   confirm you're not a bot." Point this at a Netscape-format `cookies.txt`
   exported from a real browser session.
 - `RUST_LOG` — optional log verbosity (`tracing-subscriber` `EnvFilter` syntax).
+- `DASHBOARD_BIND_ADDR` — optional, defaults to `127.0.0.1:8787`. See
+  [Web dashboard](#web-dashboard).
+- `DASHBOARD_USERNAME`, `DASHBOARD_PASSWORD` — optional, bootstrap the
+  dashboard's first login. See [Web dashboard](#web-dashboard).
+
+## Web dashboard
+
+Apollo also serves a small browser dashboard alongside the Discord bot —
+currently just "Now Playing" plus transport controls (pause/resume, skip,
+stop, shuffle, radio toggle, volume) for whichever of the bot's servers you
+select, live-updated over a WebSocket. It's a browser-based sibling to the
+`/player` panel, not a replacement — queue management, search, and
+playlists are still Discord-only for now.
+
+It listens on `DASHBOARD_BIND_ADDR` (default `127.0.0.1:8787`, i.e.
+localhost-only until you put something in front of it) and serves plain
+HTTP with no TLS of its own — if you expose it beyond your own machine, put
+a reverse proxy with TLS in front rather than binding it directly to a
+public interface. Running it directly with `cargo run`, the default just
+works. Running it via `compose.yaml`, the default does **not** — a
+container-loopback bind is unreachable from the host by design, so it sets
+`DASHBOARD_BIND_ADDR=0.0.0.0:8787` and publishes it back to
+`127.0.0.1:8787` on the host instead (see `ports:` in `compose.yaml`).
+
+Sign-in is a single local account (username + password, hashed with
+argon2), stored in the same SQLite database as everything else — there's no
+per-Discord-user identity or per-guild permission check, so anyone who logs
+in can control any server the bot is in. Set `DASHBOARD_USERNAME` and
+`DASHBOARD_PASSWORD` before the first run to create that account; they're
+only read while no dashboard account exists yet, so changing them later has
+no effect (there's no "change password" flow yet). Leave both unset to
+disable the dashboard's login entirely — it still comes up, but rejects
+every sign-in.
 
 ## Commands
 
@@ -211,6 +244,10 @@ setup, and premature before this has even been run live once.
   `/player` panel's rendering), `resolve.rs` (yt-dlp-backed audio resolution
   + startup dependency check), `radio.rs` (Mix listing for radio mode),
   `ipc_backend.rs` (the `VoiceBackend` that talks to `apollo-audio-worker`).
+- `src/web/` — the web dashboard (`axum`): `api.rs` (HTTP/WebSocket
+  handlers), `auth.rs` (password hashing + in-memory session tokens),
+  `dashboard.html` (the single-page frontend, served as-is). See
+  [Web dashboard](#web-dashboard).
 - `ipc/` — shared wire protocol/DTOs between `apollo` and
   `apollo-audio-worker` (a separate workspace crate, `apollo-ipc`).
 - `audio-worker/` — `apollo-audio-worker`: the standalone process holding
