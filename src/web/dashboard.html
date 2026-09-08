@@ -274,6 +274,24 @@
     opacity: 0; max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; margin-bottom: 0;
   }
   .compact-row.queue-row { grid-template-columns: 18px 34px 1fr auto auto; }
+  .compact-row.now-playing-row { background: color-mix(in oklch, var(--accent) 13%, transparent); }
+  .compact-row.now-playing-row:hover { background: color-mix(in oklch, var(--accent) 18%, transparent); }
+  .compact-row.now-playing-row .compact-title { color: var(--accent); }
+  .compact-row.now-playing-row .compact-thumb {
+    box-shadow: 0 0 0 2px var(--accent), 0 0 14px 2px color-mix(in oklch, var(--accent) 50%, transparent);
+  }
+  .now-playing-indicator {
+    width: 18px; height: 34px; flex-shrink: 0; display: flex;
+    align-items: flex-end; justify-content: center; gap: 2px;
+  }
+  .now-playing-indicator span {
+    width: 3px; height: 4px; border-radius: 1px; background: var(--accent);
+    animation: now-playing-bar .9s ease-in-out infinite;
+  }
+  .now-playing-indicator span:nth-child(1) { animation-delay: -.6s; }
+  .now-playing-indicator span:nth-child(2) { animation-delay: -.3s; }
+  .now-playing-row.is-paused .now-playing-indicator span { animation-play-state: paused; height: 8px; }
+  @keyframes now-playing-bar { 0%, 100% { height: 4px; } 50% { height: 14px; } }
   .compact-row.dragging {
     z-index: 30; transition: none; background: var(--bg-hover);
     box-shadow: 0 8px 20px rgba(0,0,0,.4);
@@ -1148,6 +1166,13 @@
     return handle;
   }
 
+  function makeNowPlayingIndicator() {
+    const el = document.createElement('div');
+    el.className = 'now-playing-indicator';
+    el.innerHTML = '<span></span><span></span><span></span>';
+    return el;
+  }
+
   // The queue's remove button acts on the row's position, which can change
   // across renders even when the row itself persists (e.g. a track at
   // position 2 moves to position 1). The row's current index is stashed on
@@ -1157,6 +1182,13 @@
   function createQueueRow(track, index, items) {
     const row = createTrackRow(track);
     row.classList.add('queue-row');
+
+    if (track.__nowPlaying) {
+      row.insertBefore(makeNowPlayingIndicator(), row.firstChild);
+      updateQueueRow(row, track, index, items);
+      return row;
+    }
+
     row.insertBefore(makeDragHandle(row), row.firstChild);
 
     const actions = document.createElement('div');
@@ -1171,9 +1203,18 @@
     return row;
   }
 
-  function updateQueueRow(row, track, index) {
+  // `items[0]` is the pinned now-playing entry (see renderQueue) when
+  // present, so a real queue row's index is offset by one from its position
+  // in the combined array.
+  function updateQueueRow(row, track, index, items) {
     updateTrackRowContent(row, track);
-    row.dataset.index = String(index);
+    if (track.__nowPlaying) {
+      row.classList.add('now-playing-row');
+      row.classList.toggle('is-paused', !!track.__paused);
+      return;
+    }
+    const offset = items && items[0] && items[0].__nowPlaying ? 1 : 0;
+    row.dataset.index = String(index - offset);
   }
 
   function renderQueue(snapshot) {
@@ -1193,9 +1234,25 @@
 
     const list = document.getElementById('queue-list');
     const emptyNote = document.getElementById('queue-empty-note');
-    emptyNote.style.display = upcoming.length === 0 ? 'block' : 'none';
 
-    reconcileList(list, upcoming, (track) => track.video_id, createQueueRow, updateQueueRow);
+    // Pin the currently playing/buffering track to the top of the queue
+    // list, highlighted, instead of just letting it vanish from view now
+    // that it's no longer in `upcoming`. Keyed separately from a plain
+    // queue entry so a track playing twice back-to-back doesn't collide
+    // with itself mid-reconcile.
+    const nowPlaying = HERO_STATES.has(snapshot.state) && snapshot.track
+      ? { ...snapshot.track, __nowPlaying: true, __paused: snapshot.state === 'paused' }
+      : null;
+    emptyNote.style.display = upcoming.length === 0 && !nowPlaying ? 'block' : 'none';
+
+    const items = nowPlaying ? [nowPlaying, ...upcoming] : upcoming;
+    reconcileList(
+      list,
+      items,
+      (track) => (track.__nowPlaying ? `now-playing:${track.video_id}` : track.video_id),
+      createQueueRow,
+      updateQueueRow,
+    );
   }
 
   // Fades `.np-info` out, swaps its text, then lets the same transition fade
