@@ -1149,7 +1149,8 @@ impl PlayerRegistry {
             return Err(PlayerError::InvalidQueueIndex);
         }
 
-        items.swap(from, to);
+        let track = items.remove(from);
+        items.insert(to, track);
         db::queue_replace_all(&self.db, &guild_id_str, &items)
             .await
             .map_err(|e| PlayerError::Storage(e.to_string()))?;
@@ -2369,6 +2370,27 @@ mod tests {
         let err = registry.clear_queue(guild_id).await.unwrap_err();
 
         assert!(matches!(err, PlayerError::QueueEmpty));
+    }
+
+    #[tokio::test]
+    async fn move_queue_track_reinserts_rather_than_swapping_for_a_non_adjacent_move() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry
+            .enqueue_many(
+                guild_id,
+                vec![queued("b"), queued("c"), queued("d"), queued("e")],
+            )
+            .await
+            .unwrap();
+
+        registry.move_queue_track(guild_id, 0, 3).await.unwrap();
+
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        // Removing "b" from position 0 and reinserting it at position 3
+        // yields c, d, e, b. A swap of positions 0 and 3 would instead
+        // yield e, c, d, b, leaving c/d untouched.
+        assert_eq!(upcoming_ids(&snapshot), vec!["c", "d", "e", "b"]);
     }
 
     #[tokio::test]
