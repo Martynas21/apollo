@@ -5,9 +5,9 @@
 //!
 //! Scope is deliberately narrow for now: now-playing state and transport
 //! controls (pause/resume/skip/stop/shuffle/radio/volume) plus queue
-//! management (remove/reorder/clear), YouTube search/add-to-queue, and
-//! saved-playlist listing/play, all for whichever guild the dashboard's
-//! server switcher has selected.
+//! management (remove/reorder/clear), YouTube search/add-to-queue,
+//! saved-playlist listing/play, and per-guild play-count favourites, all for
+//! whichever guild the dashboard's server switcher has selected.
 
 mod api;
 mod auth;
@@ -79,6 +79,7 @@ pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {
             "/api/guilds/{guild_id}/playlists/{playlist_id}/play",
             post(api::play_playlist),
         )
+        .route("/api/guilds/{guild_id}/favourites", get(api::favourites))
         .route_layer(from_fn_with_state(state.clone(), auth::require_session));
 
     let public = Router::new()

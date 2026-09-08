@@ -357,15 +357,14 @@ async fn show_playlist_details(
         return update_picker(ctx, component, message).await;
     }
 
-    let playlist = match crate::db::get_guild_playlist(&data.db, &guild_id.to_string(), playlist.id)
-        .await
-    {
-        Ok(Some(playlist)) => playlist,
-        Ok(None) => return update_picker(ctx, component, PLAYLIST_NO_LONGER_EXISTS).await,
-        Err(err) => {
-            return update_picker(ctx, component, failed_to_load_playlist(err)).await;
-        }
-    };
+    let playlist =
+        match crate::db::get_guild_playlist(&data.db, &guild_id.to_string(), playlist.id).await {
+            Ok(Some(playlist)) => playlist,
+            Ok(None) => return update_picker(ctx, component, PLAYLIST_NO_LONGER_EXISTS).await,
+            Err(err) => {
+                return update_picker(ctx, component, failed_to_load_playlist(err)).await;
+            }
+        };
     let track_count = match crate::db::get_playlist_tracks(&data.db, playlist.id).await {
         Ok(tracks) => tracks.len(),
         Err(err) => {
@@ -460,6 +459,7 @@ async fn enqueue_playlist_tracks(
     data: &Data,
     guild_id: serenity::GuildId,
     requested_by: serenity::UserId,
+    playlist_id: i64,
     playlist_name: &str,
     tracks: Vec<Track>,
 ) -> Result<String, String> {
@@ -475,6 +475,12 @@ async fn enqueue_playlist_tracks(
         .enqueue_many(guild_id, queued)
         .await
         .map_err(failed_to_queue_tracks)?;
+
+    if let Err(err) =
+        crate::db::increment_playlist_play_count(&data.db, &guild_id.to_string(), playlist_id).await
+    {
+        tracing::warn!(%err, playlist_id, "failed to record playlist play count");
+    }
 
     Ok(format!("Queued {total} track(s) from **{playlist_name}**."))
 }
@@ -506,7 +512,16 @@ async fn handle_playlist_play_button(
         return update_picker(ctx, component, message).await;
     }
 
-    match enqueue_playlist_tracks(data, guild_id, component.user.id, &playlist.name, tracks).await {
+    match enqueue_playlist_tracks(
+        data,
+        guild_id,
+        component.user.id,
+        playlist.id,
+        &playlist.name,
+        tracks,
+    )
+    .await
+    {
         Ok(content) => update_picker(ctx, component, content).await,
         Err(message) => update_picker(ctx, component, message).await,
     }
@@ -641,8 +656,7 @@ pub(super) async fn handle_search_modal_submit(
             modal
                 .edit_response(
                     &ctx.http,
-                    serenity::EditInteractionResponse::new()
-                        .content(search_failed(err)),
+                    serenity::EditInteractionResponse::new().content(search_failed(err)),
                 )
                 .await?;
             return Ok(());
@@ -1086,7 +1100,10 @@ pub(super) async fn present_search_results(
                 .content(format!(
                     "Search results for \"{query}\":\n{listing}\n\nSelect one below to queue it."
                 ))
-                .components(vec![track_select_menu(results, SEARCH_RESULTS_DISPLAY_LIMIT)])
+                .components(vec![track_select_menu(
+                    results,
+                    SEARCH_RESULTS_DISPLAY_LIMIT,
+                )])
                 .ephemeral(true),
         )
         .await?;

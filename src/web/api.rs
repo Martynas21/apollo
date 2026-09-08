@@ -464,5 +464,85 @@ pub async fn play_playlist(
         })
         .collect();
     let result = state.player.enqueue_many(guild_id, queued).await;
+    if result.is_ok()
+        && let Err(err) =
+            db::increment_playlist_play_count(&state.db, &guild_id.to_string(), playlist_id).await
+    {
+        tracing::warn!(%err, playlist_id, "dashboard failed to record playlist play count");
+    }
     respond_after(&state.player, guild_id, result).await
+}
+
+const FAVOURITES_LIMIT: i64 = 5;
+
+#[derive(Serialize)]
+struct FavouriteTrackJson {
+    title: String,
+    channel: String,
+    video_id: String,
+    duration_secs: Option<u64>,
+    play_count: i64,
+}
+
+#[derive(Serialize)]
+struct FavouritePlaylistJson {
+    id: i64,
+    name: String,
+    play_count: i64,
+}
+
+#[derive(Serialize)]
+struct FavouritesJson {
+    tracks: Vec<FavouriteTrackJson>,
+    playlists: Vec<FavouritePlaylistJson>,
+}
+
+pub async fn favourites(State(state): State<WebState>, Path(guild_id): Path<String>) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+    let guild_id = guild_id.to_string();
+
+    let tracks = match db::top_played_tracks(&state.db, &guild_id, FAVOURITES_LIMIT).await {
+        Ok(tracks) => tracks,
+        Err(err) => {
+            tracing::warn!(%err, "dashboard failed to load favourite tracks");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load favourites",
+            );
+        }
+    };
+
+    let playlists = match db::top_played_playlists(&state.db, &guild_id, FAVOURITES_LIMIT).await {
+        Ok(playlists) => playlists,
+        Err(err) => {
+            tracing::warn!(%err, "dashboard failed to load favourite playlists");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load favourites",
+            );
+        }
+    };
+
+    let tracks = tracks
+        .into_iter()
+        .map(|t| FavouriteTrackJson {
+            title: t.title,
+            channel: t.channel,
+            video_id: t.video_id,
+            duration_secs: t.duration_secs,
+            play_count: t.play_count,
+        })
+        .collect();
+    let playlists = playlists
+        .into_iter()
+        .map(|p| FavouritePlaylistJson {
+            id: p.id,
+            name: p.name,
+            play_count: p.play_count,
+        })
+        .collect();
+
+    Json(FavouritesJson { tracks, playlists }).into_response()
 }

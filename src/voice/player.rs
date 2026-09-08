@@ -873,6 +873,12 @@ impl PlayerRegistry {
         }
         drop(guilds);
 
+        if let Err(err) =
+            db::record_track_play(&self.db, &guild_id.to_string(), &queued.track).await
+        {
+            tracing::warn!(%guild_id, %err, "failed to record track play count");
+        }
+
         if needs_radio_refill {
             self.maybe_spawn_radio_refill(guild_id);
         }
