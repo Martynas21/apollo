@@ -269,6 +269,11 @@
   .search-bar input { flex: 1; background: none; border: none; outline: none; color: var(--text); font-size: 13.5px; }
   .search-bar input::placeholder { color: var(--text-faint); }
   .scroll-list { display: flex; flex-direction: column; gap: 2px; max-height: 178px; overflow-y: auto; overflow-x: hidden; padding-right: 10px; }
+  .list-panel {
+    background: var(--bg); border: 1px solid var(--border-soft); border-radius: 12px; padding: 8px;
+  }
+  .list-panel .scroll-list { padding-right: 4px; }
+  .queue-card .list-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
   .compact-row {
     position: relative;
     display: grid; grid-template-columns: 34px 1fr auto auto; gap: 10px; align-items: center; padding: 7px 4px; border-radius: 8px;
@@ -530,8 +535,10 @@
           <button class="ghost-btn danger" id="queue-clear-btn">Clear</button>
         </div>
       </div>
-      <div class="scroll-list" id="queue-list"></div>
-      <div class="muted-note" id="queue-empty-note" style="display:none">Queue is empty — add something from Search.</div>
+      <div class="list-panel">
+        <div class="scroll-list" id="queue-list"></div>
+        <div class="muted-note" id="queue-empty-note" style="display:none">Queue is empty — add something from Search.</div>
+      </div>
     </section>
 
     <section class="card favourites-card">
@@ -539,8 +546,10 @@
 
       <div class="favourites-section">
         <div class="section-label">Most Played Tracks</div>
-        <div class="scroll-list" id="favourite-tracks"></div>
-        <div class="muted-note" id="favourite-tracks-empty-note" style="display:none">No plays yet — favourites show up once tracks have been played.</div>
+        <div class="list-panel">
+          <div class="scroll-list" id="favourite-tracks"></div>
+          <div class="muted-note" id="favourite-tracks-empty-note" style="display:none">No plays yet — favourites show up once tracks have been played.</div>
+        </div>
       </div>
 
       <div class="favourites-section">
