@@ -1018,11 +1018,27 @@
     const others = rows.filter((r) => r !== row);
     const draggedCenter = startRect.top + deltaY + startRect.height / 2;
 
+    // Walk rows in DOM order summing offsetHeight (a pure layout dimension,
+    // never affected by a transform or an in-flight transition on one) to
+    // find each sibling's settled position. getBoundingClientRect() would be
+    // wrong here: a sibling displaced by the last reorderDom is still mid
+    // FLIP-transition (see flipTransition), so its rect lags behind where
+    // it's actually headed — if the pointer moves fast enough to sample again
+    // before that 150ms transition finishes, the threshold check below would
+    // compare against the stale, still-animating position and the dragged
+    // row would stop advancing, i.e. appear to "stick" mid-drag.
+    const gap = parseFloat(getComputedStyle(queueList).rowGap) || 0;
+    let top = queueList.getBoundingClientRect().top - queueList.scrollTop;
     let newIndex = others.length;
-    for (let i = 0; i < others.length; i++) {
-      const rect = others[i].getBoundingClientRect();
-      const mid = rect.top + rect.height / 2;
-      if (draggedCenter < mid) { newIndex = i; break; }
+    let otherIndex = 0;
+    for (const r of rows) {
+      const height = r.offsetHeight;
+      if (r !== row) {
+        const mid = top + height / 2;
+        if (draggedCenter < mid) { newIndex = otherIndex; break; }
+        otherIndex++;
+      }
+      top += height + gap;
     }
 
     if (newIndex !== dragState.tentativeIndex) {
