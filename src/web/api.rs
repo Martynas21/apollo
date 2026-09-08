@@ -9,9 +9,13 @@ use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
 use serenity::GuildId;
 
+use crate::commands::playback::extract_video_id;
+use crate::db;
+use crate::voice::QueuedTrack;
 use crate::voice::player::{PlayerError, PlayerRegistry};
 use crate::web::WebState;
 use crate::web::auth;
+use crate::youtube::api::Track;
 
 const SNAPSHOT_PUSH_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -75,6 +79,15 @@ fn track_json(queued: &crate::voice::QueuedTrack) -> TrackJson {
         channel: queued.track.channel.clone(),
         video_id: queued.track.video_id.clone(),
         duration_secs: queued.track.duration.map(|d| d.as_secs()),
+    }
+}
+
+fn track_json_from_track(track: &Track) -> TrackJson {
+    TrackJson {
+        title: track.title.clone(),
+        channel: track.channel.clone(),
+        video_id: track.video_id.clone(),
+        duration_secs: track.duration.map(|d| d.as_secs()),
     }
 }
 
@@ -308,5 +321,148 @@ pub async fn clear_queue(State(state): State<WebState>, Path(guild_id): Path<Str
         return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
     };
     let result = state.player.clear_queue(guild_id).await;
+    respond_after(&state.player, guild_id, result).await
+}
+
+#[derive(Deserialize)]
+pub struct SearchQuery {
+    q: String,
+}
+
+pub async fn search(
+    State(state): State<WebState>,
+    Path(guild_id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<SearchQuery>,
+) -> Response {
+    let Some(_guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+
+    if let Some(video_id) = extract_video_id(&params.q) {
+        return match state.player.resolve_video(&video_id).await {
+            Ok(track) => Json(vec![track_json_from_track(&track)]).into_response(),
+            Err(err) => error_response(StatusCode::BAD_REQUEST, err.to_string()),
+        };
+    }
+
+    match state.player.search_tracks(&params.q).await {
+        Ok(tracks) => {
+            let tracks: Vec<TrackJson> = tracks.iter().map(track_json_from_track).collect();
+            Json(tracks).into_response()
+        }
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AddToQueueRequest {
+    video_id: String,
+}
+
+pub async fn add_to_queue(
+    State(state): State<WebState>,
+    Path(guild_id): Path<String>,
+    Json(body): Json<AddToQueueRequest>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+
+    let track = match state.player.resolve_video(&body.video_id).await {
+        Ok(track) => track,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    let queued = QueuedTrack {
+        track,
+        requested_by: state.cache.current_user().id,
+    };
+    let result = state.player.enqueue(guild_id, queued).await;
+    respond_after(&state.player, guild_id, result).await
+}
+
+#[derive(Serialize)]
+struct PlaylistJson {
+    id: i64,
+    name: String,
+    track_count: usize,
+}
+
+pub async fn list_playlists(
+    State(state): State<WebState>,
+    Path(guild_id): Path<String>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+
+    let playlists = match db::list_guild_playlists(&state.db, &guild_id.to_string()).await {
+        Ok(playlists) => playlists,
+        Err(err) => {
+            tracing::warn!(%err, "dashboard failed to list guild playlists");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load playlists",
+            );
+        }
+    };
+
+    let mut playlists_json = Vec::with_capacity(playlists.len());
+    for playlist in playlists {
+        let track_count = match db::get_playlist_tracks(&state.db, playlist.id).await {
+            Ok(tracks) => tracks.len(),
+            Err(err) => {
+                tracing::warn!(%err, "dashboard failed to load playlist track count");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to load playlists",
+                );
+            }
+        };
+        playlists_json.push(PlaylistJson {
+            id: playlist.id,
+            name: playlist.name,
+            track_count,
+        });
+    }
+
+    Json(playlists_json).into_response()
+}
+
+pub async fn play_playlist(
+    State(state): State<WebState>,
+    Path((guild_id, playlist_id)): Path<(String, i64)>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+
+    let tracks = match db::get_playlist_tracks(&state.db, playlist_id).await {
+        Ok(tracks) => tracks,
+        Err(err) => {
+            tracing::warn!(%err, "dashboard failed to load playlist tracks");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load playlists",
+            );
+        }
+    };
+
+    if tracks.is_empty() {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "playlist is empty or has not been cached yet — refresh it from Discord's /playlists first",
+        );
+    }
+
+    let requested_by = state.cache.current_user().id;
+    let queued: Vec<QueuedTrack> = tracks
+        .into_iter()
+        .map(|track| QueuedTrack {
+            track,
+            requested_by,
+        })
+        .collect();
+    let result = state.player.enqueue_many(guild_id, queued).await;
     respond_after(&state.player, guild_id, result).await
 }

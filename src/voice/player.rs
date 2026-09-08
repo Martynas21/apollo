@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::db;
 use crate::voice::radio;
 use crate::voice::resolve::{self, PlaybackError};
-use crate::youtube::api::{Track, YouTubeClient};
+use crate::youtube::api::{Track, YouTubeApiError, YouTubeClient};
 
 type Prefetch = JoinHandle<Result<AudioSource, PlaybackError>>;
 
@@ -1216,6 +1216,14 @@ impl PlayerRegistry {
         db::get_guild_volume(&self.db, &guild_id.to_string())
             .await
             .unwrap_or(db::DEFAULT_VOLUME)
+    }
+
+    pub async fn search_tracks(&self, query: &str) -> Result<Vec<Track>, YouTubeApiError> {
+        self.youtube.search(query).await
+    }
+
+    pub async fn resolve_video(&self, video_id: &str) -> Result<Track, YouTubeApiError> {
+        self.youtube.get_video(video_id).await
     }
 
     pub async fn set_volume(&self, guild_id: GuildId, volume: u8) -> Result<(), PlayerError> {

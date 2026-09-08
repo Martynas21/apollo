@@ -22,7 +22,7 @@ const RESUMED: &str = "Resumed.";
 
 pub(super) const REPLY_CLEANUP_DELAY: Duration = Duration::from_secs(30);
 
-fn extract_video_id(input: &str) -> Option<String> {
+pub(crate) fn extract_video_id(input: &str) -> Option<String> {
     let url = url::Url::parse(input).ok()?;
     let host = url.host_str()?;
 

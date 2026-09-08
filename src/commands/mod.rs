@@ -1,5 +1,5 @@
 mod library;
-mod playback;
+pub(crate) mod playback;
 mod radio;
 
 pub use library::handle_component as handle_library_component;
