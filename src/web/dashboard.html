@@ -191,6 +191,16 @@
   .np-title { font-family: 'Spectral', serif; font-size: 25px; font-weight: 600; margin: 0; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .np-channel { font-size: 14px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .np-duration { font-size: 12px; color: var(--text-faint); }
+  .np-progress { display: none; flex-direction: column; gap: 6px; margin-top: 2px; }
+  .np-progress-track {
+    position: relative; height: 4px; border-radius: 2px;
+    background: var(--bg); overflow: hidden;
+  }
+  .np-progress-fill {
+    position: absolute; inset: 0 auto 0 0; width: 0%;
+    border-radius: 2px; background: var(--accent);
+  }
+  .np-progress-elapsed { font-size: 11px; color: var(--text-faint); }
 
   .np-empty { display: none; flex-direction: column; align-items: center; text-align: center; gap: 10px; padding: 26px 10px; color: var(--text-muted); }
   .np-empty svg { color: var(--text-faint); }
@@ -463,6 +473,10 @@
           <div class="np-title" id="np-title">&mdash;</div>
           <div class="np-channel" id="np-channel"></div>
           <div class="np-duration" id="np-duration"></div>
+          <div class="np-progress" id="np-progress">
+            <div class="np-progress-track"><div class="np-progress-fill" id="np-progress-fill"></div></div>
+            <div class="np-progress-elapsed" id="np-elapsed"></div>
+          </div>
         </div>
       </div>
 
@@ -1269,6 +1283,30 @@
     }, 150);
   }
 
+  // Animates the progress fill with a single CSS transition to 100% timed
+  // to the track's remaining length, rather than polling every tick — the
+  // bar then advances smoothly between snapshots with no JS interval.
+  function updateProgress(snapshot) {
+    const wrap = document.getElementById('np-progress');
+    const fill = document.getElementById('np-progress-fill');
+    const elapsedEl = document.getElementById('np-elapsed');
+    const duration = snapshot.track ? snapshot.track.duration_secs : null;
+    const showProgress = !!snapshot.track && duration != null && snapshot.position_ms != null;
+    wrap.style.display = showProgress ? 'flex' : 'none';
+    if (!showProgress) return;
+
+    const positionSecs = Math.min(snapshot.position_ms / 1000, duration);
+    elapsedEl.textContent = formatDuration(positionSecs);
+    fill.style.transition = 'none';
+    fill.style.width = `${duration > 0 ? (positionSecs / duration) * 100 : 0}%`;
+    if (snapshot.state === 'playing') {
+      void fill.offsetWidth; // flush so the transition below starts from the width just set
+      const remaining = Math.max(duration - positionSecs, 0);
+      fill.style.transition = `width ${remaining}s linear`;
+      fill.style.width = '100%';
+    }
+  }
+
   // One-shot glow pulse on the art tile when a new track starts.
   function pulseNowPlayingArt() {
     const npArt = document.getElementById('np-art');
@@ -1296,6 +1334,7 @@
       document.getElementById('np-channel').textContent = hasTrack ? snapshot.track.channel : '';
       document.getElementById('np-duration').textContent = hasTrack ? formatDuration(snapshot.track.duration_secs) : '';
       if (hasTrack) applyThumbnail(document.getElementById('np-art'), snapshot.track.video_id, snapshot.track.video_id);
+      updateProgress(snapshot);
     }
 
     if (shouldCrossfade) {

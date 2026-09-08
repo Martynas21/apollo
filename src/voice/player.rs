@@ -127,7 +127,6 @@ pub struct AudioSource {
 }
 
 pub struct TrackStatus {
-    #[allow(dead_code)]
     pub position: Duration,
     pub paused: bool,
 }
@@ -1217,6 +1216,16 @@ impl PlayerRegistry {
                 .and_then(|state| state.current_handle.clone())
         }?;
         handle.status().await.map(|status| status.paused)
+    }
+
+    pub async fn track_position(&self, guild_id: GuildId) -> Option<Duration> {
+        let handle = {
+            let guilds = self.guilds.lock().await;
+            guilds
+                .get(&guild_id)
+                .and_then(|state| state.current_handle.clone())
+        }?;
+        handle.status().await.map(|status| status.position)
     }
 
     pub async fn get_volume(&self, guild_id: GuildId) -> u8 {

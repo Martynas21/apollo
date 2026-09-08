@@ -72,6 +72,7 @@ struct TrackJson {
 struct SnapshotJson {
     state: &'static str,
     track: Option<TrackJson>,
+    position_ms: Option<u64>,
     volume: u8,
     radio_enabled: bool,
     upcoming: Vec<TrackJson>,
@@ -118,9 +119,19 @@ async fn build_snapshot(player: &PlayerRegistry, guild_id: GuildId) -> SnapshotJ
 
     let upcoming: Vec<TrackJson> = snapshot.upcoming.iter().map(track_json).collect();
 
+    let position_ms = if matches!(state, "playing" | "paused") {
+        player
+            .track_position(guild_id)
+            .await
+            .map(|position| u64::try_from(position.as_millis()).unwrap_or(u64::MAX))
+    } else {
+        None
+    };
+
     SnapshotJson {
         state,
         track,
+        position_ms,
         volume,
         radio_enabled,
         upcoming,
