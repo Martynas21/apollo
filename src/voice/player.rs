@@ -97,6 +97,7 @@ pub enum PlayerError {
     NothingPlaying,
     NothingToShuffle,
     QueueEmpty,
+    InvalidQueueIndex,
     Join(String),
     Playback(String),
     Storage(String),
@@ -109,6 +110,7 @@ impl std::fmt::Display for PlayerError {
             Self::NothingPlaying => write!(f, "nothing is playing"),
             Self::NothingToShuffle => write!(f, "not enough upcoming tracks to shuffle"),
             Self::QueueEmpty => write!(f, "the queue is already empty"),
+            Self::InvalidQueueIndex => write!(f, "invalid queue position"),
             Self::Join(message) => write!(f, "failed to join voice channel: {message}"),
             Self::Playback(message) => write!(f, "playback error: {message}"),
             Self::Storage(message) => write!(f, "failed to save setting: {message}"),
@@ -1085,6 +1087,63 @@ impl PlayerRegistry {
         }
 
         items.shuffle(&mut rand::rng());
+        db::queue_replace_all(&self.db, &guild_id_str, &items)
+            .await
+            .map_err(|e| PlayerError::Storage(e.to_string()))?;
+        if let Some(state) = guilds.get_mut(&guild_id) {
+            self.restart_prefetch(state, items.first().cloned());
+        }
+        drop(guilds);
+
+        self.refresh_panel(guild_id).await;
+        self.persist_session(guild_id).await;
+        Ok(())
+    }
+
+    pub async fn remove_queue_track(
+        &self,
+        guild_id: GuildId,
+        index: usize,
+    ) -> Result<(), PlayerError> {
+        let guild_id_str = guild_id.to_string();
+        let mut guilds = self.guilds.lock().await;
+        let mut items = db::queue_all(&self.db, &guild_id_str)
+            .await
+            .map_err(|e| PlayerError::Storage(e.to_string()))?;
+        if index >= items.len() {
+            return Err(PlayerError::InvalidQueueIndex);
+        }
+
+        items.remove(index);
+        db::queue_replace_all(&self.db, &guild_id_str, &items)
+            .await
+            .map_err(|e| PlayerError::Storage(e.to_string()))?;
+        if let Some(state) = guilds.get_mut(&guild_id) {
+            self.restart_prefetch(state, items.first().cloned());
+        }
+        drop(guilds);
+
+        self.refresh_panel(guild_id).await;
+        self.persist_session(guild_id).await;
+        Ok(())
+    }
+
+    pub async fn move_queue_track(
+        &self,
+        guild_id: GuildId,
+        from: usize,
+        to: usize,
+    ) -> Result<(), PlayerError> {
+        let guild_id_str = guild_id.to_string();
+        let mut guilds = self.guilds.lock().await;
+        let mut items = db::queue_all(&self.db, &guild_id_str)
+            .await
+            .map_err(|e| PlayerError::Storage(e.to_string()))?;
+        if from >= items.len() || to >= items.len() || from == to {
+            return Err(PlayerError::InvalidQueueIndex);
+        }
+
+        items.swap(from, to);
         db::queue_replace_all(&self.db, &guild_id_str, &items)
             .await
             .map_err(|e| PlayerError::Storage(e.to_string()))?;
@@ -2859,10 +2918,12 @@ mod tests {
         ToggleRadio,
         ClearQueue,
         SetVolume,
+        RemoveQueueTrack,
+        MoveQueueTrack,
     }
 
     impl MatrixAction {
-        const ALL: [MatrixAction; 8] = [
+        const ALL: [MatrixAction; 10] = [
             MatrixAction::Pause,
             MatrixAction::Resume,
             MatrixAction::Skip,
@@ -2871,6 +2932,8 @@ mod tests {
             MatrixAction::ToggleRadio,
             MatrixAction::ClearQueue,
             MatrixAction::SetVolume,
+            MatrixAction::RemoveQueueTrack,
+            MatrixAction::MoveQueueTrack,
         ];
 
         async fn invoke(&self, registry: &PlayerRegistry, guild_id: GuildId) {
@@ -2899,6 +2962,12 @@ mod tests {
                 MatrixAction::SetVolume => {
                     let _ = registry.set_volume(guild_id, 42).await;
                 }
+                MatrixAction::RemoveQueueTrack => {
+                    let _ = registry.remove_queue_track(guild_id, 0).await;
+                }
+                MatrixAction::MoveQueueTrack => {
+                    let _ = registry.move_queue_track(guild_id, 0, 1).await;
+                }
             }
         }
 
@@ -2912,6 +2981,8 @@ mod tests {
                 MatrixAction::ToggleRadio => "toggle_radio",
                 MatrixAction::ClearQueue => "clear_queue",
                 MatrixAction::SetVolume => "set_volume",
+                MatrixAction::RemoveQueueTrack => "remove_queue_track",
+                MatrixAction::MoveQueueTrack => "move_queue_track",
             }
         }
     }

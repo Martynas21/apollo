@@ -39,7 +39,9 @@ fn player_error_status(err: &PlayerError) -> StatusCode {
         PlayerError::NothingPlaying | PlayerError::NothingToShuffle | PlayerError::QueueEmpty => {
             StatusCode::CONFLICT
         }
-        PlayerError::NotConnected | PlayerError::Join(_) => StatusCode::BAD_REQUEST,
+        PlayerError::NotConnected | PlayerError::Join(_) | PlayerError::InvalidQueueIndex => {
+            StatusCode::BAD_REQUEST
+        }
         PlayerError::Playback(_) | PlayerError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
@@ -64,6 +66,7 @@ struct SnapshotJson {
     track: Option<TrackJson>,
     volume: u8,
     radio_enabled: bool,
+    upcoming: Vec<TrackJson>,
 }
 
 fn track_json(queued: &crate::voice::QueuedTrack) -> TrackJson {
@@ -96,11 +99,14 @@ async fn build_snapshot(player: &PlayerRegistry, guild_id: GuildId) -> SnapshotJ
         ("empty", None)
     };
 
+    let upcoming: Vec<TrackJson> = snapshot.upcoming.iter().map(track_json).collect();
+
     SnapshotJson {
         state,
         track,
         volume,
         radio_enabled,
+        upcoming,
     }
 }
 
@@ -263,5 +269,44 @@ pub async fn set_volume(
         return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
     };
     let result = state.player.set_volume(guild_id, body.level).await;
+    respond_after(&state.player, guild_id, result).await
+}
+
+pub async fn remove_queue_track(
+    State(state): State<WebState>,
+    Path((guild_id, index)): Path<(String, usize)>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+    let result = state.player.remove_queue_track(guild_id, index).await;
+    respond_after(&state.player, guild_id, result).await
+}
+
+#[derive(Deserialize)]
+pub struct MoveQueueTrackRequest {
+    to: usize,
+}
+
+pub async fn move_queue_track(
+    State(state): State<WebState>,
+    Path((guild_id, index)): Path<(String, usize)>,
+    Json(body): Json<MoveQueueTrackRequest>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+    let result = state
+        .player
+        .move_queue_track(guild_id, index, body.to)
+        .await;
+    respond_after(&state.player, guild_id, result).await
+}
+
+pub async fn clear_queue(State(state): State<WebState>, Path(guild_id): Path<String>) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+    let result = state.player.clear_queue(guild_id).await;
     respond_after(&state.player, guild_id, result).await
 }

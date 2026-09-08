@@ -76,6 +76,8 @@ off; where it doesn't, a single cell covers both.
 | `/radio` (`toggle_radio`) | flips the flag; refills if turning on with an empty queue | same | same | same | same |
 | Panel Clear Queue (`clear_queue`) | `QueueEmpty` | `QueueEmpty` unless upcoming tracks exist | drops upcoming, leaves `now_playing` alone; refills if radio is on | same as Playing | `QueueEmpty` |
 | Panel Volume (`set_volume`) | persists the setting; no current track to apply it to | persists; no handle yet | persists and applies to the current handle | same as Playing | persists |
+| Panel Remove Track (`remove_queue_track`) | `InvalidQueueIndex` | `InvalidQueueIndex` unless upcoming tracks exist | removes the track at that queue position, leaves `now_playing` alone, restarts the prefetch if the first upcoming track changed | same as Playing | `InvalidQueueIndex` |
+| Panel Reorder Track (`move_queue_track`) | `InvalidQueueIndex` | `InvalidQueueIndex` unless upcoming tracks exist | swaps two upcoming queue positions, leaves `now_playing` alone, restarts the prefetch if the first upcoming track changed | same as Playing | `InvalidQueueIndex` |
 
 In every case, the action either succeeds, silently no-ops, or returns a
 well-typed `PlayerError` — never panics — and the invariant

@@ -4,9 +4,10 @@
 //! a Discord message.
 //!
 //! Scope is deliberately narrow for now: now-playing state and transport
-//! controls (pause/resume/skip/stop/shuffle/radio/volume) for whichever
-//! guild the dashboard's server switcher has selected. Queue management,
-//! search, and playlists are not implemented here yet.
+//! controls (pause/resume/skip/stop/shuffle/radio/volume) plus queue
+//! management (remove/reorder/clear) for whichever guild the dashboard's
+//! server switcher has selected. Search and playlists are not implemented
+//! here yet.
 
 mod api;
 mod auth;
@@ -62,6 +63,15 @@ pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {
             post(api::toggle_radio),
         )
         .route("/api/guilds/{guild_id}/volume", post(api::set_volume))
+        .route(
+            "/api/guilds/{guild_id}/queue/{index}/remove",
+            post(api::remove_queue_track),
+        )
+        .route(
+            "/api/guilds/{guild_id}/queue/{index}/move",
+            post(api::move_queue_track),
+        )
+        .route("/api/guilds/{guild_id}/queue/clear", post(api::clear_queue))
         .route_layer(from_fn_with_state(state.clone(), auth::require_session));
 
     let public = Router::new()
