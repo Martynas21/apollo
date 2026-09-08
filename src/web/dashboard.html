@@ -251,7 +251,7 @@
   .compact-row {
     position: relative;
     display: grid; grid-template-columns: 34px 1fr auto auto; gap: 10px; align-items: center; padding: 7px 4px; border-radius: 8px;
-    max-height: 64px; overflow: hidden;
+    overflow: hidden;
     transition: opacity .18s ease-out, transform .18s ease-out,
       max-height .16s ease-in, padding-top .16s ease-in, padding-bottom .16s ease-in,
       margin-top .16s ease-in, margin-bottom .16s ease-in, background-color .12s ease;
@@ -741,7 +741,19 @@
     }
     el.addEventListener('transitionend', onTransitionEnd);
     fallback = setTimeout(finish, 250);
+    // The exit transition shrinks max-height to 0, which needs an explicit
+    // starting px value to animate from (CSS can't interpolate from the
+    // resting `none`) — measure the row's actual rendered height rather than
+    // guessing a constant, so rows taller than an assumed height never get
+    // clipped in the resting (non-exiting) state. The inline value is only
+    // there to seed that starting point for one committed frame: it's
+    // cleared in the same breath `row-exit` is added so the class's own
+    // `max-height: 0` (not an inline style that would outrank it) drives the
+    // actual animated transition.
+    el.style.maxHeight = `${el.scrollHeight}px`;
+    void el.offsetHeight;
     el.classList.add('row-exit');
+    el.style.maxHeight = '';
   }
 
   function reconcileList(container, items, keyOf, createRow, updateRow) {
