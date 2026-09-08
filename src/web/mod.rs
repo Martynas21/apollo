@@ -49,6 +49,11 @@ impl WebState {
 pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {
     let protected = Router::new()
         .route("/api/guilds", get(api::list_guilds))
+        .route(
+            "/api/guilds/{guild_id}/voice-channels",
+            get(api::list_voice_channels),
+        )
+        .route("/api/guilds/{guild_id}/join", post(api::join_voice_channel))
         .route("/api/guilds/{guild_id}/now-playing", get(api::now_playing))
         .route("/api/guilds/{guild_id}/ws", get(api::now_playing_ws))
         .route(

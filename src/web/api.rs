@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
-use serenity::GuildId;
+use serenity::{ChannelId, ChannelType, GuildId};
 
 use crate::commands::playback::extract_video_id;
 use crate::db;
@@ -36,6 +36,10 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
 
 fn parse_guild_id(raw: &str) -> Option<GuildId> {
     raw.parse::<u64>().ok().map(GuildId::new)
+}
+
+fn parse_channel_id(raw: &str) -> Option<ChannelId> {
+    raw.parse::<u64>().ok().map(ChannelId::new)
 }
 
 fn player_error_status(err: &PlayerError) -> StatusCode {
@@ -180,6 +184,64 @@ pub async fn list_guilds(State(state): State<WebState>) -> Response {
         })
         .collect();
     Json(guilds).into_response()
+}
+
+#[derive(Serialize)]
+struct VoiceChannelJson {
+    id: String,
+    name: String,
+}
+
+pub async fn list_voice_channels(
+    State(state): State<WebState>,
+    Path(guild_id): Path<String>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+    let Some(guild) = state.cache.guild(guild_id) else {
+        return error_response(StatusCode::NOT_FOUND, "guild not found");
+    };
+
+    let mut channels: Vec<(u16, VoiceChannelJson)> = guild
+        .channels
+        .values()
+        .filter(|channel| channel.kind == ChannelType::Voice)
+        .map(|channel| {
+            (
+                channel.position,
+                VoiceChannelJson {
+                    id: channel.id.to_string(),
+                    name: channel.name.clone(),
+                },
+            )
+        })
+        .collect();
+    channels.sort_by_key(|(position, _)| *position);
+
+    let channels: Vec<VoiceChannelJson> =
+        channels.into_iter().map(|(_, channel)| channel).collect();
+    Json(channels).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct JoinVoiceChannelRequest {
+    channel_id: String,
+}
+
+pub async fn join_voice_channel(
+    State(state): State<WebState>,
+    Path(guild_id): Path<String>,
+    Json(body): Json<JoinVoiceChannelRequest>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+    let Some(channel_id) = parse_channel_id(&body.channel_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid channel id");
+    };
+    let result = state.player.join(guild_id, channel_id).await;
+    respond_after(&state.player, guild_id, result).await
 }
 
 pub async fn now_playing(State(state): State<WebState>, Path(guild_id): Path<String>) -> Response {

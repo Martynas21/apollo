@@ -318,6 +318,37 @@
   }
   #status-line.status-visible { opacity: 1; }
   #status-line.status-error { color: var(--danger); }
+
+  /* ---- Join-a-voice-channel modal ---- */
+  .modal-overlay {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(0,0,0,.55);
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; pointer-events: none;
+    transition: opacity .15s ease-out;
+  }
+  .modal-overlay.open { opacity: 1; pointer-events: auto; }
+  .modal-card {
+    width: 360px; max-width: calc(100vw - 40px);
+    background: var(--bg-elevated); border: 1px solid var(--border-soft);
+    border-radius: 16px; padding: 24px;
+    box-shadow: 0 20px 50px rgba(0,0,0,.5);
+    transform: translateY(-10px) scale(.97);
+    transition: transform .15s ease-out;
+  }
+  .modal-overlay.open .modal-card { transform: translateY(0) scale(1); }
+  .modal-title { font-family: 'Spectral', serif; font-size: 17px; font-weight: 600; margin: 0 0 6px; }
+  .modal-subtext { font-size: 13px; color: var(--text-muted); margin: 0 0 16px; }
+  .modal-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+  .channel-row {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 10px; border-radius: 9px; background: none; border: none;
+    text-align: left; font-size: 13.5px; color: var(--text);
+  }
+  .channel-row:hover { background: var(--bg-hover); }
+  .channel-row-icon { display: flex; flex-shrink: 0; color: var(--text-faint); }
+  .channel-row:hover .channel-row-icon { color: var(--accent); }
+  .channel-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -477,6 +508,18 @@
   </div>
 
   <div id="status-line"></div>
+</div>
+
+<div class="modal-overlay" id="join-modal-overlay">
+  <div class="modal-card">
+    <h3 class="modal-title">Join a voice channel</h3>
+    <p class="modal-subtext">Apollo isn't in a voice channel yet — pick one to continue.</p>
+    <div class="scroll-list" id="join-channel-list"></div>
+    <div class="muted-note" id="join-channel-empty-note" style="display:none">No voice channels found.</div>
+    <div class="modal-actions">
+      <button class="ghost-btn" id="join-modal-cancel" type="button">Cancel</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -659,6 +702,7 @@
     renderServerMenu();
     connectSocket(guildId);
     clearSearch();
+    closeJoinModal();
     loadPlaylists(guildId);
     loadFavourites(guildId);
   }
@@ -1213,6 +1257,92 @@
     }, 250);
   });
 
+  // ---- Join-a-voice-channel modal ----
+  // Surfaced reactively: a queue/playlist action fails with PlayerError::
+  // NotConnected (see src/voice/player.rs) whenever the bot has no active
+  // voice connection in this guild, since nothing upstream of that point
+  // knows which channel to join. Rather than just showing the error, offer
+  // a channel picker and — once the user picks one and the join succeeds —
+  // replay whatever action triggered the modal.
+  const NOT_CONNECTED_ERROR = 'not connected to a voice channel';
+  const VOICE_ICON = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>';
+
+  const joinModalOverlay = document.getElementById('join-modal-overlay');
+  const joinChannelList = document.getElementById('join-channel-list');
+  const joinChannelEmptyNote = document.getElementById('join-channel-empty-note');
+  let pendingRetryAction = null;
+
+  function closeJoinModal() {
+    joinModalOverlay.classList.remove('open');
+    pendingRetryAction = null;
+  }
+
+  function createChannelRow(channel) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'channel-row';
+
+    const icon = document.createElement('span');
+    icon.className = 'channel-row-icon';
+    icon.innerHTML = VOICE_ICON;
+    row.appendChild(icon);
+
+    const name = document.createElement('span');
+    name.className = 'channel-row-name';
+    name.textContent = channel.name;
+    row.appendChild(name);
+
+    row.addEventListener('click', () => joinChannel(channel.id, channel.name));
+    return row;
+  }
+
+  async function openJoinModal(retryAction) {
+    pendingRetryAction = retryAction || null;
+    joinModalOverlay.classList.add('open');
+    joinChannelList.innerHTML = '';
+    joinChannelEmptyNote.style.display = 'none';
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/voice-channels`);
+      if (!response.ok) return;
+      const channels = await response.json();
+      if (channels.length === 0) {
+        joinChannelEmptyNote.style.display = 'block';
+        return;
+      }
+      for (const channel of channels) {
+        joinChannelList.appendChild(createChannelRow(channel));
+      }
+    } catch (err) { /* showLogin already handled unauthorized */ }
+  }
+
+  async function joinChannel(channelId, channelName) {
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/join`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel_id: channelId }),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        showStatus(body.error || 'Could not join that channel.', { isError: true });
+        return;
+      }
+      renderSnapshot(body);
+      showStatus(`Joined "${channelName}".`);
+      const retry = pendingRetryAction;
+      closeJoinModal();
+      if (retry) retry();
+    } catch (err) { /* showLogin already handled unauthorized */ }
+  }
+
+  document.getElementById('join-modal-cancel').addEventListener('click', closeJoinModal);
+  joinModalOverlay.addEventListener('click', (event) => {
+    if (event.target === joinModalOverlay) closeJoinModal();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && joinModalOverlay.classList.contains('open')) closeJoinModal();
+  });
+
   // ---- Search ----
   // Faithful mirror of the backend's extract_video_id (src/commands/playback.rs)
   // so "is this a link" is decided identically client-side and server-side.
@@ -1363,6 +1493,10 @@
       });
       const body = await response.json();
       if (!response.ok) {
+        if (body.error === NOT_CONNECTED_ERROR) {
+          openJoinModal(() => addToQueue(videoId, title));
+          return;
+        }
         showStatus(body.error || 'Could not add that track.', { isError: true });
         return;
       }
@@ -1441,6 +1575,10 @@
       const response = await api(`/api/guilds/${currentGuildId}/playlists/${id}/play`, { method: 'POST' });
       const body = await response.json();
       if (!response.ok) {
+        if (body.error === NOT_CONNECTED_ERROR) {
+          openJoinModal(() => playPlaylist(id, name));
+          return;
+        }
         showStatus(body.error || 'Could not start that playlist.', { isError: true });
         return;
       }
