@@ -1,6 +1,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-mod commands;
 mod config;
 mod db;
 mod voice;
@@ -8,10 +7,10 @@ mod web;
 mod youtube;
 
 use anyhow::Context;
-use commands::{Data, Error};
-use poise::serenity_prelude as serenity;
+use serenity::all as serenity;
 use songbird::serenity::SerenityInit;
 use tracing_subscriber::EnvFilter;
+use voice::PlayerRegistry;
 use voice::ipc_backend::IpcBackend;
 
 #[tokio::main(worker_threads = 2)]
@@ -35,21 +34,63 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let data = build_data(&config, db_pool.clone(), voice_backend);
-    let dashboard_player = data.player.clone();
+    let player = build_player(&config, db_pool.clone(), voice_backend);
+    let dashboard_player = player.clone();
 
-    let framework = build_framework(config.discord_guild_id, data);
+    let application_id: u64 = config
+        .discord_application_id
+        .parse()
+        .context("DISCORD_APPLICATION_ID is not a valid application id")?;
 
     let intents = serenity::GatewayIntents::GUILDS | serenity::GatewayIntents::GUILD_VOICE_STATES;
     let mut client = serenity::ClientBuilder::new(config.discord_token.clone(), intents)
-        .framework(framework)
+        .application_id(serenity::ApplicationId::new(application_id))
+        .event_handler(Handler)
         .register_songbird_with(songbird)
         .await?;
+
+    clear_stale_slash_commands(&client.http, config.discord_guild_id).await?;
 
     spawn_dashboard(&config, dashboard_player, db_pool, client.cache.clone());
 
     client.start().await?;
 
+    Ok(())
+}
+
+struct Handler;
+
+#[async_trait::async_trait]
+impl serenity::EventHandler for Handler {
+    async fn ready(&self, _ctx: serenity::Context, data_about_bot: serenity::Ready) {
+        tracing::info!(user = %data_about_bot.user.name, "ready");
+    }
+
+    async fn resume(&self, _ctx: serenity::Context, _: serenity::ResumedEvent) {
+        tracing::info!("resumed");
+    }
+}
+
+/// Clears any slash commands this bot previously registered, so `/play` etc.
+/// don't linger in Discord's UI after the switch to the web dashboard. Mirrors
+/// the guild-vs-global scoping the old registration step used.
+async fn clear_stale_slash_commands(
+    http: &serenity::Http,
+    guild_id: Option<u64>,
+) -> anyhow::Result<()> {
+    match guild_id {
+        Some(id) => {
+            serenity::GuildId::new(id)
+                .set_commands(http, Vec::new())
+                .await
+                .context("failed to clear guild slash commands")?;
+        }
+        None => {
+            serenity::Command::set_global_commands(http, Vec::new())
+                .await
+                .context("failed to clear global slash commands")?;
+        }
+    }
     Ok(())
 }
 
@@ -96,82 +137,19 @@ async fn connect_backends(
     Ok((db_pool, voice_backend))
 }
 
-fn build_data(
+fn build_player(
     config: &config::Config,
     db_pool: sqlx::SqlitePool,
     voice_backend: IpcBackend,
-) -> Data {
-    let discord_http = std::sync::Arc::new(serenity::Http::new(&config.discord_token));
+) -> PlayerRegistry {
     let youtube_client = youtube::api::YouTubeClient::new(
         config.yt_dlp_cookies_file.clone(),
         config.playlist_track_limit,
     );
-    let player = voice::PlayerRegistry::new(
+    voice::PlayerRegistry::new(
         std::sync::Arc::new(voice_backend),
-        discord_http,
         config.yt_dlp_cookies_file.clone(),
-        db_pool.clone(),
-        youtube_client.clone(),
-    );
-
-    Data {
-        youtube: youtube_client,
-        player,
-        db: db_pool,
-    }
-}
-
-fn build_framework(guild_id: Option<u64>, data: Data) -> poise::Framework<Data, Error> {
-    poise::Framework::builder()
-        .options(poise::FrameworkOptions {
-            commands: commands::commands(),
-            event_handler: |ctx, event, _framework, data| Box::pin(event_handler(ctx, event, data)),
-            ..Default::default()
-        })
-        .setup(move |ctx, _ready, framework| {
-            Box::pin(async move {
-                match guild_id {
-                    Some(id) => {
-                        poise::builtins::register_in_guild(
-                            ctx,
-                            &framework.options().commands,
-                            serenity::GuildId::new(id),
-                        )
-                        .await?;
-                    }
-                    None => {
-                        poise::builtins::register_globally(ctx, &framework.options().commands)
-                            .await?;
-                    }
-                }
-                Ok(data)
-            })
-        })
-        .build()
-}
-
-async fn event_handler(
-    ctx: &serenity::Context,
-    event: &serenity::FullEvent,
-    data: &Data,
-) -> Result<(), Error> {
-    match event {
-        serenity::FullEvent::Ready { data_about_bot } => {
-            tracing::info!(user = %data_about_bot.user.name, "ready");
-        }
-        serenity::FullEvent::Resume { .. } => {
-            tracing::info!("resumed");
-        }
-        serenity::FullEvent::InteractionCreate {
-            interaction: serenity::Interaction::Component(component),
-        } => {
-            if component.data.custom_id.starts_with("player:") {
-                commands::handle_player_component(ctx, component, data).await?;
-            } else if component.data.custom_id.starts_with("library:") {
-                commands::handle_library_component(ctx, component, data).await?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
+        db_pool,
+        youtube_client,
+    )
 }

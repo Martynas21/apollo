@@ -1,5 +1,4 @@
 pub mod ipc_backend;
-pub mod panel;
 pub mod player;
 pub mod radio;
 pub mod resolve;

@@ -27,7 +27,6 @@ songbird = "0.6.0"
 # (mkv/webm, ogg, wav, vorbis, flac, pcm) cover YouTube's typical Opus-in-WebM
 # best-audio pick; aac/isomp4 cover the common AAC-in-MP4 fallback.
 symphonia = { version = "0.5", features = ["aac", "isomp4"] }
-poise = "0.6.2"
 url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

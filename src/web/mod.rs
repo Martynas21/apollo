@@ -1,13 +1,13 @@
 //! The web dashboard: a small HTTP+WebSocket surface exposing "Now Playing"
-//! state and transport controls, mirroring what the Discord `/player` panel
-//! already does (see `voice::panel`) but reachable from a browser instead of
-//! a Discord message.
+//! state and full playback control for whichever of the bot's guilds the
+//! dashboard's server switcher has selected. It's the only control surface —
+//! Discord slash commands and the old `/player` panel have been removed.
 //!
-//! Scope is deliberately narrow for now: now-playing state and transport
-//! controls (pause/resume/skip/stop/shuffle/radio/volume) plus queue
-//! management (remove/reorder/clear), YouTube search/add-to-queue,
-//! saved-playlist listing/play/import, and per-guild play-count favourites,
-//! all for whichever guild the dashboard's server switcher has selected.
+//! Covers: now-playing state and transport controls
+//! (pause/resume/skip/stop/shuffle/radio/volume), queue management
+//! (remove/reorder/clear), YouTube search/add-to-queue, saved-playlist
+//! management (import/play/refresh/remove), and per-guild play-count
+//! favourites.
 
 mod api;
 mod auth;
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
-use poise::serenity_prelude as serenity;
+use serenity::all as serenity;
 
 pub use auth::bootstrap_user_if_needed;
 
@@ -46,8 +46,8 @@ impl WebState {
     }
 }
 
-pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {
-    let protected = Router::new()
+fn playback_routes() -> Router<WebState> {
+    Router::new()
         .route("/api/guilds", get(api::list_guilds))
         .route(
             "/api/guilds/{guild_id}/voice-channels",
@@ -79,6 +79,11 @@ pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {
         .route("/api/guilds/{guild_id}/queue/clear", post(api::clear_queue))
         .route("/api/guilds/{guild_id}/search", get(api::search))
         .route("/api/guilds/{guild_id}/queue/add", post(api::add_to_queue))
+        .route("/api/guilds/{guild_id}/favourites", get(api::favourites))
+}
+
+fn playlist_routes() -> Router<WebState> {
+    Router::new()
         .route("/api/guilds/{guild_id}/playlists", get(api::list_playlists))
         .route(
             "/api/guilds/{guild_id}/playlists/import",
@@ -88,7 +93,19 @@ pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {
             "/api/guilds/{guild_id}/playlists/{playlist_id}/play",
             post(api::play_playlist),
         )
-        .route("/api/guilds/{guild_id}/favourites", get(api::favourites))
+        .route(
+            "/api/guilds/{guild_id}/playlists/{playlist_id}/refresh",
+            post(api::refresh_playlist),
+        )
+        .route(
+            "/api/guilds/{guild_id}/playlists/{playlist_id}/remove",
+            post(api::remove_playlist),
+        )
+}
+
+pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {
+    let protected = playback_routes()
+        .merge(playlist_routes())
         .route_layer(from_fn_with_state(state.clone(), auth::require_session));
 
     let public = Router::new()

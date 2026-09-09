@@ -60,6 +60,35 @@ impl std::fmt::Display for YouTubeApiError {
 
 impl std::error::Error for YouTubeApiError {}
 
+pub fn extract_video_id(input: &str) -> Option<String> {
+    let url = url::Url::parse(input).ok()?;
+    let host = url.host_str()?;
+
+    if host == "youtu.be" {
+        return url
+            .path_segments()?
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+    }
+
+    if host == "youtube.com" || host.ends_with(".youtube.com") {
+        if url.path() == "/watch" {
+            return url
+                .query_pairs()
+                .find(|(key, _)| key == "v")
+                .map(|(_, value)| value.into_owned());
+        }
+        if let Some(rest) = url.path().strip_prefix("/shorts/") {
+            let id = rest.split('/').next()?;
+            return (!id.is_empty()).then(|| id.to_string());
+        }
+        return None;
+    }
+
+    None
+}
+
 fn truncate_tail(s: &str, max_len: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_len {
@@ -316,6 +345,56 @@ impl YouTubeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_from_youtu_be_short_link() {
+        assert_eq!(
+            extract_video_id("https://youtu.be/dQw4w9WgXcQ"),
+            Some("dQw4w9WgXcQ".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_from_watch_url_with_extra_params() {
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLxxxx"),
+            Some("dQw4w9WgXcQ".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_from_shorts_url() {
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/shorts/dQw4w9WgXcQ"),
+            Some("dQw4w9WgXcQ".to_string())
+        );
+    }
+
+    #[test]
+    fn plain_search_query_returns_none() {
+        assert_eq!(extract_video_id("never gonna give you up"), None);
+    }
+
+    #[test]
+    fn extracts_from_music_youtube_com() {
+        assert_eq!(
+            extract_video_id("https://music.youtube.com/watch?v=dQw4w9WgXcQ"),
+            Some("dQw4w9WgXcQ".to_string())
+        );
+    }
+
+    #[test]
+    fn unrecognized_path_on_known_host_returns_none() {
+        assert_eq!(
+            extract_video_id("https://www.youtube.com/channel/UCxxxx"),
+            None
+        );
+    }
+
+    #[test]
+    fn unrelated_url_returns_none() {
+        assert_eq!(extract_video_id("https://example.com/foo"), None);
+    }
 
     #[test]
     fn maps_entry_with_channel_field() {

@@ -2,9 +2,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use poise::serenity_prelude as serenity;
 use rand::seq::SliceRandom;
-use serenity::{ChannelId, GuildId, MessageId, UserId};
+use serenity::all::{ChannelId, GuildId, UserId};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -60,28 +59,6 @@ fn better_playback_error(
     match preflight {
         Some(classified) if !matches!(classified, PlaybackError::Other(_)) => classified,
         _ => original,
-    }
-}
-
-enum PanelEditFailure {
-    Gone,
-    Transient(String),
-}
-
-impl PanelEditFailure {
-    fn classify(err: &serenity::Error) -> Self {
-        const UNKNOWN_MESSAGE: isize = 10008;
-
-        let serenity::Error::Http(serenity::HttpError::UnsuccessfulRequest(response)) = err else {
-            return Self::Transient(err.to_string());
-        };
-        if response.status_code == serenity::StatusCode::NOT_FOUND
-            || response.error.code == UNKNOWN_MESSAGE
-        {
-            Self::Gone
-        } else {
-            Self::Transient(err.to_string())
-        }
     }
 }
 
@@ -182,9 +159,6 @@ struct GuildState {
     current_handle: Option<Arc<dyn VoiceTrack>>,
     current_track_id: Option<Uuid>,
     prefetch: Option<Prefetch>,
-    panel: Option<(ChannelId, MessageId)>,
-    panel_reserved: bool,
-    panel_edit_lock: Arc<Mutex<()>>,
     radio_enabled: bool,
     radio_history: VecDeque<String>,
     radio_requested_by: Option<UserId>,
@@ -194,30 +168,6 @@ struct GuildState {
     radio_refill_notify: Option<Arc<Notify>>,
     epoch: u64,
     restore_attempted: bool,
-}
-
-impl GuildState {
-    fn set_panel(&mut self, channel_id: ChannelId, message_id: MessageId) {
-        self.panel = Some((channel_id, message_id));
-        self.panel_reserved = false;
-    }
-
-    fn release_panel(&mut self) {
-        self.panel_reserved = false;
-    }
-
-    fn begin_panel_repost(&mut self) -> PanelRepost {
-        if self.panel_reserved {
-            return PanelRepost::InProgress;
-        }
-        self.panel_reserved = true;
-        PanelRepost::Reserved
-    }
-}
-
-pub enum PanelRepost {
-    Reserved,
-    InProgress,
 }
 
 pub struct QueueSnapshot {
@@ -271,7 +221,6 @@ fn persisted_to_queued_track(pair: Option<(Track, String)>) -> Option<QueuedTrac
 #[derive(Clone)]
 pub struct PlayerRegistry {
     voice: Arc<dyn VoiceBackend>,
-    discord_http: Arc<serenity::Http>,
     cookies_file: Option<String>,
     db: sqlx::SqlitePool,
     youtube: YouTubeClient,
@@ -294,14 +243,12 @@ impl VoiceEvents for PlayerRegistry {
 impl PlayerRegistry {
     pub fn new(
         voice: Arc<dyn VoiceBackend>,
-        discord_http: Arc<serenity::Http>,
         cookies_file: Option<String>,
         db: sqlx::SqlitePool,
         youtube: YouTubeClient,
     ) -> Self {
         Self {
             voice,
-            discord_http,
             cookies_file,
             db,
             youtube,
@@ -315,13 +262,7 @@ impl PlayerRegistry {
 
     #[cfg(test)]
     fn new_for_test(voice: Arc<dyn VoiceBackend>, db: sqlx::SqlitePool) -> Self {
-        Self::new(
-            voice,
-            Arc::new(serenity::Http::new("test-token")),
-            None,
-            db,
-            YouTubeClient::default(),
-        )
+        Self::new(voice, None, db, YouTubeClient::default())
     }
 
     #[cfg(test)]
@@ -408,8 +349,6 @@ impl PlayerRegistry {
             Some(queued) => self.spawn_start_sequence(guild_id, call, queued, epoch, None),
             None => self.schedule_idle_disconnect(guild_id),
         }
-
-        self.refresh_panel(guild_id).await;
     }
 
     async fn load_persisted_session(
@@ -509,37 +448,28 @@ impl PlayerRegistry {
     }
 
     pub async fn leave(&self, guild_id: GuildId) -> Result<(), PlayerError> {
-        let (snapshot, panel) = {
+        let snapshot = {
             let mut guilds = self.guilds.lock().await;
             let snapshot = guilds.get(&guild_id).map(SessionSnapshot::from);
-            let panel = Self::take_guild_state(guild_id, &mut guilds);
-            (snapshot, panel)
+            Self::take_guild_state(guild_id, &mut guilds);
+            snapshot
         };
         if let Some(snapshot) = snapshot {
             self.save_session_snapshot(guild_id, snapshot).await;
         }
 
-        let result = self.voice.remove(guild_id).await.map_err(PlayerError::Join);
-
-        if let Some((channel_id, message_id)) = panel {
-            let _ = self.edit_panel(guild_id, channel_id, message_id).await;
-        }
-        result
+        self.voice.remove(guild_id).await.map_err(PlayerError::Join)
     }
 
-    fn take_guild_state(
-        guild_id: GuildId,
-        guilds: &mut HashMap<GuildId, GuildState>,
-    ) -> Option<(ChannelId, MessageId)> {
+    fn take_guild_state(guild_id: GuildId, guilds: &mut HashMap<GuildId, GuildState>) {
         let mut removed = guilds.remove(&guild_id);
         if let Some(prefetch) = removed.as_mut().and_then(|state| state.prefetch.take()) {
             discard_prefetch(prefetch);
         }
-        removed.and_then(|state| state.panel)
     }
 
     async fn leave_if_idle(&self, guild_id: GuildId) {
-        let (snapshot, panel) = {
+        let snapshot = {
             let mut guilds = self.guilds.lock().await;
             let now_playing_set = guilds
                 .get(&guild_id)
@@ -564,21 +494,16 @@ impl PlayerRegistry {
             }
 
             let snapshot = guilds.get(&guild_id).map(SessionSnapshot::from);
-            let panel = Self::take_guild_state(guild_id, &mut guilds);
-            (snapshot, panel)
+            Self::take_guild_state(guild_id, &mut guilds);
+            snapshot
         };
 
         if let Some(snapshot) = snapshot {
             self.save_session_snapshot(guild_id, snapshot).await;
         }
 
-        let result = self.voice.remove(guild_id).await.map_err(PlayerError::Join);
-
-        if let Err(err) = result {
+        if let Err(err) = self.voice.remove(guild_id).await.map_err(PlayerError::Join) {
             tracing::warn!(%guild_id, %err, "idle disconnect failed to leave voice");
-        }
-        if let Some((channel_id, message_id)) = panel {
-            let _ = self.edit_panel(guild_id, channel_id, message_id).await;
         }
     }
 
@@ -607,7 +532,6 @@ impl PlayerRegistry {
             self.spawn_start_sequence(guild_id, call, queued, epoch, None);
         }
 
-        self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
         Ok(())
     }
@@ -659,7 +583,6 @@ impl PlayerRegistry {
             self.spawn_start_sequence(guild_id, call, first, epoch, None);
         }
 
-        self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
         Ok(())
     }
@@ -757,7 +680,6 @@ impl PlayerRegistry {
             self.schedule_idle_disconnect(guild_id);
         }
 
-        self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
     }
 
@@ -937,7 +859,6 @@ impl PlayerRegistry {
             }
         }
 
-        self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
     }
 
@@ -1023,7 +944,6 @@ impl PlayerRegistry {
         }
 
         self.schedule_idle_disconnect(guild_id);
-        self.refresh_panel(guild_id).await;
         if let Err(err) = db::clear_guild_session(&self.db, &guild_id.to_string()).await {
             tracing::warn!(%guild_id, %err, "failed to clear the persisted session on stop");
         }
@@ -1058,7 +978,6 @@ impl PlayerRegistry {
             .map_err(|e| PlayerError::Playback(e.to_string()));
         if result.is_ok() {
             self.schedule_idle_disconnect(guild_id);
-            self.refresh_panel(guild_id).await;
         }
         result
     }
@@ -1071,14 +990,10 @@ impl PlayerRegistry {
                 .and_then(|state| state.current_handle.clone())
         };
         let handle = handle.ok_or(PlayerError::NothingPlaying)?;
-        let result = handle
+        handle
             .resume()
             .await
-            .map_err(|e| PlayerError::Playback(e.to_string()));
-        if result.is_ok() {
-            self.refresh_panel(guild_id).await;
-        }
-        result
+            .map_err(|e| PlayerError::Playback(e.to_string()))
     }
 
     pub async fn shuffle(&self, guild_id: GuildId) -> Result<(), PlayerError> {
@@ -1100,7 +1015,6 @@ impl PlayerRegistry {
         }
         drop(guilds);
 
-        self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
         Ok(())
     }
@@ -1128,7 +1042,6 @@ impl PlayerRegistry {
         }
         drop(guilds);
 
-        self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
         Ok(())
     }
@@ -1158,7 +1071,6 @@ impl PlayerRegistry {
         }
         drop(guilds);
 
-        self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
         Ok(())
     }
@@ -1191,7 +1103,6 @@ impl PlayerRegistry {
             self.maybe_spawn_radio_refill(guild_id);
         }
 
-        self.refresh_panel(guild_id).await;
         self.persist_session(guild_id).await;
         Ok(())
     }
@@ -1264,7 +1175,6 @@ impl PlayerRegistry {
             tracing::warn!(%err, "failed to apply volume change to current track");
         }
 
-        self.refresh_panel(guild_id).await;
         Ok(())
     }
 
@@ -1290,7 +1200,6 @@ impl PlayerRegistry {
             self.maybe_spawn_radio_refill(guild_id);
         }
 
-        self.refresh_panel(guild_id).await;
         if self.is_connected(guild_id) {
             // Persisting here while disconnected would upsert a blank
             // `now_playing`/`last_played` over whatever session is actually
@@ -1375,7 +1284,6 @@ impl PlayerRegistry {
             // outcome (either a track already started here, or genuinely
             // nothing to start) rather than racing this call.
             self.kick_off_if_idle(guild_id).await;
-            self.refresh_panel(guild_id).await;
             self.persist_session(guild_id).await;
         }
     }
@@ -1545,94 +1453,6 @@ impl PlayerRegistry {
             }
         }
     }
-
-    pub async fn begin_panel_repost(&self, guild_id: GuildId) -> PanelRepost {
-        let mut guilds = self.guilds.lock().await;
-        guilds.entry(guild_id).or_default().begin_panel_repost()
-    }
-
-    pub async fn set_panel(&self, guild_id: GuildId, channel_id: ChannelId, message_id: MessageId) {
-        let old = {
-            let mut guilds = self.guilds.lock().await;
-            let state = guilds.entry(guild_id).or_default();
-            let old = state.panel;
-            state.set_panel(channel_id, message_id);
-            old
-        };
-
-        if let Some((old_channel, old_message)) = old {
-            let _ = old_channel
-                .delete_message(self.discord_http.clone(), old_message)
-                .await;
-        }
-    }
-
-    pub async fn release_panel_slot(&self, guild_id: GuildId) {
-        let mut guilds = self.guilds.lock().await;
-        if let Some(state) = guilds.get_mut(&guild_id) {
-            state.release_panel();
-        }
-    }
-
-    async fn edit_panel(
-        &self,
-        guild_id: GuildId,
-        channel_id: ChannelId,
-        message_id: MessageId,
-    ) -> Result<(), PanelEditFailure> {
-        let (content, embed, components) = crate::voice::panel::render(self, guild_id).await;
-        let mut edit = serenity::EditMessage::new()
-            .content(content)
-            .components(components);
-        edit = match embed {
-            Some(embed) => edit.embed(embed),
-            None => edit.embeds(Vec::new()),
-        };
-
-        channel_id
-            .edit_message(self.discord_http.clone(), message_id, edit)
-            .await
-            .map(|_| ())
-            .map_err(|err| PanelEditFailure::classify(&err))
-    }
-
-    async fn forget_panel_if_gone(
-        &self,
-        guild_id: GuildId,
-        panel: (ChannelId, MessageId),
-        failure: &PanelEditFailure,
-    ) -> bool {
-        if let PanelEditFailure::Transient(message) = failure {
-            tracing::warn!(%guild_id, message, "failed to refresh the /player panel; keeping it");
-            return false;
-        }
-
-        let mut guilds = self.guilds.lock().await;
-        if let Some(state) = guilds.get_mut(&guild_id)
-            && state.panel == Some(panel)
-        {
-            state.panel = None;
-        }
-        true
-    }
-
-    async fn refresh_panel(&self, guild_id: GuildId) {
-        let (panel, edit_lock) = {
-            let guilds = self.guilds.lock().await;
-            let Some(state) = guilds.get(&guild_id) else {
-                return;
-            };
-            (state.panel, state.panel_edit_lock.clone())
-        };
-        let Some(panel) = panel else {
-            return;
-        };
-        let (channel_id, message_id) = panel;
-        let _guard = edit_lock.lock().await;
-        if let Err(failure) = self.edit_panel(guild_id, channel_id, message_id).await {
-            self.forget_panel_if_gone(guild_id, panel, &failure).await;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1727,68 +1547,6 @@ mod tests {
                 other => panic!("expected Other, got {other:?}"),
             }
         }
-    }
-
-    #[test]
-    fn transient_failures_do_not_count_as_a_deleted_panel() {
-        for err in [
-            serenity::Error::Other("timed out"),
-            serenity::Error::Url("bad url".to_string()),
-        ] {
-            assert!(matches!(
-                PanelEditFailure::classify(&err),
-                PanelEditFailure::Transient(_)
-            ));
-        }
-    }
-
-    fn sample_panel() -> (ChannelId, MessageId) {
-        (ChannelId::new(111), MessageId::new(222))
-    }
-
-    #[test]
-    fn set_panel_fulfils_a_reservation_and_records_the_message() {
-        let mut state = GuildState::default();
-        assert!(matches!(state.begin_panel_repost(), PanelRepost::Reserved));
-
-        let (channel_id, message_id) = sample_panel();
-        state.set_panel(channel_id, message_id);
-
-        assert_eq!(state.panel, Some((channel_id, message_id)));
-        assert!(!state.panel_reserved);
-    }
-
-    #[test]
-    fn release_panel_clears_the_reservation_without_touching_panel() {
-        let mut state = GuildState::default();
-        assert!(matches!(state.begin_panel_repost(), PanelRepost::Reserved));
-
-        state.release_panel();
-
-        assert!(!state.panel_reserved);
-        assert!(state.panel.is_none());
-        assert!(matches!(state.begin_panel_repost(), PanelRepost::Reserved));
-    }
-
-    #[test]
-    fn begin_panel_repost_reserves_even_when_a_panel_already_exists() {
-        let mut state = GuildState {
-            panel: Some(sample_panel()),
-            ..GuildState::default()
-        };
-
-        assert!(matches!(state.begin_panel_repost(), PanelRepost::Reserved));
-        assert!(state.panel_reserved);
-    }
-
-    #[test]
-    fn begin_panel_repost_reports_in_progress_while_already_reserved() {
-        let mut state = GuildState::default();
-        assert!(matches!(state.begin_panel_repost(), PanelRepost::Reserved));
-        assert!(matches!(
-            state.begin_panel_repost(),
-            PanelRepost::InProgress
-        ));
     }
 
     #[derive(Default)]
@@ -2855,10 +2613,9 @@ mod tests {
         .await
         .unwrap();
 
-        // The panel's Radio button (and `begin_panel_repost`/`set_panel`)
-        // create a `GuildState` map entry with no connection precondition;
-        // that must not block the later real `join()` from restoring the
-        // persisted session.
+        // `toggle_radio` creates a `GuildState` map entry with no connection
+        // precondition; that must not block the later real `join()` from
+        // restoring the persisted session.
         registry.toggle_radio(guild_id).await;
 
         registry.join(guild_id, ChannelId::new(2)).await.unwrap();

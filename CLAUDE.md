@@ -5,11 +5,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 Apollo is a Discord bot that streams audio from YouTube (search, direct URL,
-or playlist) into a voice channel. All YouTube access goes through a `yt-dlp`
-subprocess — no Google API, no OAuth. Rust, edition 2024, tokio async
-throughout. It's meant to run locally/single-user, not as a multi-tenant
-service — see README.md "Running it" before suggesting deployment-style
-hardening (secrets managers, metrics backends, etc.) that this setup doesn't need.
+or playlist) into a voice channel, controlled entirely through its own web
+dashboard rather than Discord slash commands. All YouTube access goes
+through a `yt-dlp` subprocess — no Google API, no OAuth. Rust, edition 2024,
+tokio async throughout. It's meant to run locally/single-user, not as a
+multi-tenant service — see README.md "Running it" before suggesting
+deployment-style hardening (secrets managers, metrics backends, etc.) that
+this setup doesn't need.
 
 ## Commands
 
@@ -42,9 +44,12 @@ AUDIO_WORKER_SOCKET=127.0.0.1:7878 cargo run --bin apollo
 
 Three-crate Cargo workspace:
 
-- **`apollo`** (root `src/`) — the Discord-facing process: serenity (gateway/REST)
-  + poise (slash commands) + sqlx (SQLite), on tokio. Owns all yt-dlp calls and
-  the database; has no direct voice connection.
+- **`apollo`** (root `src/`) — the Discord-facing process: serenity
+  (gateway/REST) + sqlx (SQLite) + axum (the web dashboard), on tokio. Owns
+  all yt-dlp calls and the database; has no direct voice connection. Discord
+  itself is used only for the gateway connection (guild/channel cache,
+  voice-state) — all playback control comes from the dashboard in `src/web/`,
+  not slash commands.
 - **`audio-worker/`** (`apollo-audio-worker`) — a separate OS process holding
   the actual `songbird::Driver`/voice connection, isolated so gateway traffic,
   DB writes, and `yt-dlp` spawns in `apollo` can't starve the mixer's packet
@@ -81,10 +86,12 @@ Key points:
   immediately) and `commit_started_track` (sets `current_track_id` once audio
   has actually started).
 - Radio mode (`radio_enabled`) is an orthogonal flag, not a sixth state — it
-  changes auto-refill behavior at the edges (queue-empty refill, `/stop`
+  changes auto-refill behavior at the edges (queue-empty refill, `stop()`
   always clears it, at-most-one-refill-per-guild via `radio_refill_running`
   + `Notify`).
-  `/radio`'s implementation lives in `src/voice/radio.rs`.
+  The Mix-listing/auto-refill logic lives in `src/voice/radio.rs`; the
+  dashboard's radio toggle (`toggle_radio`) is just another `PlayerRegistry`
+  method, exposed via `src/web/api.rs`.
 - Invariant that must hold after every action: `current_handle.is_some() ==
   current_track_id.is_some()`, and no action panics — it succeeds, no-ops, or
   returns a typed `PlayerError`. This is exercised by a table-driven test in
@@ -94,14 +101,16 @@ Key points:
 
 ### Other modules
 
-- `src/commands/` — poise slash commands: `playback.rs`, `library.rs`
-  (search/queue/saved playlists), `radio.rs`.
+- `src/web/` — the web dashboard (axum): `api.rs` (HTTP/WebSocket handlers —
+  the only place playback actions are invoked from), `auth.rs` (password
+  hashing + in-memory session tokens), `dashboard.html` (the single-page
+  frontend, served as-is).
 - `src/youtube/api.rs` — the `yt-dlp` subprocess client (search,
-  single-video metadata, playlist listing — all via `yt-dlp -j`).
+  single-video metadata, playlist listing — all via `yt-dlp -j`) plus
+  `extract_video_id` for pulling a video ID out of a YouTube URL.
 - `src/voice/resolve.rs` — resolves a track to a direct streamable URL
   (metadata-only `yt-dlp -j`, no download) and does the ffmpeg/yt-dlp
   startup dependency check.
-- `src/voice/panel.rs` — renders/updates the persistent `/player` panel.
 - `src/db.rs` — sqlx/SQLite: per-guild settings (volume), saved playlists,
   guild sessions. Migrations in `migrations/` are embedded into the binary at
   compile time (sqlx `migrate!`).

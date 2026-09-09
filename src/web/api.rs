@@ -5,17 +5,15 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use poise::serenity_prelude as serenity;
 use serde::{Deserialize, Serialize};
-use serenity::{ChannelId, ChannelType, GuildId};
+use serenity::all::{ChannelId, ChannelType, GuildId};
 
-use crate::commands::playback::extract_video_id;
 use crate::db;
 use crate::voice::QueuedTrack;
 use crate::voice::player::{PlayerError, PlayerRegistry};
 use crate::web::WebState;
 use crate::web::auth;
-use crate::youtube::api::Track;
+use crate::youtube::api::{Track, extract_video_id};
 
 const SNAPSHOT_PUSH_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -560,6 +558,68 @@ pub async fn import_playlist(
         thumbnail_video_id,
     })
     .into_response()
+}
+
+pub async fn refresh_playlist(
+    State(state): State<WebState>,
+    Path((guild_id, playlist_id)): Path<(String, i64)>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+
+    let playlist = match db::get_guild_playlist(&state.db, &guild_id.to_string(), playlist_id).await
+    {
+        Ok(Some(playlist)) => playlist,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "playlist not found"),
+        Err(err) => {
+            tracing::warn!(%err, "dashboard failed to load playlist for refresh");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to load playlist");
+        }
+    };
+
+    let listing = match state.player.list_playlist(&playlist.url).await {
+        Ok(listing) => listing,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    if let Err(err) = db::replace_playlist_tracks(&state.db, playlist.id, &listing.tracks).await {
+        tracing::warn!(%err, playlist_id, "dashboard failed to cache refreshed playlist tracks");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to refresh playlist",
+        );
+    }
+
+    let thumbnail_video_id = listing.tracks.first().map(|track| track.video_id.clone());
+    Json(PlaylistJson {
+        id: playlist.id,
+        name: playlist.name,
+        track_count: listing.tracks.len(),
+        thumbnail_video_id,
+    })
+    .into_response()
+}
+
+pub async fn remove_playlist(
+    State(state): State<WebState>,
+    Path((guild_id, playlist_id)): Path<(String, i64)>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+
+    match db::delete_guild_playlist(&state.db, &guild_id.to_string(), playlist_id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "playlist not found"),
+        Err(err) => {
+            tracing::warn!(%err, "dashboard failed to remove playlist");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to remove playlist",
+            )
+        }
+    }
 }
 
 pub async fn play_playlist(

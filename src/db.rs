@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use poise::serenity_prelude::UserId;
+use serenity::all::UserId;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
 };
@@ -750,45 +750,6 @@ pub async fn queue_replace_all(
         .await
         .context("failed to commit queue replace transaction")?;
     Ok(())
-}
-
-pub async fn search_cached_tracks(
-    pool: &SqlitePool,
-    guild_id: &str,
-    query: &str,
-    limit: i64,
-) -> Result<Vec<Track>> {
-    let escaped = query
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    let pattern = format!("%{escaped}%");
-
-    let rows: Vec<(String, String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT DISTINCT pt.video_id, pt.title, pt.channel, pt.duration_secs \
-         FROM playlist_tracks pt \
-         JOIN playlists p ON p.id = pt.playlist_id \
-         WHERE p.guild_id = ?1 AND pt.title LIKE ?2 ESCAPE '\\' \
-         ORDER BY pt.title \
-         LIMIT ?3",
-    )
-    .bind(guild_id)
-    .bind(pattern)
-    .bind(limit)
-    .fetch_all(pool)
-    .await
-    .context("failed to search cached playlist tracks")?;
-
-    Ok(rows
-        .into_iter()
-        .map(|(video_id, title, channel, duration_secs)| Track {
-            video_id,
-            title,
-            channel,
-            #[allow(clippy::cast_sign_loss)]
-            duration: duration_secs.map(|secs| Duration::from_secs(secs as u64)),
-        })
-        .collect())
 }
 
 pub async fn record_track_play(pool: &SqlitePool, guild_id: &str, track: &Track) -> Result<()> {
@@ -1557,63 +1518,6 @@ mod tests {
                 .map(|q| q.track.video_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["b", "a"]
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn search_cached_tracks_matches_by_title_case_insensitively() -> Result<()> {
-        let pool = connect("sqlite::memory:").await?;
-        let id =
-            save_guild_playlist(&pool, "1", "Mix", "https://example.com/list=abc", "42").await?;
-        replace_playlist_tracks(
-            &pool,
-            id,
-            &[sample_track("a", None), sample_track("b", None)],
-        )
-        .await?;
-
-        let results = search_cached_tracks(&pool, "1", "title a", 10).await?;
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].video_id, "a");
-
-        assert_eq!(
-            search_cached_tracks(&pool, "2", "title a", 10).await?,
-            Vec::new()
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn search_cached_tracks_treats_percent_and_underscore_literally() -> Result<()> {
-        let pool = connect("sqlite::memory:").await?;
-        let id =
-            save_guild_playlist(&pool, "1", "Mix", "https://example.com/list=abc", "42").await?;
-        let literal = Track {
-            video_id: "lit".to_string(),
-            title: "50% off_sale".to_string(),
-            channel: "Some Channel".to_string(),
-            duration: None,
-        };
-        let decoy = Track {
-            video_id: "decoy".to_string(),
-            title: "50X offXsale".to_string(),
-            channel: "Some Channel".to_string(),
-            duration: None,
-        };
-        replace_playlist_tracks(&pool, id, &[literal, decoy]).await?;
-
-        let results = search_cached_tracks(&pool, "1", "50% off_sale", 10).await?;
-
-        assert_eq!(
-            results
-                .iter()
-                .map(|t| t.video_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["lit"]
         );
 
         Ok(())
