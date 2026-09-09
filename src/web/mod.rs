@@ -5,7 +5,7 @@
 //!
 //! Covers: now-playing state and transport controls
 //! (pause/resume/skip/stop/shuffle/radio/volume), queue management
-//! (remove/reorder/clear), YouTube search/add-to-queue, saved-playlist
+//! (play/remove/reorder/clear), YouTube search/add-to-queue, saved-playlist
 //! management (import/play/refresh/remove), and per-guild play-count
 //! favourites.
 
@@ -71,6 +71,10 @@ fn playback_routes() -> Router<WebState> {
         .route(
             "/api/guilds/{guild_id}/queue/{index}/remove",
             post(api::remove_queue_track),
+        )
+        .route(
+            "/api/guilds/{guild_id}/queue/{index}/play",
+            post(api::play_queue_track),
         )
         .route(
             "/api/guilds/{guild_id}/queue/{index}/move",

@@ -69,6 +69,7 @@ off; where it doesn't, a single cell covers both.
 | Action | Empty | Buffering | Playing | Paused | Queue-finished |
 | --- | --- | --- | --- | --- | --- |
 | `enqueue`/`enqueue_many` | starts immediately | appends behind the loading track | appends behind the current track | appends behind the current track | starts immediately |
+| `enqueue_next` | starts immediately | inserts ahead of the upcoming queue, behind the loading track | inserts as the very next upcoming track, restarts the prefetch | same as Playing | starts immediately |
 | `pause` | `NothingPlaying` | `NothingPlaying` (no handle yet) | pauses, arms idle-disconnect timer | no-op (already paused) | `NothingPlaying` |
 | `resume` | `NothingPlaying` | `NothingPlaying` | no-op (already playing) | resumes | `NothingPlaying` |
 | `skip` | `NothingPlaying` | `NothingPlaying` | stops the handle; `advance()` promotes the next track (or refill-waits/idles if radio) | same as Playing | `NothingPlaying` |
@@ -79,6 +80,7 @@ off; where it doesn't, a single cell covers both.
 | `set_volume` | persists the setting; no current track to apply it to | persists; no handle yet | persists and applies to the current handle | same as Playing | persists |
 | `remove_queue_track` | `InvalidQueueIndex` | `InvalidQueueIndex` unless upcoming tracks exist | removes the track at that queue position, leaves `now_playing` alone, restarts the prefetch if the first upcoming track changed | same as Playing | `InvalidQueueIndex` |
 | `move_queue_track` | `InvalidQueueIndex` | `InvalidQueueIndex` unless upcoming tracks exist | moves an upcoming track from one queue position to another, shifting the tracks in between, leaves `now_playing` alone, restarts the prefetch if the first upcoming track changed | same as Playing | `InvalidQueueIndex` |
+| `play_queue_track` | `NothingPlaying` | `InvalidQueueIndex` unless upcoming tracks exist | pulls the chosen upcoming track out of the queue, stops the current handle without requeuing it, and starts the chosen track immediately; every other upcoming track keeps its relative order | same as Playing | `NothingPlaying` |
 
 All of these are reached only through `src/web/api.rs`'s HTTP handlers — there
 is no longer a Discord-side command or panel driving them.

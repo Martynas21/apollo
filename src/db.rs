@@ -511,6 +511,7 @@ fn queued_track_from_row(
     })
 }
 
+#[cfg(test)]
 pub async fn queue_push_back(
     pool: &SqlitePool,
     guild_id: &str,

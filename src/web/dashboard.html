@@ -1034,6 +1034,7 @@
   }
 
   const REMOVE_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+  const PLAY_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,3 21,12 6,21"/></svg>';
   const GRIP_ICON = '<svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="2.5" cy="2.5" r="1.5"/><circle cx="7.5" cy="2.5" r="1.5"/><circle cx="2.5" cy="8" r="1.5"/><circle cx="7.5" cy="8" r="1.5"/><circle cx="2.5" cy="13.5" r="1.5"/><circle cx="7.5" cy="13.5" r="1.5"/></svg>';
   const REFRESH_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>';
 
@@ -1269,6 +1270,10 @@
     const actions = document.createElement('div');
     actions.className = 'compact-actions';
 
+    const playBtn = makeMiniIconBtn(PLAY_ICON, 'Play now', false, false);
+    playBtn.addEventListener('click', () => playQueueTrack(Number(row.dataset.index)));
+    actions.appendChild(playBtn);
+
     const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Remove', false, true);
     removeBtn.addEventListener('click', () => removeQueueTrack(Number(row.dataset.index)));
     actions.appendChild(removeBtn);
@@ -1460,6 +1465,10 @@
 
   function removeQueueTrack(index) {
     sendAction(`queue/${index}/remove`, { method: 'POST' });
+  }
+
+  function playQueueTrack(index) {
+    sendAction(`queue/${index}/play`, { method: 'POST' });
   }
 
   const volumeBtn = document.getElementById('volume-btn');
@@ -1778,6 +1787,7 @@
       renderSnapshot(body);
       showStatus(`Added "${title}" to the queue.`);
       loadFavourites(currentGuildId);
+      clearSearch();
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
 

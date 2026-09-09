@@ -367,6 +367,17 @@ pub async fn remove_queue_track(
     respond_after(&state.player, guild_id, result).await
 }
 
+pub async fn play_queue_track(
+    State(state): State<WebState>,
+    Path((guild_id, index)): Path<(String, usize)>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+    let result = state.player.play_queue_track(guild_id, index).await;
+    respond_after(&state.player, guild_id, result).await
+}
+
 #[derive(Deserialize)]
 pub struct MoveQueueTrackRequest {
     to: usize,
@@ -448,7 +459,7 @@ pub async fn add_to_queue(
         track,
         requested_by: state.cache.current_user().id,
     };
-    let result = state.player.enqueue(guild_id, queued).await;
+    let result = state.player.enqueue_next(guild_id, queued).await;
     respond_after(&state.player, guild_id, result).await
 }
 
