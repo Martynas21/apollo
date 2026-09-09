@@ -511,7 +511,8 @@ impl PlayerRegistry {
         self.voice.call(guild_id).is_some()
     }
 
-    pub async fn enqueue(&self, guild_id: GuildId, queued: QueuedTrack) -> Result<(), PlayerError> {
+    #[cfg(test)]
+    async fn enqueue(&self, guild_id: GuildId, queued: QueuedTrack) -> Result<(), PlayerError> {
         let (call, start) = {
             let mut guilds = self.guilds.lock().await;
             let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
@@ -524,6 +525,41 @@ impl PlayerRegistry {
                 db::queue_push_back(&self.db, &guild_id.to_string(), &queued).await
             {
                 return Err(PlayerError::Storage(err.to_string()));
+            }
+            (call, should_start.then_some(state.epoch))
+        };
+
+        if let Some(epoch) = start {
+            self.spawn_start_sequence(guild_id, call, queued, epoch, None);
+        }
+
+        self.persist_session(guild_id).await;
+        Ok(())
+    }
+
+    pub async fn enqueue_next(
+        &self,
+        guild_id: GuildId,
+        queued: QueuedTrack,
+    ) -> Result<(), PlayerError> {
+        let guild_id_str = guild_id.to_string();
+        let (call, start) = {
+            let mut guilds = self.guilds.lock().await;
+            let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
+            let state = guilds.entry(guild_id).or_default();
+            state.radio_exhausted = false;
+            let should_start = state.now_playing.is_none();
+            if should_start {
+                state.now_playing = Some(queued.clone());
+            } else {
+                let mut items = db::queue_all(&self.db, &guild_id_str)
+                    .await
+                    .map_err(|e| PlayerError::Storage(e.to_string()))?;
+                items.insert(0, queued.clone());
+                db::queue_replace_all(&self.db, &guild_id_str, &items)
+                    .await
+                    .map_err(|e| PlayerError::Storage(e.to_string()))?;
+                self.restart_prefetch(state, items.first().cloned());
             }
             (call, should_start.then_some(state.epoch))
         };
@@ -1071,6 +1107,57 @@ impl PlayerRegistry {
         }
         drop(guilds);
 
+        self.persist_session(guild_id).await;
+        Ok(())
+    }
+
+    /// Jumps straight to an upcoming queue entry: pulls it out of the queue,
+    /// stops whatever is currently playing/buffering without requeuing it
+    /// (like `skip`, but landing on a chosen track instead of the front of
+    /// the queue), and starts it immediately. Every other upcoming track
+    /// keeps its relative order behind the new current track. Bumping the
+    /// epoch invalidates any start sequence still in flight for the track
+    /// that was buffering, the same guard `stop()` uses.
+    pub async fn play_queue_track(
+        &self,
+        guild_id: GuildId,
+        index: usize,
+    ) -> Result<(), PlayerError> {
+        let guild_id_str = guild_id.to_string();
+        let (handle, call, epoch, target) = {
+            let mut guilds = self.guilds.lock().await;
+            let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
+            let state = guilds.entry(guild_id).or_default();
+            if state.now_playing.is_none() {
+                return Err(PlayerError::NothingPlaying);
+            }
+
+            let mut items = db::queue_all(&self.db, &guild_id_str)
+                .await
+                .map_err(|e| PlayerError::Storage(e.to_string()))?;
+            if index >= items.len() {
+                return Err(PlayerError::InvalidQueueIndex);
+            }
+            let target = items.remove(index);
+            db::queue_replace_all(&self.db, &guild_id_str, &items)
+                .await
+                .map_err(|e| PlayerError::Storage(e.to_string()))?;
+
+            if let Some(prefetch) = state.prefetch.take() {
+                discard_prefetch(prefetch);
+            }
+            let handle = state.current_handle.take();
+            state.current_track_id = None;
+            state.now_playing = Some(target.clone());
+            state.epoch = state.epoch.wrapping_add(1);
+            (handle, call, state.epoch, target)
+        };
+
+        if let Some(handle) = handle {
+            let _ = handle.stop().await;
+        }
+
+        self.spawn_start_sequence(guild_id, call, target, epoch, None);
         self.persist_session(guild_id).await;
         Ok(())
     }
@@ -1956,6 +2043,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enqueue_next_starts_playback_immediately_on_an_empty_queue() {
+        let (registry, backend, guild_id) = joined_registry().await;
+
+        registry.enqueue_next(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+        assert!(snapshot.upcoming.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enqueue_next_inserts_ahead_of_the_upcoming_queue() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        registry
+            .enqueue_many(guild_id, vec![queued("a"), queued("b"), queued("c")])
+            .await
+            .unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        registry.enqueue_next(guild_id, queued("d")).await.unwrap();
+
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["d", "b", "c"]);
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+    }
+
+    #[tokio::test]
+    async fn play_queue_track_promotes_the_chosen_track_and_keeps_the_rest_in_order() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry
+            .enqueue_many(guild_id, vec![queued("b"), queued("c"), queued("d")])
+            .await
+            .unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        registry.play_queue_track(guild_id, 1).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a", "c"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["b", "d"]);
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "c");
+    }
+
+    #[tokio::test]
+    async fn play_queue_track_with_nothing_playing_reports_nothing_playing() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+
+        let result = registry.play_queue_track(guild_id, 0).await;
+
+        assert!(matches!(result, Err(PlayerError::NothingPlaying)));
+    }
+
+    #[tokio::test]
+    async fn play_queue_track_out_of_range_reports_invalid_index() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let result = registry.play_queue_track(guild_id, 0).await;
+
+        assert!(matches!(result, Err(PlayerError::InvalidQueueIndex)));
+    }
+
+    #[tokio::test]
     async fn advance_starts_the_next_queued_track_when_one_ends() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
@@ -2726,10 +2883,12 @@ mod tests {
         SetVolume,
         RemoveQueueTrack,
         MoveQueueTrack,
+        EnqueueNext,
+        PlayQueueTrack,
     }
 
     impl MatrixAction {
-        const ALL: [MatrixAction; 10] = [
+        const ALL: [MatrixAction; 12] = [
             MatrixAction::Pause,
             MatrixAction::Resume,
             MatrixAction::Skip,
@@ -2740,6 +2899,8 @@ mod tests {
             MatrixAction::SetVolume,
             MatrixAction::RemoveQueueTrack,
             MatrixAction::MoveQueueTrack,
+            MatrixAction::EnqueueNext,
+            MatrixAction::PlayQueueTrack,
         ];
 
         async fn invoke(&self, registry: &PlayerRegistry, guild_id: GuildId) {
@@ -2774,6 +2935,12 @@ mod tests {
                 MatrixAction::MoveQueueTrack => {
                     let _ = registry.move_queue_track(guild_id, 0, 1).await;
                 }
+                MatrixAction::EnqueueNext => {
+                    let _ = registry.enqueue_next(guild_id, queued("z")).await;
+                }
+                MatrixAction::PlayQueueTrack => {
+                    let _ = registry.play_queue_track(guild_id, 0).await;
+                }
             }
         }
 
@@ -2789,6 +2956,8 @@ mod tests {
                 MatrixAction::SetVolume => "set_volume",
                 MatrixAction::RemoveQueueTrack => "remove_queue_track",
                 MatrixAction::MoveQueueTrack => "move_queue_track",
+                MatrixAction::EnqueueNext => "enqueue_next",
+                MatrixAction::PlayQueueTrack => "play_queue_track",
             }
         }
     }
