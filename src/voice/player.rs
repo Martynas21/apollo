@@ -21,7 +21,7 @@ const MAX_VOLUME: u8 = 100;
 
 const RADIO_HISTORY_CAP: usize = 5;
 
-const RADIO_REFILL_BATCH: usize = 3;
+const RADIO_REFILL_BATCH: usize = 4;
 
 /// How long `advance()` will wait for an in-flight radio refill to finish
 /// before declaring the guild idle, when the queue is empty but a refill is
@@ -520,6 +520,7 @@ impl PlayerRegistry {
             state.radio_exhausted = false;
             let should_start = state.now_playing.is_none();
             if should_start {
+                state.radio_history.clear();
                 state.now_playing = Some(queued.clone());
             } else if let Err(err) =
                 db::queue_push_back(&self.db, &guild_id.to_string(), &queued).await
@@ -550,6 +551,7 @@ impl PlayerRegistry {
             state.radio_exhausted = false;
             let should_start = state.now_playing.is_none();
             if should_start {
+                state.radio_history.clear();
                 state.now_playing = Some(queued.clone());
             } else {
                 let mut items = db::queue_all(&self.db, &guild_id_str)
@@ -591,6 +593,7 @@ impl PlayerRegistry {
             state.radio_exhausted = false;
             let needs_start = state.now_playing.is_none();
             if needs_start {
+                state.radio_history.clear();
                 state.now_playing = first.clone();
             }
 
@@ -1150,6 +1153,11 @@ impl PlayerRegistry {
             state.current_track_id = None;
             state.now_playing = Some(target.clone());
             state.epoch = state.epoch.wrapping_add(1);
+            // Jumping straight to a chosen track is a deliberate change of
+            // direction — drop the recency-weighted history so the next
+            // radio refill seeds off this track instead of a stale entry
+            // from whatever was playing before.
+            state.radio_history.clear();
             (handle, call, state.epoch, target)
         };
 
@@ -2090,6 +2098,27 @@ mod tests {
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(upcoming_ids(&snapshot), vec!["b", "d"]);
         assert_eq!(snapshot.now_playing.unwrap().track.video_id, "c");
+    }
+
+    #[tokio::test]
+    async fn play_queue_track_resets_radio_history_to_the_jumped_to_track() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry
+            .enqueue_many(guild_id, vec![queued("a"), queued("b")])
+            .await
+            .unwrap();
+        registry.settle_playback_start(guild_id).await;
+        let a_id = current_track_id(&registry, guild_id).await;
+        backend.finish_track(guild_id, a_id).await;
+        registry.settle_playback_start(guild_id).await;
+        registry.enqueue(guild_id, queued("c")).await.unwrap();
+
+        registry.play_queue_track(guild_id, 0).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let guilds = registry.guilds.lock().await;
+        let history = Vec::from(guilds.get(&guild_id).unwrap().radio_history.clone());
+        assert_eq!(history, vec!["c".to_string()]);
     }
 
     #[tokio::test]
