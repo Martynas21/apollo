@@ -7,7 +7,6 @@ mod voice;
 mod web;
 mod youtube;
 
-use anyhow::Context;
 use commands::{Data, Error};
 use poise::serenity_prelude as serenity;
 use songbird::serenity::SerenityInit;
@@ -84,13 +83,14 @@ async fn connect_backends(
         voice::check_playback_dependencies(),
         db::connect(&config.database_url),
         async {
-            IpcBackend::connect(
-                &config.audio_worker_socket,
-                songbird,
-                config.yt_dlp_cookies_file.clone(),
+            anyhow::Ok(
+                IpcBackend::connect(
+                    &config.audio_worker_socket,
+                    songbird,
+                    config.yt_dlp_cookies_file.clone(),
+                )
+                .await,
             )
-            .await
-            .context("failed to connect to apollo-audio-worker")
         },
     )?;
     Ok((db_pool, voice_backend))
