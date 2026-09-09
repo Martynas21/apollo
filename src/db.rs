@@ -905,6 +905,16 @@ pub async fn set_user_password(
     Ok(())
 }
 
+pub async fn rename_user(pool: &SqlitePool, old_username: &str, new_username: &str) -> Result<()> {
+    sqlx::query("UPDATE users SET username = ?1 WHERE username = ?2")
+        .bind(new_username)
+        .bind(old_username)
+        .execute(pool)
+        .await
+        .context("failed to rename user")?;
+    Ok(())
+}
+
 pub struct UserCredentials {
     pub password_hash: String,
     pub is_admin: bool,
@@ -1032,6 +1042,23 @@ mod tests {
 
         assert_eq!(get_guild_volume(&pool, "1").await?, DEFAULT_VOLUME);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rename_user_updates_username_and_keeps_other_fields() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        insert_user(&pool, "old-name", "some-hash", true, false).await?;
+
+        rename_user(&pool, "old-name", "new-name").await?;
+
+        assert!(!user_exists(&pool, "old-name").await?);
+        let creds = user_credentials(&pool, "new-name")
+            .await?
+            .expect("the renamed user should exist under its new name");
+        assert_eq!(creds.password_hash, "some-hash");
+        assert!(creds.is_admin);
+        assert!(!creds.is_root);
         Ok(())
     }
 

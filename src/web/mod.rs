@@ -120,6 +120,7 @@ fn admin_routes() -> Router<WebState> {
         )
         .route("/api/users/{username}", delete(users::delete_user))
         .route("/api/users/{username}/password", post(users::set_password))
+        .route("/api/users/{username}/username", post(users::set_username))
 }
 
 pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {

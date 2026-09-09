@@ -231,3 +231,66 @@ pub async fn set_password(
         }
     }
 }
+
+#[derive(Deserialize)]
+pub struct SetUsernameRequest {
+    new_username: String,
+}
+
+/// Same authorization rule as `set_password`: anyone can rename themselves,
+/// only root can rename someone else.
+pub async fn set_username(
+    State(state): State<WebState>,
+    Extension(current): Extension<CurrentUser>,
+    Path(username): Path<String>,
+    Json(body): Json<SetUsernameRequest>,
+) -> Response {
+    let new_username = body.new_username.trim();
+    if new_username.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "username is required");
+    }
+    if username != current.username && !current.is_root {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "only the root admin can rename another user",
+        );
+    }
+
+    match db::user_exists(&state.db, &username).await {
+        Ok(true) => {}
+        Ok(false) => return error_response(StatusCode::NOT_FOUND, "no such user"),
+        Err(err) => {
+            tracing::warn!(%err, "failed to check for an existing user before renaming");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to rename user");
+        }
+    }
+
+    if new_username == username {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    match db::user_exists(&state.db, new_username).await {
+        Ok(true) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "a user with that username already exists",
+            );
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(%err, "failed to check for a username conflict before renaming");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to rename user");
+        }
+    }
+
+    match db::rename_user(&state.db, &username, new_username).await {
+        Ok(()) => {
+            state.sessions.rename(&username, new_username);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(err) => {
+            tracing::warn!(%err, "failed to rename user");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to rename user")
+        }
+    }
+}

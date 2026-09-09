@@ -181,10 +181,10 @@ every sign-in.
 Admins get a "Users" tab in the top nav, where they can create further
 accounts (optionally as admins themselves) and remove them; there's no
 self-service signup, so account creation is entirely admin-driven from that
-page. Every account can change its own password from that same page — but
-only root can change someone *else's* (e.g. to reset a forgotten one); a
-regular admin can't, and root itself can't be deleted, since that would
-permanently remove the only account able to do so.
+page. Every account can rename itself and change its own password from that
+same page — but only root can do either to someone *else's* account (e.g. to
+reset a forgotten password); a regular admin can't, and root itself can't be
+deleted, since that would permanently remove the only account able to do so.
 
 ## Running it
 

@@ -69,6 +69,22 @@ impl SessionStore {
             .filter(|info| info.expires_at > Instant::now())
             .map(|info| info.user.clone())
     }
+
+    /// Keeps any already-issued session(s) for this account pointing at its
+    /// new name, so a rename doesn't strand an active session under a
+    /// username the DB no longer has — without this, that session's own
+    /// self-checks (e.g. in `users::set_password`) would start failing.
+    pub fn rename(&self, old_username: &str, new_username: &str) {
+        let mut sessions = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for info in sessions.values_mut() {
+            if info.user.username == old_username {
+                info.user.username = new_username.to_string();
+            }
+        }
+    }
 }
 
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
@@ -222,6 +238,42 @@ mod tests {
     fn an_unknown_token_is_never_valid() {
         let sessions = SessionStore::default();
         assert!(sessions.get("not-a-real-token").is_none());
+    }
+
+    #[test]
+    fn renaming_a_session_updates_its_username_in_place() {
+        let sessions = SessionStore::default();
+        let token = sessions.issue(CurrentUser {
+            username: "old-name".to_string(),
+            is_admin: true,
+            is_root: false,
+        });
+
+        sessions.rename("old-name", "new-name");
+
+        let user = sessions.get(&token).expect("session should still be valid");
+        assert_eq!(user.username, "new-name");
+        assert!(user.is_admin);
+    }
+
+    #[test]
+    fn renaming_leaves_sessions_for_other_usernames_untouched() {
+        let sessions = SessionStore::default();
+        let token = sessions.issue(CurrentUser {
+            username: "someone-else".to_string(),
+            is_admin: false,
+            is_root: false,
+        });
+
+        sessions.rename("old-name", "new-name");
+
+        assert_eq!(
+            sessions
+                .get(&token)
+                .expect("session should still be valid")
+                .username,
+            "someone-else"
+        );
     }
 
     #[tokio::test]
