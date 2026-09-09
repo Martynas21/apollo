@@ -1528,8 +1528,21 @@
     sendAction(`queue/${index}/remove`, { method: 'POST' });
   }
 
-  function playQueueTrack(index) {
-    sendAction(`queue/${index}/play`, { method: 'POST' });
+  async function playQueueTrack(index) {
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/queue/${index}/play`, { method: 'POST' });
+      const body = await response.json();
+      if (!response.ok) {
+        if (body.error === NOT_CONNECTED_ERROR) {
+          openJoinModal(() => playQueueTrack(index));
+          return;
+        }
+        showStatus(body.error || 'Something went wrong.', { isError: true });
+        return;
+      }
+      showStatus('');
+      renderSnapshot(body);
+    } catch (err) { /* showLogin already handled unauthorized */ }
   }
 
   const volumeBtn = document.getElementById('volume-btn');
