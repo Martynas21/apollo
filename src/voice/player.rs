@@ -611,6 +611,10 @@ impl PlayerRegistry {
                 return Err(PlayerError::Storage(err.to_string()));
             }
 
+            if !needs_start && state.prefetch.is_none() {
+                self.restart_prefetch(state, rest.first().cloned());
+            }
+
             let start = match (needs_start, &first) {
                 (true, Some(track)) => Some((track.clone(), state.epoch)),
                 _ => None,
@@ -1788,6 +1792,7 @@ mod tests {
         next_join_failure: Option<String>,
         download_gate: Option<Arc<Notify>>,
         failing_video_ids: HashMap<String, String>,
+        buffered_source_calls: Vec<String>,
     }
 
     #[derive(Default)]
@@ -1816,6 +1821,14 @@ mod tests {
                 .unwrap()
                 .failing_video_ids
                 .insert(video_id.to_string(), message.to_string());
+        }
+
+        fn buffered_source_calls(&self) -> Vec<String> {
+            self.state.lock().unwrap().buffered_source_calls.clone()
+        }
+
+        fn clear_buffered_source_calls(&self) {
+            self.state.lock().unwrap().buffered_source_calls.clear();
         }
 
         fn call_for(&self, guild_id: GuildId) -> Option<Arc<FakeCall>> {
@@ -1915,7 +1928,11 @@ mod tests {
         }
 
         async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError> {
-            let gate = self.state.lock().unwrap().download_gate.clone();
+            let gate = {
+                let mut state = self.state.lock().unwrap();
+                state.buffered_source_calls.push(track.video_id.clone());
+                state.download_gate.clone()
+            };
             if let Some(gate) = gate {
                 gate.notified().await;
             }
@@ -2048,6 +2065,35 @@ mod tests {
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(upcoming_ids(&snapshot), vec!["b", "c"]);
         assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+    }
+
+    #[tokio::test]
+    async fn enqueue_many_into_an_empty_upcoming_queue_prefetches_the_new_track_immediately() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+        backend.clear_buffered_source_calls();
+
+        let gate = backend.hold_downloads();
+        registry
+            .enqueue_many(guild_id, vec![queued("b")])
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // "b" should already be resolving in the background, ahead of "a"
+        // finishing, instead of only being fetched once `advance()` needs it.
+        assert_eq!(backend.buffered_source_calls(), vec!["b".to_string()]);
+
+        gate.notify_one();
+        let a_id = current_track_id(&registry, guild_id).await;
+        backend.finish_track(guild_id, a_id).await;
+        registry.settle_playback_start(guild_id).await;
+
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "b");
     }
 
     #[tokio::test]
