@@ -1018,6 +1018,15 @@
     }
   }
 
+  // A cheap fingerprint of the fields updateTrackRowContent writes to the
+  // DOM, so a reconcile can tell whether a persisting row's content actually
+  // needs touching — most snapshot ticks change only playback position/state,
+  // not the queue's track list, so this turns the common case into a string
+  // comparison instead of 3 querySelector + 3 textContent writes per row.
+  function trackContentSig(track) {
+    return `${track.title} ${track.channel} ${track.duration_secs}`;
+  }
+
   // Builds the shared thumb + title/channel + duration layout used by both
   // the search results list and the queue list; callers append their own
   // trailing action button(s).
@@ -1050,6 +1059,7 @@
     duration.textContent = formatDuration(track.duration_secs);
     row.appendChild(duration);
 
+    row.dataset.contentSig = trackContentSig(track);
     return row;
   }
 
@@ -1060,8 +1070,15 @@
   // (video_id) matches, so a reused row's thumbnail is already correct —
   // reapplying it would tear down and recreate the <img> (forcing a reload)
   // on every reconcile, which gets very expensive with large lists like a
-  // multi-thousand-track queue.
+  // multi-thousand-track queue. Same reasoning for the contentSig guard below:
+  // with a large queue, most reconciles change no track's title/channel/
+  // duration at all (only playback position/state), so skipping the DOM
+  // writes entirely when the fingerprint matches avoids thousands of
+  // pointless querySelector/textContent calls every snapshot tick.
   function updateTrackRowContent(row, track) {
+    const sig = trackContentSig(track);
+    if (row.dataset.contentSig === sig) return;
+    row.dataset.contentSig = sig;
     row.querySelector('.compact-title').textContent = track.title;
     row.querySelector('.compact-channel').textContent = track.channel;
     row.querySelector('.compact-duration').textContent = formatDuration(track.duration_secs);
@@ -1322,7 +1339,8 @@
       return;
     }
     const offset = items && items[0] && items[0].__nowPlaying ? 1 : 0;
-    row.dataset.index = String(index - offset);
+    const newIndex = String(index - offset);
+    if (row.dataset.index !== newIndex) row.dataset.index = newIndex;
   }
 
   function renderQueue(snapshot) {
