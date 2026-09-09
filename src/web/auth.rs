@@ -17,11 +17,29 @@ use crate::db;
 /// single-operator tool.
 const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
+/// The identity behind a validated session, as resolved at login time.
+/// Inserted into request extensions by [`require_session`] so downstream
+/// handlers/middleware (e.g. [`require_admin`]) can read who's asking
+/// without a further DB round-trip.
+#[derive(Clone)]
+pub struct CurrentUser {
+    pub username: String,
+    pub is_admin: bool,
+    /// The single env-bootstrapped account — the only one allowed to change
+    /// another user's password (see `web::users::set_password`).
+    pub is_root: bool,
+}
+
+struct SessionInfo {
+    user: CurrentUser,
+    expires_at: Instant,
+}
+
 #[derive(Clone, Default)]
-pub struct SessionStore(Arc<Mutex<HashMap<String, Instant>>>);
+pub struct SessionStore(Arc<Mutex<HashMap<String, SessionInfo>>>);
 
 impl SessionStore {
-    fn issue(&self) -> String {
+    fn issue(&self, user: CurrentUser) -> String {
         let mut bytes = [0u8; 32];
         rand::rng().fill_bytes(&mut bytes);
         let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -30,19 +48,26 @@ impl SessionStore {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sessions.retain(|_, expires_at| *expires_at > Instant::now());
-        sessions.insert(token.clone(), Instant::now() + SESSION_TTL);
+        sessions.retain(|_, info| info.expires_at > Instant::now());
+        sessions.insert(
+            token.clone(),
+            SessionInfo {
+                user,
+                expires_at: Instant::now() + SESSION_TTL,
+            },
+        );
         token
     }
 
-    fn is_valid(&self, token: &str) -> bool {
+    fn get(&self, token: &str) -> Option<CurrentUser> {
         let sessions = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         sessions
             .get(token)
-            .is_some_and(|expires_at| *expires_at > Instant::now())
+            .filter(|info| info.expires_at > Instant::now())
+            .map(|info| info.user.clone())
     }
 }
 
@@ -69,7 +94,7 @@ pub async fn bootstrap_user_if_needed(
     username: Option<&str>,
     password: Option<&str>,
 ) -> anyhow::Result<()> {
-    if db::dashboard_user_count(db).await? > 0 {
+    if db::user_count(db).await? > 0 {
         return Ok(());
     }
     let (Some(username), Some(password)) = (username, password) else {
@@ -80,24 +105,33 @@ pub async fn bootstrap_user_if_needed(
         return Ok(());
     };
     let hash = hash_password(password)?;
-    db::insert_dashboard_user(db, username, &hash).await?;
-    tracing::info!(username, "bootstrapped the initial dashboard user");
+    db::insert_user(db, username, &hash, true, true).await?;
+    tracing::info!(username, "bootstrapped the initial dashboard admin");
     Ok(())
 }
 
+/// Returns the resolved identity on success, `None` for an unknown username
+/// or a wrong password (deliberately not distinguished, so a login failure
+/// can't be used to enumerate valid usernames).
 pub async fn verify_login(
     db: &sqlx::SqlitePool,
     username: &str,
     password: &str,
-) -> anyhow::Result<bool> {
-    let Some(hash) = db::dashboard_user_password_hash(db, username).await? else {
-        return Ok(false);
+) -> anyhow::Result<Option<CurrentUser>> {
+    let Some(creds) = db::user_credentials(db, username).await? else {
+        return Ok(None);
     };
-    Ok(verify_password(password, &hash))
+    Ok(
+        verify_password(password, &creds.password_hash).then(|| CurrentUser {
+            username: username.to_string(),
+            is_admin: creds.is_admin,
+            is_root: creds.is_root,
+        }),
+    )
 }
 
-pub fn issue_session(sessions: &SessionStore) -> String {
-    sessions.issue()
+pub fn issue_session(sessions: &SessionStore, user: CurrentUser) -> String {
+    sessions.issue(user)
 }
 
 fn bearer_token(request: &Request) -> Option<String> {
@@ -123,13 +157,28 @@ fn query_token(request: &Request) -> Option<String> {
 
 pub async fn require_session(
     State(state): State<crate::web::WebState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     let token = bearer_token(&request).or_else(|| query_token(&request));
-    match token {
-        Some(token) if state.sessions.is_valid(&token) => Ok(next.run(request).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
+    let user = token.and_then(|token| state.sessions.get(&token));
+    match user {
+        Some(user) => {
+            request.extensions_mut().insert(user);
+            Ok(next.run(request).await)
+        }
+        None => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+/// Must run after [`require_session`] on the same route (which puts the
+/// [`CurrentUser`] extension in place) — see the merge-then-`route_layer`
+/// ordering in `web::serve`.
+pub async fn require_admin(request: Request, next: Next) -> Result<Response, StatusCode> {
+    match request.extensions().get::<CurrentUser>() {
+        Some(user) if user.is_admin => Ok(next.run(request).await),
+        Some(_) => Err(StatusCode::FORBIDDEN),
+        None => Err(StatusCode::UNAUTHORIZED),
     }
 }
 
@@ -158,25 +207,40 @@ mod tests {
     #[test]
     fn a_freshly_issued_session_is_valid() {
         let sessions = SessionStore::default();
-        let token = sessions.issue();
-        assert!(sessions.is_valid(&token));
+        let token = sessions.issue(CurrentUser {
+            username: "admin".to_string(),
+            is_admin: true,
+            is_root: true,
+        });
+        let user = sessions.get(&token).expect("session should be valid");
+        assert_eq!(user.username, "admin");
+        assert!(user.is_admin);
+        assert!(user.is_root);
     }
 
     #[test]
     fn an_unknown_token_is_never_valid() {
         let sessions = SessionStore::default();
-        assert!(!sessions.is_valid("not-a-real-token"));
+        assert!(sessions.get("not-a-real-token").is_none());
     }
 
     #[tokio::test]
-    async fn bootstrap_creates_the_first_user_from_env_credentials() -> anyhow::Result<()> {
+    async fn bootstrap_creates_the_first_user_as_an_admin_and_root() -> anyhow::Result<()> {
         let pool = db::connect("sqlite::memory:").await?;
 
         bootstrap_user_if_needed(&pool, Some("admin"), Some("hunter2")).await?;
 
-        assert_eq!(db::dashboard_user_count(&pool).await?, 1);
-        assert!(verify_login(&pool, "admin", "hunter2").await?);
-        assert!(!verify_login(&pool, "admin", "wrong-password").await?);
+        assert_eq!(db::user_count(&pool).await?, 1);
+        let user = verify_login(&pool, "admin", "hunter2")
+            .await?
+            .expect("login should succeed");
+        assert!(user.is_admin);
+        assert!(user.is_root);
+        assert!(
+            verify_login(&pool, "admin", "wrong-password")
+                .await?
+                .is_none()
+        );
         Ok(())
     }
 
@@ -186,7 +250,7 @@ mod tests {
 
         bootstrap_user_if_needed(&pool, None, None).await?;
 
-        assert_eq!(db::dashboard_user_count(&pool).await?, 0);
+        assert_eq!(db::user_count(&pool).await?, 0);
         Ok(())
     }
 
@@ -199,15 +263,34 @@ mod tests {
         // password someone has since changed via some future admin flow.
         bootstrap_user_if_needed(&pool, Some("admin"), Some("second-password")).await?;
 
-        assert_eq!(db::dashboard_user_count(&pool).await?, 1);
-        assert!(verify_login(&pool, "admin", "first-password").await?);
+        assert_eq!(db::user_count(&pool).await?, 1);
+        assert!(
+            verify_login(&pool, "admin", "first-password")
+                .await?
+                .is_some_and(|user| user.is_admin)
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn verify_login_for_an_unknown_username_is_false_not_an_error() -> anyhow::Result<()> {
+    async fn verify_login_for_an_unknown_username_is_none_not_an_error() -> anyhow::Result<()> {
         let pool = db::connect("sqlite::memory:").await?;
-        assert!(!verify_login(&pool, "nobody", "anything").await?);
+        assert!(verify_login(&pool, "nobody", "anything").await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_non_admin_user_created_by_an_admin_verifies_as_non_admin_non_root()
+    -> anyhow::Result<()> {
+        let pool = db::connect("sqlite::memory:").await?;
+        let hash = hash_password("hunter2")?;
+        db::insert_user(&pool, "listener", &hash, false, false).await?;
+
+        let user = verify_login(&pool, "listener", "hunter2")
+            .await?
+            .expect("login should succeed");
+        assert!(!user.is_admin);
+        assert!(!user.is_root);
         Ok(())
     }
 }

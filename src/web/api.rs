@@ -168,11 +168,11 @@ pub struct LoginResponse {
 
 pub async fn login(State(state): State<WebState>, Json(body): Json<LoginRequest>) -> Response {
     match auth::verify_login(&state.db, &body.username, &body.password).await {
-        Ok(true) => {
-            let token = auth::issue_session(&state.sessions);
+        Ok(Some(user)) => {
+            let token = auth::issue_session(&state.sessions, user);
             Json(LoginResponse { token }).into_response()
         }
-        Ok(false) => error_response(StatusCode::UNAUTHORIZED, "invalid username or password"),
+        Ok(None) => error_response(StatusCode::UNAUTHORIZED, "invalid username or password"),
         Err(err) => {
             tracing::warn!(%err, "dashboard login failed to check credentials");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "login failed")

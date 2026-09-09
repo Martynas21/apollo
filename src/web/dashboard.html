@@ -76,7 +76,9 @@
     padding: var(--space-3) var(--space-3-5); color: var(--text); font-size: 14px; outline: none;
   }
   .field input:focus { border-color: var(--accent); }
-  #login-error { color: var(--danger); font-size: 13px; min-height: 18px; margin-bottom: var(--space-2); }
+  .form-error { color: var(--danger); font-size: 13px; min-height: 18px; margin-bottom: var(--space-2); }
+  .checkbox-field { display: flex; align-items: center; gap: var(--space-2); font-size: 13px; color: var(--text-muted); margin-bottom: var(--space-3-5); cursor: pointer; }
+  .checkbox-field input { width: 15px; height: 15px; accent-color: var(--accent); }
   .primary-btn {
     width: 100%; background: var(--accent); color: var(--bg); border: none;
     padding: var(--space-3); border-radius: 10px; font-size: 14px; font-weight: 700;
@@ -118,6 +120,11 @@
   .topbar-right { display: flex; align-items: center; gap: var(--space-4); }
   .logout-link { font-size: 12.5px; color: var(--text-faint); background: none; border: none; }
   .logout-link:hover { color: var(--text-muted); }
+
+  .topbar-nav { display: flex; align-items: center; gap: var(--space-0-5); background: var(--bg-elevated); border: 1px solid var(--border-soft); border-radius: 999px; padding: var(--space-0-5); flex-shrink: 0; }
+  .topbar-nav-btn { background: none; border: none; color: var(--text-muted); font-size: 13px; font-weight: 600; padding: var(--space-1-5) var(--space-4); border-radius: 999px; }
+  .topbar-nav-btn:hover { color: var(--text); }
+  .topbar-nav-btn.active { background: var(--accent); color: var(--bg); }
 
   .server-switcher { position: relative; }
   .server-btn {
@@ -338,12 +345,15 @@
       margin-top .16s ease-in, margin-bottom .16s ease-in, background-color .12s ease, border-color .12s ease;
   }
   .compact-row:hover { background: var(--bg-hover); border-color: var(--border); }
+  .compact-row.kbd-active { background: var(--bg-hover); border-color: var(--accent); }
   .compact-row.row-enter { opacity: 0; transform: translateY(-6px); }
   .compact-row.row-exit {
     opacity: 0; max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; margin-bottom: 0;
     border-width: 0;
   }
   .compact-row.queue-row { grid-template-columns: 18px 34px 1fr auto auto; }
+  .compact-row.user-row { grid-template-columns: 1fr auto auto auto; }
+  .admin-badge { font-size: 11px; font-weight: 700; letter-spacing: .02em; color: var(--accent); background: color-mix(in oklch, var(--accent) 16%, transparent); padding: var(--space-0-5) var(--space-2-5); border-radius: 999px; }
   .compact-row.now-playing-row { background: color-mix(in oklch, var(--accent) 13%, transparent); }
   .compact-row.now-playing-row:hover { background: color-mix(in oklch, var(--accent) 18%, transparent); }
   .compact-row.now-playing-row .compact-title { color: var(--accent); }
@@ -444,7 +454,7 @@
   .modal-overlay.open .modal-card { transform: translateY(0) scale(1); }
   .modal-title { font-family: 'Spectral', serif; font-size: 17px; font-weight: 600; margin: 0 0 var(--space-1-5); }
   .modal-subtext { font-size: 13px; color: var(--text-muted); margin: 0 0 var(--space-4); }
-  .modal-actions { display: flex; justify-content: flex-end; margin-top: var(--space-3-5); }
+  .modal-actions { display: flex; justify-content: flex-end; gap: var(--space-2-5); margin-top: var(--space-3-5); }
   .channel-row {
     display: flex; align-items: center; gap: var(--space-2-5); width: 100%;
     padding: var(--space-2-5); border-radius: 9px; background: none; border: none;
@@ -483,7 +493,7 @@
     <label for="password">Password</label>
     <input id="password" type="password" autocomplete="current-password">
   </div>
-  <div id="login-error"></div>
+  <div class="form-error" id="login-error"></div>
   <button class="primary-btn" id="login-btn">Sign in</button>
 </div>
 
@@ -499,6 +509,10 @@
       </svg>
       <span class="brand-word">APOLLO</span>
     </div>
+    <nav class="topbar-nav" id="topbar-nav">
+      <button class="topbar-nav-btn active" id="nav-dashboard-btn" type="button">Dashboard</button>
+      <button class="topbar-nav-btn" id="nav-users-btn" type="button" style="display:none">Users</button>
+    </nav>
     <div class="topbar-search" id="topbar-search">
       <div class="search-bar" id="search-bar">
         <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -524,7 +538,7 @@
     </div>
   </header>
 
-  <div class="dashboard-body">
+  <div class="dashboard-body" id="page-dashboard-body">
    <div class="dashboard-columns">
     <div class="dashboard-main-col">
       <section class="card">
@@ -634,7 +648,57 @@
    </section>
   </div>
 
+  <div class="dashboard-body" id="page-users" style="display:none">
+   <section class="card">
+    <div class="card-header-row">
+      <h2 class="card-title">Users</h2>
+      <button class="primary-btn small" id="add-user-btn" type="button">Add user</button>
+    </div>
+    <div class="list-panel">
+      <div class="scroll-list" id="users-list"></div>
+      <div class="muted-note" id="users-empty-note" style="display:none">No users yet.</div>
+    </div>
+   </section>
+  </div>
+
   <div id="status-line"></div>
+</div>
+
+<div class="modal-overlay" id="add-user-modal-overlay">
+  <div class="modal-card">
+    <h3 class="modal-title">Add a user</h3>
+    <p class="modal-subtext">They'll be able to sign in and control playback from this dashboard.</p>
+    <div class="field">
+      <label for="new-user-username">Username</label>
+      <input id="new-user-username" type="text" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="new-user-password">Password</label>
+      <input id="new-user-password" type="password" autocomplete="new-password">
+    </div>
+    <label class="checkbox-field"><input type="checkbox" id="new-user-is-admin"> Can manage users</label>
+    <div class="form-error" id="add-user-error"></div>
+    <div class="modal-actions">
+      <button class="ghost-btn" id="add-user-cancel" type="button">Cancel</button>
+      <button class="primary-btn small" id="add-user-submit" type="button">Create</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="edit-password-modal-overlay">
+  <div class="modal-card">
+    <h3 class="modal-title">Change password</h3>
+    <p class="modal-subtext" id="edit-password-subtext"></p>
+    <div class="field">
+      <label for="edit-password-input">New password</label>
+      <input id="edit-password-input" type="password" autocomplete="new-password">
+    </div>
+    <div class="form-error" id="edit-password-error"></div>
+    <div class="modal-actions">
+      <button class="ghost-btn" id="edit-password-cancel" type="button">Cancel</button>
+      <button class="primary-btn small" id="edit-password-submit" type="button">Save</button>
+    </div>
+  </div>
 </div>
 
 <div class="modal-overlay" id="join-modal-overlay">
@@ -665,6 +729,7 @@
   let volumeDebounce = null;
   let searchDebounce = null;
   let searchSeq = 0;
+  let searchActiveIndex = -1;
   let lastSeenPlayingVideoId = null;
   let statusDismissTimeout = null;
   let npCrossfadeTimeout = null;
@@ -722,6 +787,7 @@
     loginScreen.style.display = 'none';
     dashboard.style.display = 'flex';
     loadGuilds();
+    loadCurrentUser();
   }
 
   function showLogin(message) {
@@ -731,6 +797,9 @@
     loginScreen.style.display = 'block';
     dashboard.style.display = 'none';
     loginError.textContent = message || '';
+    currentUser = null;
+    navUsersBtn.style.display = 'none';
+    showPage('dashboard');
   }
 
   async function api(path, options = {}) {
@@ -1098,6 +1167,7 @@
   const PLAY_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,3 21,12 6,21"/></svg>';
   const GRIP_ICON = '<svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="2.5" cy="2.5" r="1.5"/><circle cx="7.5" cy="2.5" r="1.5"/><circle cx="2.5" cy="8" r="1.5"/><circle cx="7.5" cy="8" r="1.5"/><circle cx="2.5" cy="13.5" r="1.5"/><circle cx="7.5" cy="13.5" r="1.5"/></svg>';
   const REFRESH_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>';
+  const EDIT_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
 
   function makeMiniIconBtn(iconSvg, title, disabled, danger) {
     const btn = document.createElement('button');
@@ -1774,6 +1844,7 @@
     searchResults.innerHTML = '';
     searchEmptyNote.style.display = 'none';
     searchLoadingNote.style.display = 'none';
+    searchActiveIndex = -1;
     closeSearchDropdown();
   }
 
@@ -1803,6 +1874,17 @@
     searchEmptyNote.style.display = tracks.length === 0 ? 'block' : 'none';
     reconcileList(searchResults, tracks, (track) => track.video_id, createSearchRow, updateSearchRow);
     openSearchDropdown();
+    setSearchActiveIndex(-1);
+  }
+
+  function setSearchActiveIndex(index) {
+    const rows = Array.from(searchResults.children);
+    if (rows.length === 0) index = -1;
+    else if (index >= rows.length) index = -1;
+    else if (index < -1) index = rows.length - 1;
+    rows.forEach((row, i) => row.classList.toggle('kbd-active', i === index));
+    if (index !== -1) rows[index].scrollIntoView({ block: 'nearest' });
+    searchActiveIndex = index;
   }
 
   function setSearchBarLoading(loading) {
@@ -1855,6 +1937,7 @@
       searchEmptyNote.style.display = 'none';
       searchLoadingNote.style.display = 'none';
       closeSearchDropdown();
+      searchActiveIndex = -1;
       return;
     }
     const isLink = extractVideoId(query) !== null;
@@ -1865,6 +1948,7 @@
       searchResults.innerHTML = '';
       searchEmptyNote.style.display = 'none';
       closeSearchDropdown();
+      searchActiveIndex = -1;
     }
     if (isPlaylistLink) {
       searchDebounce = setTimeout(() => importPlaylistFromSearch(query), 300);
@@ -1874,7 +1958,22 @@
   });
 
   searchInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') closeSearchDropdown();
+    if (event.key === 'Escape') { closeSearchDropdown(); return; }
+    if (!searchDropdown.classList.contains('open') || searchResults.children.length === 0) return;
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      setSearchActiveIndex(searchActiveIndex + 1);
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      setSearchActiveIndex(searchActiveIndex - 1);
+    } else if (event.key === 'Enter') {
+      const row = searchResults.children[searchActiveIndex === -1 ? 0 : searchActiveIndex];
+      if (row) {
+        event.preventDefault();
+        addToQueue(row._videoId, row._title);
+        closeSearchDropdown();
+      }
+    }
   });
 
   async function addToQueue(videoId, title, btn) {
@@ -2130,6 +2229,250 @@
       renderFavouritePlaylists(body.playlists);
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
+
+  // ---- Users (admin only) ----
+  const navDashboardBtn = document.getElementById('nav-dashboard-btn');
+  const navUsersBtn = document.getElementById('nav-users-btn');
+  const pageDashboardBody = document.getElementById('page-dashboard-body');
+  const pageUsers = document.getElementById('page-users');
+  const usersList = document.getElementById('users-list');
+  const usersEmptyNote = document.getElementById('users-empty-note');
+  let currentUser = null;
+
+  // The nav itself is hidden from non-admins (see loadCurrentUser), but
+  // showPage stays reachable either way so showLogin can always reset back
+  // to the Dashboard page.
+  function showPage(name) {
+    const onUsers = name === 'users';
+    pageDashboardBody.style.display = onUsers ? 'none' : 'flex';
+    pageUsers.style.display = onUsers ? 'flex' : 'none';
+    topbarSearch.style.display = onUsers ? 'none' : '';
+    navDashboardBtn.classList.toggle('active', !onUsers);
+    navUsersBtn.classList.toggle('active', onUsers);
+    if (onUsers) loadUsers();
+  }
+
+  navDashboardBtn.addEventListener('click', () => showPage('dashboard'));
+  navUsersBtn.addEventListener('click', () => showPage('users'));
+
+  async function loadCurrentUser() {
+    try {
+      const response = await api('/api/me');
+      if (!response.ok) return;
+      currentUser = await response.json();
+      navUsersBtn.style.display = currentUser.is_admin ? '' : 'none';
+    } catch (err) { /* showLogin already handled unauthorized */ }
+  }
+
+  function createUserRow(user) {
+    const row = document.createElement('div');
+    row.className = 'compact-row user-row';
+
+    const meta = document.createElement('div');
+    meta.className = 'compact-meta';
+    const title = document.createElement('div');
+    title.className = 'compact-title';
+    meta.appendChild(title);
+    row.appendChild(meta);
+
+    const badge = document.createElement('div');
+    badge.className = 'admin-badge';
+    row.appendChild(badge);
+
+    const editBtn = makeMiniIconBtn(EDIT_ICON, 'Change password', false, false);
+    editBtn.classList.add('edit-user-btn');
+    editBtn.addEventListener('click', () => openEditPasswordModal(row._username));
+    row.appendChild(editBtn);
+
+    const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Delete user', false, true);
+    removeBtn.addEventListener('click', () => deleteUser(row._username));
+    row.appendChild(removeBtn);
+
+    updateUserRow(row, user);
+    return row;
+  }
+
+  // The admin badge uses visibility (not display) when hidden so every row
+  // keeps the same 4-column grid — otherwise a plain-user row would lose a
+  // track and its buttons would drift out of alignment.
+  function updateUserRow(row, user) {
+    row.querySelector('.compact-title').textContent = user.username;
+    const badge = row.querySelector('.admin-badge');
+    badge.textContent = user.is_root ? 'Root' : 'Admin';
+    badge.style.visibility = user.is_admin ? 'visible' : 'hidden';
+
+    const isSelf = !!currentUser && user.username === currentUser.username;
+
+    // Everyone can change their own password; only root can reset someone
+    // else's (see the matching check in web::users::set_password).
+    const canEditPassword = isSelf || (!!currentUser && currentUser.is_root);
+    const editBtn = row.querySelector('.edit-user-btn');
+    editBtn.disabled = !canEditPassword;
+    editBtn.title = canEditPassword
+      ? 'Change password'
+      : "Only the root admin can change another user's password";
+
+    const removeBtn = row.querySelector('.mini-icon-btn.danger');
+    removeBtn.disabled = isSelf || user.is_root;
+    removeBtn.title = user.is_root
+      ? "The root account can't be deleted"
+      : isSelf
+        ? "You can't delete your own account"
+        : 'Delete user';
+
+    row._username = user.username;
+  }
+
+  async function loadUsers() {
+    try {
+      const response = await api('/api/users');
+      if (!response.ok) return;
+      const users = await response.json();
+      usersEmptyNote.style.display = users.length === 0 ? 'block' : 'none';
+      reconcileList(usersList, users, (user) => user.username, createUserRow, updateUserRow);
+    } catch (err) { /* showLogin already handled unauthorized */ }
+  }
+
+  async function deleteUser(username) {
+    if (!window.confirm(`Remove "${username}"? They will no longer be able to sign in.`)) return;
+    try {
+      const response = await api(`/api/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        showStatus(body.error || 'Could not remove that user.', { isError: true });
+        return;
+      }
+      showStatus(`Removed "${username}".`);
+      loadUsers();
+    } catch (err) { /* showLogin already handled unauthorized */ }
+  }
+
+  // ---- Add-user modal ----
+  const addUserModalOverlay = document.getElementById('add-user-modal-overlay');
+  const addUserUsernameInput = document.getElementById('new-user-username');
+  const addUserPasswordInput = document.getElementById('new-user-password');
+  const addUserIsAdminInput = document.getElementById('new-user-is-admin');
+  const addUserError = document.getElementById('add-user-error');
+  const addUserSubmitBtn = document.getElementById('add-user-submit');
+
+  function openAddUserModal() {
+    addUserUsernameInput.value = '';
+    addUserPasswordInput.value = '';
+    addUserIsAdminInput.checked = false;
+    addUserError.textContent = '';
+    addUserModalOverlay.classList.add('open');
+    addUserUsernameInput.focus();
+  }
+
+  function closeAddUserModal() {
+    addUserModalOverlay.classList.remove('open');
+  }
+
+  async function submitAddUser() {
+    const username = addUserUsernameInput.value.trim();
+    const password = addUserPasswordInput.value;
+    if (!username || !password) {
+      addUserError.textContent = 'Username and password are required.';
+      return;
+    }
+    addUserError.textContent = '';
+    setButtonBusy(addUserSubmitBtn, true);
+    try {
+      const response = await api('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password, is_admin: addUserIsAdminInput.checked }),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        addUserError.textContent = body.error || 'Could not create that user.';
+        return;
+      }
+      closeAddUserModal();
+      showStatus(`Created "${username}".`);
+      loadUsers();
+    } catch (err) { /* showLogin already handled unauthorized */
+    } finally {
+      setButtonBusy(addUserSubmitBtn, false);
+    }
+  }
+
+  document.getElementById('add-user-btn').addEventListener('click', openAddUserModal);
+  document.getElementById('add-user-cancel').addEventListener('click', closeAddUserModal);
+  addUserModalOverlay.addEventListener('click', (event) => {
+    if (event.target === addUserModalOverlay) closeAddUserModal();
+  });
+  addUserSubmitBtn.addEventListener('click', submitAddUser);
+  for (const fieldId of ['new-user-username', 'new-user-password']) {
+    document.getElementById(fieldId).addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitAddUser();
+    });
+  }
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && addUserModalOverlay.classList.contains('open')) closeAddUserModal();
+  });
+
+  // ---- Edit-password modal ----
+  const editPasswordModalOverlay = document.getElementById('edit-password-modal-overlay');
+  const editPasswordSubtext = document.getElementById('edit-password-subtext');
+  const editPasswordInput = document.getElementById('edit-password-input');
+  const editPasswordError = document.getElementById('edit-password-error');
+  const editPasswordSubmitBtn = document.getElementById('edit-password-submit');
+  let editPasswordUsername = null;
+
+  function openEditPasswordModal(username) {
+    editPasswordUsername = username;
+    editPasswordInput.value = '';
+    editPasswordError.textContent = '';
+    editPasswordSubtext.textContent = `Set a new password for "${username}".`;
+    editPasswordModalOverlay.classList.add('open');
+    editPasswordInput.focus();
+  }
+
+  function closeEditPasswordModal() {
+    editPasswordModalOverlay.classList.remove('open');
+    editPasswordUsername = null;
+  }
+
+  async function submitEditPassword() {
+    const password = editPasswordInput.value;
+    if (!password) {
+      editPasswordError.textContent = 'Password is required.';
+      return;
+    }
+    editPasswordError.textContent = '';
+    setButtonBusy(editPasswordSubmitBtn, true);
+    try {
+      const response = await api(`/api/users/${encodeURIComponent(editPasswordUsername)}/password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        editPasswordError.textContent = body.error || 'Could not change that password.';
+        return;
+      }
+      const username = editPasswordUsername;
+      closeEditPasswordModal();
+      showStatus(`Updated password for "${username}".`);
+    } catch (err) { /* showLogin already handled unauthorized */
+    } finally {
+      setButtonBusy(editPasswordSubmitBtn, false);
+    }
+  }
+
+  document.getElementById('edit-password-cancel').addEventListener('click', closeEditPasswordModal);
+  editPasswordModalOverlay.addEventListener('click', (event) => {
+    if (event.target === editPasswordModalOverlay) closeEditPasswordModal();
+  });
+  editPasswordSubmitBtn.addEventListener('click', submitEditPassword);
+  editPasswordInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submitEditPassword();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && editPasswordModalOverlay.classList.contains('open')) closeEditPasswordModal();
+  });
 
   if (token) {
     showDashboard();

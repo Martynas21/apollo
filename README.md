@@ -168,15 +168,23 @@ container-loopback bind is unreachable from the host by design, so it sets
 `DASHBOARD_BIND_ADDR=0.0.0.0:8787` and publishes it back to
 `127.0.0.1:8787` on the host instead (see `ports:` in `compose.yaml`).
 
-Sign-in is a single local account (username + password, hashed with
-argon2), stored in the same SQLite database as everything else — there's no
-per-Discord-user identity or per-guild permission check, so anyone who logs
-in can control any server the bot is in. Set `DASHBOARD_USERNAME` and
-`DASHBOARD_PASSWORD` before the first run to create that account; they're
-only read while no dashboard account exists yet, so changing them later has
-no effect (there's no "change password" flow yet). Leave both unset to
+Sign-in is local accounts (username + password, hashed with argon2), stored
+in the same SQLite database as everything else — there's no per-Discord-user
+identity or per-guild permission check, so anyone who logs in can control
+any server the bot is in. Set `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD`
+before the first run to create the first account, which is both an
+**admin** and the sole **root** account; they're only read while no account
+exists yet, so changing them later has no effect. Leave both unset to
 disable the dashboard's login entirely — it still comes up, but rejects
 every sign-in.
+
+Admins get a "Users" tab in the top nav, where they can create further
+accounts (optionally as admins themselves) and remove them; there's no
+self-service signup, so account creation is entirely admin-driven from that
+page. Every account can change its own password from that same page — but
+only root can change someone *else's* (e.g. to reset a forgotten one); a
+regular admin can't, and root itself can't be deleted, since that would
+permanently remove the only account able to do so.
 
 ## Running it
 

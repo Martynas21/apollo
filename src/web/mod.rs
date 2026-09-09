@@ -11,12 +11,13 @@
 
 mod api;
 mod auth;
+mod users;
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::middleware::from_fn_with_state;
-use axum::routing::{get, post};
+use axum::middleware::{from_fn, from_fn_with_state};
+use axum::routing::{delete, get, post};
 use serenity::all as serenity;
 
 pub use auth::bootstrap_user_if_needed;
@@ -107,9 +108,32 @@ fn playlist_routes() -> Router<WebState> {
         )
 }
 
+fn me_routes() -> Router<WebState> {
+    Router::new().route("/api/me", get(users::me))
+}
+
+fn admin_routes() -> Router<WebState> {
+    Router::new()
+        .route(
+            "/api/users",
+            get(users::list_users).post(users::create_user),
+        )
+        .route("/api/users/{username}", delete(users::delete_user))
+        .route("/api/users/{username}/password", post(users::set_password))
+}
+
 pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {
+    // `require_admin` needs `require_session` to have already resolved the
+    // caller's identity into the request's extensions, so it's layered onto
+    // `admin_routes()` alone before that merges into `protected` — the
+    // outer `route_layer(require_session)` below then wraps the whole
+    // merged router, running first on every request.
+    let admin_only = admin_routes().route_layer(from_fn(auth::require_admin));
+
     let protected = playback_routes()
         .merge(playlist_routes())
+        .merge(me_routes())
+        .merge(admin_only)
         .route_layer(from_fn_with_state(state.clone(), auth::require_session));
 
     let public = Router::new()
