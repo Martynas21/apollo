@@ -60,10 +60,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:bookworm-slim AS apollo
 ARG APOLLO_UID
 
-# ffmpeg from Debian's repo; yt-dlp as the standalone upstream binary
-# (no Python runtime needed, and it's the build yt-dlp's own maintainers
-# test against — apt's yt-dlp package lags upstream and breaks against
-# YouTube's extraction changes far more often).
+# yt-dlp as the standalone upstream binary (no Python runtime needed, and
+# it's the build yt-dlp's own maintainers test against — apt's yt-dlp
+# package lags upstream and breaks against YouTube's extraction changes far
+# more often).
 #
 # Deno is installed alongside it because yt-dlp now needs an external JS
 # runtime to reliably solve YouTube's "n" parameter challenge; without one
@@ -75,7 +75,7 @@ ARG APOLLO_UID
 # yt-dlp/YouTube, only a pre-resolved file on the shared buffer volume.
 ARG TARGETARCH
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg curl unzip \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip \
     && case "$TARGETARCH" in \
         amd64) deno_arch=x86_64; ytdlp_asset=yt-dlp_linux ;; \
         arm64) deno_arch=aarch64; ytdlp_asset=yt-dlp_linux_aarch64 ;; \
@@ -110,7 +110,7 @@ ENV RUST_LOG=info,apollo=info
 ENTRYPOINT ["/usr/local/bin/apollo"]
 
 # ---- apollo-audio-worker runtime ------------------------------------------
-# Deliberately minimal: no yt-dlp/ffmpeg/Deno, no Discord bot token, no DB —
+# Deliberately minimal: no yt-dlp/Deno, no Discord bot token, no DB —
 # this process only ever holds songbird `Driver`s and streams already-resolved
 # URLs straight into them over HTTP. `ca-certificates` is still needed for
 # the voice gateway's TLS websocket handshake and for the HTTPS audio stream.

@@ -34,8 +34,8 @@ AUDIO_WORKER_SOCKET=127.0.0.1:7878 cargo run --bin apollo-audio-worker &
 AUDIO_WORKER_SOCKET=127.0.0.1:7878 cargo run --bin apollo
 ```
 
-`yt-dlp`, `ffmpeg`, and a JS runtime (Deno) must be on `PATH` for `apollo`
-(not `apollo-audio-worker`) — checked at startup, fails fast if missing.
+`yt-dlp` and a JS runtime (Deno) must be on `PATH` for `apollo`
+(not `apollo-audio-worker`) — `yt-dlp` is checked at startup, fails fast if missing.
 `docker compose up -d --build` runs both processes via `compose.yaml`/`Dockerfile`.
 
 ## Architecture
@@ -52,7 +52,7 @@ Three-crate Cargo workspace:
   problem — see the "Discord replies", "IPC" and "stream directly into songbird"
   entries in `git log`). Streams a resolved media URL straight into songbird
   via `songbird::input::HttpRequest` + symphonia — no download, no local file.
-  Much smaller image than `apollo`: no `yt-dlp`/`ffmpeg`/Deno, no Discord
+  Much smaller image than `apollo`: no `yt-dlp`/Deno, no Discord
   token, no DB access.
 - **`ipc/`** (`apollo-ipc`) — the wire protocol shared by both: length-prefixed
   framing (`framing.rs`) over a plain TCP socket, `Envelope`/`Request`/
@@ -99,8 +99,8 @@ Key points:
 - `src/youtube/api.rs` — the `yt-dlp` subprocess client (search,
   single-video metadata, playlist listing — all via `yt-dlp -j`).
 - `src/voice/resolve.rs` — resolves a track to a direct streamable URL
-  (metadata-only `yt-dlp -j`, no download) and does the ffmpeg/yt-dlp
-  startup dependency check.
+  (metadata-only `yt-dlp -j`, no download). `src/voice/mod.rs` does the
+  `yt-dlp` startup dependency check.
 - `src/voice/panel.rs` — renders/updates the persistent `/player` panel.
 - `src/db.rs` — sqlx/SQLite: per-guild settings (volume), saved playlists,
   guild sessions. Migrations in `migrations/` are embedded into the binary at

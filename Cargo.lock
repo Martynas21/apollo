@@ -90,7 +90,6 @@ dependencies = [
  "serenity",
  "songbird",
  "sqlx",
- "symphonia",
  "tokio",
  "tracing",
  "tracing-subscriber",

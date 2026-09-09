@@ -11,8 +11,8 @@ Functionally complete: browsing and playback all work end to end in code
 (`cargo build`/`clippy`/`test` all pass — see `git log` for what's
 implemented phase by phase). It has **not** been run against a live
 Discord bot token yet — do that before trusting it in a real server.
-`yt-dlp` and `ffmpeg` also need to actually be installed wherever you run
-it (see Prerequisites).
+`yt-dlp` also needs to actually be installed wherever you run it (see
+Prerequisites).
 
 ## Architecture
 
@@ -22,19 +22,19 @@ it (see Prerequisites).
   listings, all via `yt-dlp -j --flat-playlist`/`--no-playlist`. No Google
   Cloud project, API key, or OAuth consent screen needed.
 - **Audio, in two processes**: `apollo` resolves a track with a metadata-only
-  `yt-dlp -j` call to get a direct streamable media URL (no download, no
-  `ffmpeg`), and sends that URL over to a separate `apollo-audio-worker`
-  process. That process holds the actual `songbird::Driver`/voice
-  connection and streams the URL straight into it over HTTP
-  (`songbird::input::HttpRequest` + symphonia), isolated into its own OS
-  process (its own container, in Docker) so ordinary load on `apollo`
-  itself — Discord gateway traffic, DB writes, `yt-dlp` spawns — can't
-  starve the mixer's packet-send timing and cause audible stutter. The two
-  talk over a small length-prefixed protocol on a plain TCP connection
-  (`ipc/`); see `src/voice/ipc_backend.rs` and `audio-worker/`. `ffmpeg` is
-  still a required dependency of `apollo` itself: it's checked for at
-  startup since `yt-dlp` itself may shell out to it for some post-processing
-  paths.
+  `yt-dlp -j` call to get a direct streamable media URL (no download), and
+  sends that URL over to a separate `apollo-audio-worker` process. That
+  process holds the actual `songbird::Driver`/voice connection and streams
+  the URL straight into it over HTTP (`songbird::input::HttpRequest` +
+  symphonia), isolated into its own OS process (its own container, in
+  Docker) so ordinary load on `apollo` itself — Discord gateway traffic, DB
+  writes, `yt-dlp` spawns — can't starve the mixer's packet-send timing and
+  cause audible stutter. The two talk over a small length-prefixed protocol
+  on a plain TCP connection (`ipc/`); see `src/voice/ipc_backend.rs` and
+  `audio-worker/`. `ffmpeg` is not needed anywhere in this pipeline — decoding
+  happens in-process via symphonia, and the `yt-dlp` calls only ever
+  simulate (no download, so no post-processing step that could shell out to
+  it).
 - A local SQLite database (via `sqlx`) persists per-guild playback settings
   (currently just volume) and saved playlists (a named pointer to a
   `YouTube` playlist URL, browsable from the `/player` panel) across
@@ -45,9 +45,8 @@ it (see Prerequisites).
 
 - Rust (stable, edition 2024 — see `rustc --version`)
 - A Discord application + bot token — see [Discord application setup](#discord-application-setup) below.
-- `yt-dlp` and `ffmpeg` installed and on `PATH`. The bot checks for both at
-  startup and refuses to run if either is missing, with a message naming
-  which one. **Keep `yt-dlp` updated** (`yt-dlp -U`, or reinstall
+- `yt-dlp` installed and on `PATH`. The bot checks for it at startup and
+  refuses to run if it's missing. **Keep `yt-dlp` updated** (`yt-dlp -U`, or reinstall
   periodically) — YouTube changes its site internals often enough that a
   stale `yt-dlp` silently starts failing to resolve videos.
 - A JS runtime on `PATH` for `yt-dlp` — [Deno](https://github.com/denoland/deno/releases)
@@ -81,8 +80,8 @@ it (see Prerequisites).
 
 1. Copy `.env.example` to `.env` and fill in the values from the section
    above.
-2. `cargo run` (fails fast at startup if `yt-dlp`/`ffmpeg` are missing, or
-   if any required `.env` value is unset).
+2. `cargo run` (fails fast at startup if `yt-dlp` is missing, or if any
+   required `.env` value is unset).
 
 ## Development
 
@@ -195,7 +194,7 @@ every sign-in.
 Apollo is meant to run **locally** (your own machine, not a remote
 server) — either directly with `cargo run` (or a release build) and a
 `.env` file next to it, or in Docker if you'd rather not install Rust,
-`yt-dlp`, `ffmpeg`, and Deno on the host yourself. Either way it's the
+`yt-dlp` and Deno on the host yourself. Either way it's the
 same local, single-user setup — Docker here is just a convenience
 wrapper, not a deployment.
 
@@ -218,8 +217,8 @@ manager/vault would be solving a problem this setup doesn't have.
 
 For Docker: `Dockerfile` is a multi-target build producing two images from
 one Cargo workspace — `apollo` (with `yt-dlp`, upstream's standalone
-binary, `ffmpeg`, and Deno installed) and `apollo-audio-worker` (much
-smaller: no `yt-dlp`/`ffmpeg`/Deno, no Discord bot token, no DB access —
+binary, and Deno installed) and `apollo-audio-worker` (much
+smaller: no `yt-dlp`/Deno, no Discord bot token, no DB access —
 just the audio driver). `compose.yaml` runs both, wired together over a
 plain TCP connection (Docker's internal DNS resolves the `audio-worker`
 hostname), plus the usual volume for `DATABASE_URL`'s SQLite file (so it

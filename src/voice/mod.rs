@@ -16,22 +16,10 @@ const VERSION_LOG_LEN: usize = 120;
 
 #[allow(dead_code)]
 pub async fn check_playback_dependencies() -> anyhow::Result<()> {
-    let mut missing = Vec::new();
-
-    if !binary_runnable("yt-dlp", "--version").await {
-        missing.push("yt-dlp");
-    }
-    if !binary_runnable("ffmpeg", "-version").await {
-        missing.push("ffmpeg");
-    }
-
-    if missing.is_empty() {
+    if binary_runnable("yt-dlp", "--version").await {
         Ok(())
     } else {
-        anyhow::bail!(
-            "missing required playback dependencies: {} — install yt-dlp and ffmpeg and ensure they're on PATH",
-            missing.join(", ")
-        )
+        anyhow::bail!("yt-dlp is missing — install it and ensure it's on PATH")
     }
 }
 
@@ -111,7 +99,7 @@ mod tests {
         let banner = version_banner("yt-dlp 2024.08.06\nsome other line\n");
         assert_eq!(banner, "yt-dlp 2024.08.06");
 
-        let long = format!("ffmpeg version {}\nconfiguration: ...", "x".repeat(300));
+        let long = format!("yt-dlp version {}\nconfiguration: ...", "x".repeat(300));
         let banner = version_banner(&long);
         assert!(banner.ends_with("..."));
         assert!(banner.chars().count() <= VERSION_LOG_LEN + 3);

@@ -1,7 +1,7 @@
 # Manual end-to-end test plan
 
 Everything in this repo is unit-tested where that's possible without a
-live Discord gateway connection or working `yt-dlp`/`ffmpeg` binaries.
+live Discord gateway connection or a working `yt-dlp` binary.
 This plan covers what's left: the parts that can only be verified by
 actually running the bot against a real Discord server. Run through it
 once after setup (`README.md`), and again after any change that touches
@@ -14,7 +14,7 @@ share with other people — some steps involve deliberately breaking things
 ## 0. Prerequisites
 
 - [x] `.env` filled in per README's Discord application setup section.
-- [x] `which yt-dlp ffmpeg` both resolve; `cargo run` gets past the
+- [x] `which yt-dlp` resolves; `cargo run` gets past the
       startup dependency check without erroring.
 - [x] The bot's invite URL (README) has been used to add it to your test
       server, and it shows **online** within a few seconds of `cargo run`.
