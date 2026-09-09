@@ -1,7 +1,8 @@
 # Apollo
 
 Apollo is a Discord bot that streams audio from YouTube — search, a direct
-URL, or a playlist — into a Discord voice channel. All YouTube access
+URL, or a playlist — into a Discord voice channel, controlled from its own
+web dashboard rather than Discord slash commands. All YouTube access
 (search, metadata, playback) goes through `yt-dlp`, so there's no Google
 API quota, no OAuth client to register, and no per-user linking step.
 
@@ -16,7 +17,7 @@ it (see Prerequisites).
 
 ## Architecture
 
-- **Discord**: [serenity](https://github.com/serenity-rs/serenity) (gateway/REST) + [songbird](https://github.com/serenity-rs/songbird) (voice) + [poise](https://github.com/serenity-rs/poise) (slash commands), on tokio.
+- **Discord**: [serenity](https://github.com/serenity-rs/serenity) (gateway/REST) + [songbird](https://github.com/serenity-rs/songbird) (voice), on tokio. Discord is used only for the gateway connection and voice — there are no slash commands; all control is via the web dashboard below.
 - **YouTube**: `yt-dlp` subprocess calls for everything — search
   (`ytsearch<n>:<query>`), a single video's metadata, and playlist
   listings, all via `yt-dlp -j --flat-playlist`/`--no-playlist`. No Google
@@ -37,9 +38,8 @@ it (see Prerequisites).
   paths.
 - A local SQLite database (via `sqlx`) persists per-guild playback settings
   (currently just volume) and saved playlists (a named pointer to a
-  `YouTube` playlist URL, browsable from the `/player` panel) across
-  restarts. Only `apollo` touches it — `apollo-audio-worker` has no DB
-  access.
+  `YouTube` playlist URL, managed from the web dashboard) across restarts.
+  Only `apollo` touches it — `apollo-audio-worker` has no DB access.
 
 ## Prerequisites
 
@@ -65,17 +65,18 @@ it (see Prerequisites).
 3. No privileged gateway intents need to be toggled on in the portal —
    Apollo only uses `GUILDS` and `GUILD_VOICE_STATES`, neither of which is
    privileged (unlike, e.g., message content or member list access).
-4. Generate an invite URL with the `bot` and `applications.commands`
-   scopes, and these bot permissions: View Channels, Send Messages, Embed
-   Links, Connect, Speak. You can build this in the portal's OAuth2 → URL
-   Generator page, or use this template with your Application ID:
+4. Generate an invite URL with the `bot` scope (no `applications.commands` —
+   there are no slash commands), and these bot permissions: View Channels,
+   Connect, Speak. You can build this in the portal's OAuth2 → URL Generator
+   page, or use this template with your Application ID:
    ```
-   https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot%20applications.commands&permissions=3165184
+   https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot&permissions=3146752
    ```
-5. For local development, set `DISCORD_GUILD_ID` (in `.env`) to a test
-   server's ID — slash commands registered to a specific guild show up
-   within seconds; global registration (leaving it unset) can take up to
-   an hour to propagate everywhere, which is annoying mid-development.
+5. `DISCORD_GUILD_ID` (in `.env`) is optional and only matters if this bot
+   previously registered slash commands (from before they were removed) —
+   set it to the same guild ID they were registered to so startup can clear
+   them; leave it unset to clear global commands instead. New installs can
+   ignore it entirely.
 
 ## Setup
 
@@ -128,7 +129,8 @@ this — see `cargo clippy` in Development above:
 See `.env.example` for the full list and inline docs:
 
 - `DISCORD_TOKEN`, `DISCORD_APPLICATION_ID` — required.
-- `DISCORD_GUILD_ID` — optional, see [Discord application setup](#discord-application-setup).
+- `DISCORD_GUILD_ID` — optional, only relevant for clearing stale slash
+  commands from an older install; see [Discord application setup](#discord-application-setup).
 - `DATABASE_URL` — required (e.g. `sqlite://apollo.db`).
 - `YT_DLP_COOKIES_FILE` — optional but increasingly necessary in practice:
   YouTube requires a proof-of-origin signal from a real logged-in browser
@@ -145,12 +147,17 @@ See `.env.example` for the full list and inline docs:
 
 ## Web dashboard
 
-Apollo also serves a small browser dashboard alongside the Discord bot —
-currently just "Now Playing" plus transport controls (pause/resume, skip,
-stop, shuffle, radio toggle, volume) for whichever of the bot's servers you
-select, live-updated over a WebSocket. It's a browser-based sibling to the
-`/player` panel, not a replacement — queue management, search, and
-playlists are still Discord-only for now.
+The web dashboard is Apollo's only control surface — there are no Discord
+slash commands. It covers "Now Playing" plus transport controls
+(pause/resume, skip, stop, shuffle, radio toggle, volume, live-updated over
+a WebSocket), queue management (remove/reorder/clear), YouTube search and
+add-to-queue, saved-playlist management (import/play/refresh/remove), and
+per-guild play-count favourites, for whichever of the bot's servers you
+select. Unlike a Discord command (which could infer the caller's current
+voice channel), the dashboard has no such context — it prompts you to pick
+a voice channel the first time you play something for a guild. The bot
+leaves on its own ~2.5 minutes after the queue drains empty (see
+`IDLE_DISCONNECT` in `src/voice/player.rs`).
 
 It listens on `DASHBOARD_BIND_ADDR` (default `127.0.0.1:8787`, i.e.
 localhost-only until you put something in front of it) and serves plain
@@ -171,24 +178,6 @@ only read while no dashboard account exists yet, so changing them later has
 no effect (there's no "change password" flow yet). Leave both unset to
 disable the dashboard's login entirely — it still comes up, but rejects
 every sign-in.
-
-## Commands
-
-- **Playback**: `/play <query|url|playlist-url>` (auto-joins your voice
-  channel) — plays a video, queues an entire playlist given its URL, or for
-  free text shows up to 5 search results with a select menu to queue one.
-  `/queue`, `/skip`, `/pause`, `/resume`, `/stop`, `/player`, `/shuffle`,
-  `/radio`, `/volume <0-100>` (persists per-guild across restarts)
-- **Player panel**: `/player` posts a persistent per-guild panel (playback
-  controls plus Search/Playlists buttons into the library, kept in sync as
-  state changes) or points back at the existing one if it's already active.
-  Its Playlists button opens a picker for this guild's saved playlists —
-  import one from a `YouTube` playlist URL, then browse/play/refresh/remove
-  it later without re-pasting the URL into `/play`.
-
-  There's no manual `/join`/`/leave` — the bot joins automatically on
-  `/play`/etc., and leaves on its own ~2.5 minutes after the
-  queue drains empty (see `IDLE_DISCONNECT` in `src/voice/player.rs`).
 
 ## Running it
 
@@ -233,17 +222,15 @@ setup, and premature before this has even been run live once.
 
 ## Project layout
 
-- `src/main.rs` — entrypoint: config, logging, client/framework wiring.
+- `src/main.rs` — entrypoint: config, logging, Discord client wiring.
 - `src/config.rs` — environment-based configuration.
 - `src/db.rs` — SQLite persistence for per-guild playback settings and saved
   playlists (`sqlx`).
-- `src/commands/` — poise slash commands: `playback.rs` (playback control),
-  `library.rs` (search/queue/saved playlists), `radio.rs` (`/radio`).
 - `src/youtube/api.rs` — `yt-dlp`-backed search/single-video/playlist client.
-- `src/voice/` — `player.rs` (per-guild queue engine), `panel.rs` (the
-  `/player` panel's rendering), `resolve.rs` (yt-dlp-backed audio resolution
-  + startup dependency check), `radio.rs` (Mix listing for radio mode),
-  `ipc_backend.rs` (the `VoiceBackend` that talks to `apollo-audio-worker`).
+- `src/voice/` — `player.rs` (per-guild queue engine), `resolve.rs`
+  (yt-dlp-backed audio resolution + startup dependency check), `radio.rs`
+  (Mix listing for radio mode), `ipc_backend.rs` (the `VoiceBackend` that
+  talks to `apollo-audio-worker`).
 - `src/web/` — the web dashboard (`axum`): `api.rs` (HTTP/WebSocket
   handlers), `auth.rs` (password hashing + in-memory session tokens),
   `dashboard.html` (the single-page frontend, served as-is). See

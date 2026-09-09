@@ -413,6 +413,8 @@
   .playlist-cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
   .playlist-name { font-family: 'Spectral', serif; font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .playlist-count { font-size: 11.5px; color: var(--text-muted); margin-top: calc(-1 * var(--space-1)); }
+  .playlist-actions { display: flex; align-items: center; gap: var(--space-1); }
+  .playlist-actions .primary-btn { flex: 1; min-width: 0; }
 
   #status-line {
     min-height: 18px; font-size: 12.5px; color: var(--text-muted); padding: 0 var(--space-10) var(--space-5);
@@ -1086,6 +1088,7 @@
 
   const REMOVE_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
   const GRIP_ICON = '<svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="2.5" cy="2.5" r="1.5"/><circle cx="7.5" cy="2.5" r="1.5"/><circle cx="2.5" cy="8" r="1.5"/><circle cx="7.5" cy="8" r="1.5"/><circle cx="2.5" cy="13.5" r="1.5"/><circle cx="7.5" cy="13.5" r="1.5"/></svg>';
+  const REFRESH_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>';
 
   function makeMiniIconBtn(iconSvg, title, disabled, danger) {
     const btn = document.createElement('button');
@@ -1909,12 +1912,25 @@
       count.textContent = `${playlist.track_count} track${playlist.track_count === 1 ? '' : 's'}`;
       chip.appendChild(count);
 
+      const actions = document.createElement('div');
+      actions.className = 'playlist-actions';
+
       const playBtn = document.createElement('button');
       playBtn.type = 'button';
       playBtn.className = 'primary-btn small';
       playBtn.textContent = 'Play';
       playBtn.addEventListener('click', () => playPlaylist(playlist.id, playlist.name, playBtn));
-      chip.appendChild(playBtn);
+      actions.appendChild(playBtn);
+
+      const refreshBtn = makeMiniIconBtn(REFRESH_ICON, 'Refresh from YouTube', false, false);
+      refreshBtn.addEventListener('click', () => refreshPlaylist(playlist.id, playlist.name));
+      actions.appendChild(refreshBtn);
+
+      const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Remove playlist', false, true);
+      removeBtn.addEventListener('click', () => removePlaylist(playlist.id, playlist.name));
+      actions.appendChild(removeBtn);
+
+      chip.appendChild(actions);
 
       playlistRow.appendChild(chip);
     }
@@ -1951,6 +1967,34 @@
     } finally {
       setButtonBusy(btn, false);
     }
+  }
+
+  async function refreshPlaylist(id, name) {
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/playlists/${id}/refresh`, { method: 'POST' });
+      const body = await response.json();
+      if (!response.ok) {
+        showStatus(body.error || 'Could not refresh that playlist.', { isError: true });
+        return;
+      }
+      showStatus(`Refreshed "${name}" (${body.track_count} track${body.track_count === 1 ? '' : 's'}).`);
+      loadPlaylists(currentGuildId);
+    } catch (err) { /* showLogin already handled unauthorized */ }
+  }
+
+  async function removePlaylist(id, name) {
+    if (!window.confirm(`Remove "${name}"? You can re-import it later from its URL.`)) return;
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/playlists/${id}/remove`, { method: 'POST' });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        showStatus(body.error || 'Could not remove that playlist.', { isError: true });
+        return;
+      }
+      showStatus(`Removed "${name}".`);
+      loadPlaylists(currentGuildId);
+      loadFavourites(currentGuildId);
+    } catch (err) { /* showLogin already handled unauthorized */ }
   }
 
   // ---- Favourites ----
