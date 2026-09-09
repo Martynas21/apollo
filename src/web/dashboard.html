@@ -1193,6 +1193,11 @@
 
     const rows = getQueueRows();
     const others = rows.filter((r) => r !== row);
+    // The now-playing track (if any) is pinned as the first row but isn't
+    // part of the movable queue — its lack of a drag handle already stops it
+    // from being dragged itself, but without this floor a dragged row could
+    // still be spliced in ahead of it, implying a reorder that can't happen.
+    const minIndex = others[0] && others[0].classList.contains('now-playing-row') ? 1 : 0;
     const draggedCenter = startRect.top + deltaY + startRect.height / 2;
 
     // Walk rows in DOM order summing offsetHeight (a pure layout dimension,
@@ -1217,6 +1222,7 @@
       }
       top += height + gap;
     }
+    if (newIndex < minIndex) newIndex = minIndex;
 
     if (newIndex !== dragState.tentativeIndex) {
       reorderDom(dragState, others, newIndex);
@@ -1228,7 +1234,7 @@
 
   function onDragPointerEnd(event) {
     if (!dragState || event.pointerId !== dragState.pointerId) return;
-    const { row, handle, pointerId, startIndex, tentativeIndex, moveHandler, upHandler, cancelHandler } = dragState;
+    const { row, handle, pointerId, startIndex, tentativeIndex, queueIndexOffset, moveHandler, upHandler, cancelHandler } = dragState;
 
     try { handle.releasePointerCapture(pointerId); } catch (err) { /* already released */ }
     document.removeEventListener('pointermove', moveHandler);
@@ -1242,7 +1248,7 @@
     dragState = null;
 
     if (tentativeIndex !== startIndex) {
-      moveQueueTrack(startIndex, tentativeIndex);
+      moveQueueTrack(startIndex - queueIndexOffset, tentativeIndex - queueIndexOffset);
     }
   }
 
@@ -1267,6 +1273,10 @@
     const rows = getQueueRows();
     const startIndex = rows.indexOf(row);
     if (startIndex === -1) return;
+    // startIndex/tentativeIndex live in DOM-row space, which includes the
+    // pinned now-playing row when present; the server's queue indices don't
+    // include it, so this offset is subtracted before calling moveQueueTrack.
+    const queueIndexOffset = rows[0] && rows[0].classList.contains('now-playing-row') ? 1 : 0;
 
     dragState = {
       pointerId: event.pointerId,
@@ -1274,6 +1284,7 @@
       handle,
       startIndex,
       tentativeIndex: startIndex,
+      queueIndexOffset,
       startRect: row.getBoundingClientRect(),
       startClientY: event.clientY,
       layoutTopDelta: 0,
