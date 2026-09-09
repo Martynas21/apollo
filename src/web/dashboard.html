@@ -1053,11 +1053,15 @@
     return row;
   }
 
-  // Mutates an existing row's thumb/title/channel/duration in place, without
+  // Mutates an existing row's title/channel/duration in place, without
   // recreating the element — used by every list's updateRow so persisting
-  // rows keep their identity across reconciles.
+  // rows keep their identity across reconciles. The thumbnail is deliberately
+  // left untouched: reconcileList only reuses a row when the item's key
+  // (video_id) matches, so a reused row's thumbnail is already correct —
+  // reapplying it would tear down and recreate the <img> (forcing a reload)
+  // on every reconcile, which gets very expensive with large lists like a
+  // multi-thousand-track queue.
   function updateTrackRowContent(row, track) {
-    applyThumbnail(row.querySelector('.compact-thumb'), track.video_id, track.video_id);
     row.querySelector('.compact-title').textContent = track.title;
     row.querySelector('.compact-channel').textContent = track.channel;
     row.querySelector('.compact-duration').textContent = formatDuration(track.duration_secs);
