@@ -4,7 +4,13 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::process::Command;
 
-const SEARCH_LIMIT: usize = 25;
+const SEARCH_LIMIT: usize = 5;
+
+// yt-dlp is asked for more than SEARCH_LIMIT because parse_tracks() drops
+// entries with no known duration (live streams/premieres), which are common
+// enough in some genres (e.g. 24/7 lofi streams) to otherwise starve the
+// display count well below what was requested.
+const SEARCH_FETCH_LIMIT: usize = 20;
 
 const DEFAULT_PLAYLIST_LIMIT: usize = 500;
 
@@ -260,7 +266,7 @@ impl YouTubeClient {
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<Track>, YouTubeApiError> {
-        let target = format!("ytsearch{SEARCH_LIMIT}:{query}");
+        let target = format!("ytsearch{SEARCH_FETCH_LIMIT}:{query}");
         let stdout = self
             .run(
                 &["--flat-playlist", "--no-warnings"],
@@ -268,7 +274,9 @@ impl YouTubeClient {
                 YT_DLP_TIMEOUT,
             )
             .await?;
-        Ok(parse_tracks(&stdout))
+        let mut tracks = parse_tracks(&stdout);
+        tracks.truncate(SEARCH_LIMIT);
+        Ok(tracks)
     }
 
     pub async fn get_video(&self, video_id: &str) -> Result<Track, YouTubeApiError> {
