@@ -744,7 +744,7 @@
     return response;
   }
 
-  document.getElementById('login-btn').addEventListener('click', async () => {
+  async function attemptLogin() {
     const username = document.getElementById('username').value.trim();
     const password = document.getElementById('password').value;
     loginError.textContent = '';
@@ -766,7 +766,14 @@
     } catch (err) {
       loginError.textContent = 'Could not reach the server.';
     }
-  });
+  }
+
+  document.getElementById('login-btn').addEventListener('click', attemptLogin);
+  for (const fieldId of ['username', 'password']) {
+    document.getElementById(fieldId).addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.keyCode === 13) attemptLogin();
+    });
+  }
 
   document.getElementById('logout-btn').addEventListener('click', () => showLogin());
 
