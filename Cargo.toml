@@ -20,13 +20,11 @@ workspace = true
 apollo-ipc = { path = "ipc" }
 tokio = { version = "1.53", features = ["full"] }
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "cache", "voice", "rustls_backend"] }
-songbird = "0.6.0"
-# Songbird's own symphonia dependency requests zero codecs/formats by design
-# (see its README) — the consuming crate must add symphonia directly to get
-# any decode support at all, via Cargo feature unification. Default features
-# (mkv/webm, ogg, wav, vorbis, flac, pcm) cover YouTube's typical Opus-in-WebM
-# best-audio pick; aac/isomp4 cover the common AAC-in-MP4 fallback.
-symphonia = { version = "0.5", features = ["aac", "isomp4"] }
+# apollo never drives audio itself (that's apollo-audio-worker, over IPC) —
+# it only uses songbird to join/leave voice channels via the gateway and
+# hand off the resulting ConnectionInfo, so it needs "gateway" and "serenity"
+# only, not "driver" (which pulls in symphonia, reqwest, opus, etc.).
+songbird = { version = "0.6.0", default-features = false, features = ["gateway", "serenity"] }
 url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -37,6 +35,6 @@ sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio
 anyhow = "1"
 async-trait = "0.1"
 rand = "0.10.2"
-uuid = "1"
+uuid = { version = "1", features = ["v4"] }
 axum = { version = "0.8.9", features = ["ws"] }
 argon2 = "0.6.0"
