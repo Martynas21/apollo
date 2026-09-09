@@ -95,6 +95,16 @@
     transform: scale(0.93);
   }
 
+  /* Shared busy state: hides a button's label/icon in favor of a centered
+     spinner while the action it triggered is still in flight. */
+  .btn-busy { color: transparent !important; position: relative; }
+  .btn-busy::after {
+    content: ''; position: absolute; top: 50%; left: 50%; width: 12px; height: 12px;
+    margin: -6px 0 0 -6px; border-radius: 50%;
+    border: 2px solid var(--border-soft); border-top-color: var(--accent);
+    animation: search-spin .6s linear infinite;
+  }
+
   /* ---- Dashboard ---- */
   #dashboard {
     display: none; width: 100%; min-height: 100vh;
@@ -301,6 +311,16 @@
   }
   .search-bar input { flex: 1; background: none; border: none; outline: none; color: var(--text); font-size: 13.5px; }
   .search-bar input::placeholder { color: var(--text-faint); }
+  .search-icon { flex-shrink: 0; }
+  .search-spinner {
+    display: none; flex-shrink: 0; width: 14px; height: 14px;
+    border: 2px solid var(--border-soft); border-top-color: var(--accent);
+    border-radius: 50%; animation: search-spin .7s linear infinite;
+  }
+  @keyframes search-spin { to { transform: rotate(360deg); } }
+  .search-bar.loading .search-icon { display: none; }
+  .search-bar.loading .search-spinner { display: block; }
+  .search-loading-note { display: flex; align-items: center; gap: var(--space-2); }
   .scroll-list { display: flex; flex-direction: column; gap: var(--space-1-5); max-height: 178px; overflow-y: auto; overflow-x: hidden; padding-right: var(--space-2-5); }
   .list-panel {
     background: var(--bg); border: 1px solid var(--border-soft); border-radius: 12px; padding: var(--space-2);
@@ -477,12 +497,14 @@
       <span class="brand-word">APOLLO</span>
     </div>
     <div class="topbar-search" id="topbar-search">
-      <div class="search-bar">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <div class="search-bar" id="search-bar">
+        <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <div class="search-spinner" aria-hidden="true"></div>
         <input type="text" id="search-input" placeholder="Search YouTube or paste a URL">
       </div>
       <div class="search-dropdown" id="search-dropdown">
         <div class="scroll-list" id="search-results"></div>
+        <div class="muted-note search-loading-note" id="search-loading-note" style="display:none"><div class="search-spinner" style="display:block"></div>Searching…</div>
         <div class="muted-note" id="search-empty-note" style="display:none">No matches — try a different search term.</div>
       </div>
     </div>
@@ -617,6 +639,7 @@
     <h3 class="modal-title">Join a voice channel</h3>
     <p class="modal-subtext">Apollo isn't in a voice channel yet — pick one to continue.</p>
     <div class="scroll-list" id="join-channel-list"></div>
+    <div class="muted-note search-loading-note" id="join-channel-loading-note" style="display:none"><div class="search-spinner" style="display:block"></div>Loading channels…</div>
     <div class="muted-note" id="join-channel-empty-note" style="display:none">No voice channels found.</div>
     <div class="modal-actions">
       <button class="ghost-btn" id="join-modal-cancel" type="button">Cancel</button>
@@ -681,6 +704,15 @@
         statusDismissTimeout = null;
       }, 4000);
     }
+  }
+
+  // Swaps a button's label for a spinner while an action it triggered is
+  // in flight, so a click gets an immediate visual response instead of
+  // nothing happening until the request resolves.
+  function setButtonBusy(btn, busy) {
+    if (!btn) return;
+    btn.disabled = busy;
+    btn.classList.toggle('btn-busy', busy);
   }
 
   function showDashboard() {
@@ -1511,6 +1543,7 @@
   const joinModalOverlay = document.getElementById('join-modal-overlay');
   const joinChannelList = document.getElementById('join-channel-list');
   const joinChannelEmptyNote = document.getElementById('join-channel-empty-note');
+  const joinChannelLoadingNote = document.getElementById('join-channel-loading-note');
   let pendingRetryAction = null;
 
   function closeJoinModal() {
@@ -1542,6 +1575,7 @@
     joinModalOverlay.classList.add('open');
     joinChannelList.innerHTML = '';
     joinChannelEmptyNote.style.display = 'none';
+    joinChannelLoadingNote.style.display = 'flex';
     try {
       const response = await api(`/api/guilds/${currentGuildId}/voice-channels`);
       if (!response.ok) return;
@@ -1556,7 +1590,10 @@
       for (const channel of channels) {
         joinChannelList.appendChild(createChannelRow(channel, channel.id === lastChannelId));
       }
-    } catch (err) { /* showLogin already handled unauthorized */ }
+    } catch (err) { /* showLogin already handled unauthorized */
+    } finally {
+      joinChannelLoadingNote.style.display = 'none';
+    }
   }
 
   async function joinChannel(channelId, channelName) {
@@ -1656,6 +1693,7 @@
   const searchInput = document.getElementById('search-input');
   const searchResults = document.getElementById('search-results');
   const searchEmptyNote = document.getElementById('search-empty-note');
+  const searchLoadingNote = document.getElementById('search-loading-note');
 
   function openSearchDropdown() {
     searchDropdown.classList.add('open');
@@ -1669,6 +1707,7 @@
     searchInput.value = '';
     searchResults.innerHTML = '';
     searchEmptyNote.style.display = 'none';
+    searchLoadingNote.style.display = 'none';
     closeSearchDropdown();
   }
 
@@ -1700,12 +1739,23 @@
     openSearchDropdown();
   }
 
+  function setSearchBarLoading(loading) {
+    document.getElementById('search-bar').classList.toggle('loading', loading);
+  }
+
   async function runSearch(query, isLink) {
     const seq = ++searchSeq;
+    setSearchBarLoading(true);
+    if (!isLink) {
+      searchLoadingNote.style.display = 'flex';
+      searchEmptyNote.style.display = 'none';
+      openSearchDropdown();
+    }
     try {
       const response = await api(`/api/guilds/${currentGuildId}/search?q=${encodeURIComponent(query)}`);
       const body = await response.json();
       if (seq !== searchSeq) return; // a newer search superseded this one
+      searchLoadingNote.style.display = 'none';
       if (!response.ok) {
         showStatus(body.error || 'Search failed.', { isError: true });
         searchResults.innerHTML = '';
@@ -1724,7 +1774,11 @@
         return;
       }
       renderSearchResults(body);
-    } catch (err) { /* showLogin already handled unauthorized */ }
+    } catch (err) {
+      if (seq === searchSeq) searchLoadingNote.style.display = 'none';
+    } finally {
+      if (seq === searchSeq) setSearchBarLoading(false);
+    }
   }
 
   searchInput.addEventListener('input', () => {
@@ -1733,6 +1787,7 @@
     if (!query) {
       searchResults.innerHTML = '';
       searchEmptyNote.style.display = 'none';
+      searchLoadingNote.style.display = 'none';
       closeSearchDropdown();
       return;
     }
@@ -1756,7 +1811,8 @@
     if (event.key === 'Escape') closeSearchDropdown();
   });
 
-  async function addToQueue(videoId, title) {
+  async function addToQueue(videoId, title, btn) {
+    setButtonBusy(btn, true);
     try {
       const response = await api(`/api/guilds/${currentGuildId}/queue/add`, {
         method: 'POST',
@@ -1775,10 +1831,14 @@
       renderSnapshot(body);
       showStatus(`Added "${title}" to the queue.`);
       loadFavourites(currentGuildId);
-    } catch (err) { /* showLogin already handled unauthorized */ }
+    } catch (err) { /* showLogin already handled unauthorized */
+    } finally {
+      setButtonBusy(btn, false);
+    }
   }
 
   async function importPlaylistFromSearch(url) {
+    setSearchBarLoading(true);
     try {
       const response = await api(`/api/guilds/${currentGuildId}/playlists/import`, {
         method: 'POST',
@@ -1793,7 +1853,10 @@
       searchInput.value = '';
       showStatus(`Imported "${body.name}" (${body.track_count} track${body.track_count === 1 ? '' : 's'}).`);
       loadPlaylists(currentGuildId);
-    } catch (err) { /* showLogin already handled unauthorized */ }
+    } catch (err) { /* showLogin already handled unauthorized */
+    } finally {
+      setSearchBarLoading(false);
+    }
   }
 
   // ---- Playlists ----
@@ -1828,7 +1891,7 @@
       playBtn.type = 'button';
       playBtn.className = 'primary-btn small';
       playBtn.textContent = 'Play';
-      playBtn.addEventListener('click', () => playPlaylist(playlist.id, playlist.name));
+      playBtn.addEventListener('click', () => playPlaylist(playlist.id, playlist.name, playBtn));
       chip.appendChild(playBtn);
 
       playlistRow.appendChild(chip);
@@ -1846,7 +1909,8 @@
     } catch (err) { /* showLogin already handled unauthorized */ }
   }
 
-  async function playPlaylist(id, name) {
+  async function playPlaylist(id, name, btn) {
+    setButtonBusy(btn, true);
     try {
       const response = await api(`/api/guilds/${currentGuildId}/playlists/${id}/play`, { method: 'POST' });
       const body = await response.json();
@@ -1861,7 +1925,10 @@
       renderSnapshot(body);
       showStatus(`Playing "${name}".`);
       loadFavourites(currentGuildId);
-    } catch (err) { /* showLogin already handled unauthorized */ }
+    } catch (err) { /* showLogin already handled unauthorized */
+    } finally {
+      setButtonBusy(btn, false);
+    }
   }
 
   // ---- Favourites ----
@@ -1883,7 +1950,7 @@
     addBtn.type = 'button';
     addBtn.className = 'outline-btn';
     addBtn.textContent = 'Add';
-    addBtn.addEventListener('click', () => addToQueue(row._videoId, row._title));
+    addBtn.addEventListener('click', () => addToQueue(row._videoId, row._title, addBtn));
     row.appendChild(addBtn);
     updateFavouriteTrackRow(row, track);
     return row;
@@ -1921,7 +1988,7 @@
     playBtn.type = 'button';
     playBtn.className = 'primary-btn small';
     playBtn.textContent = 'Play';
-    playBtn.addEventListener('click', () => playPlaylist(chip._playlistId, chip._playlistName));
+    playBtn.addEventListener('click', () => playPlaylist(chip._playlistId, chip._playlistName, playBtn));
     chip.appendChild(playBtn);
 
     updateFavPlaylistChip(chip, playlist);
