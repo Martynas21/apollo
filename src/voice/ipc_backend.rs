@@ -24,6 +24,8 @@ type EventsMap = StdMutex<HashMap<GuildId, Arc<dyn VoiceEvents>>>;
 
 const RECONNECT_ATTEMPTS: u32 = 5;
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+const INITIAL_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(2);
+const INITIAL_CONNECT_LOG_EVERY: u32 = 15;
 
 struct Connection {
     write: Mutex<OwnedWriteHalf>,
@@ -242,8 +244,8 @@ impl IpcBackend {
         socket_addr: &str,
         songbird: Arc<Songbird>,
         cookies_file: Option<String>,
-    ) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(socket_addr).await?;
+    ) -> Self {
+        let stream = connect_with_retry(socket_addr).await;
         let (read_half, write_half) = stream.into_split();
         let connection = Arc::new(Connection {
             write: Mutex::new(write_half),
@@ -255,11 +257,36 @@ impl IpcBackend {
             reconnecting: Mutex::new(()),
         });
         tokio::spawn(run_reader(read_half, connection.clone(), 0));
-        Ok(Self {
+        Self {
             songbird,
             cookies_file,
             connection,
-        })
+        }
+    }
+}
+
+/// Retries indefinitely so apollo can be started before apollo-audio-worker
+/// is up (e.g. both containers starting together) instead of failing to boot.
+async fn connect_with_retry(socket_addr: &str) -> TcpStream {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match TcpStream::connect(socket_addr).await {
+            Ok(stream) => {
+                if attempt > 1 {
+                    tracing::info!("connected to apollo-audio-worker");
+                }
+                return stream;
+            }
+            Err(e) => {
+                if attempt == 1 {
+                    tracing::warn!(%e, %socket_addr, "apollo-audio-worker not reachable yet, waiting for it to start");
+                } else if attempt.is_multiple_of(INITIAL_CONNECT_LOG_EVERY) {
+                    tracing::warn!(%e, %socket_addr, attempt, "still waiting for apollo-audio-worker");
+                }
+                tokio::time::sleep(INITIAL_CONNECT_RETRY_DELAY).await;
+            }
+        }
     }
 }
 
