@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "audio-worker",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "-p", "apollo-audio-worker", "--bin", "apollo-audio-worker"],
+      "port": 7878
+    },
+    {
+      "name": "apollo",
+      "runtimeExecutable": "cargo",
+      "runtimeArgs": ["run", "-p", "apollo", "--bin", "apollo"],
+      "port": 8787
+    }
+  ]
+}
