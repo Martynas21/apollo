@@ -4,28 +4,28 @@
 //! surface, so it stays out of `api.rs`.
 
 use axum::Json;
+use axum::Router;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
 use serde::{Deserialize, Serialize};
 
 use crate::db;
 use crate::web::WebState;
 use crate::web::auth::{self, CurrentUser};
+use crate::web::response::error_response;
 
-#[derive(Serialize)]
-struct ErrorBody {
-    error: String,
+pub fn routes() -> Router<WebState> {
+    Router::new().route("/api/me", get(me))
 }
 
-fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        Json(ErrorBody {
-            error: message.into(),
-        }),
-    )
-        .into_response()
+pub fn admin_routes() -> Router<WebState> {
+    Router::new()
+        .route("/api/users", get(list_users).post(create_user))
+        .route("/api/users/{username}", delete(delete_user))
+        .route("/api/users/{username}/password", post(set_password))
+        .route("/api/users/{username}/username", post(set_username))
 }
 
 #[derive(Serialize)]
@@ -35,7 +35,7 @@ struct UserJson {
     is_root: bool,
 }
 
-pub async fn me(Extension(user): Extension<CurrentUser>) -> Response {
+async fn me(Extension(user): Extension<CurrentUser>) -> Response {
     Json(UserJson {
         username: user.username,
         is_admin: user.is_admin,
@@ -44,7 +44,7 @@ pub async fn me(Extension(user): Extension<CurrentUser>) -> Response {
     .into_response()
 }
 
-pub async fn list_users(State(state): State<WebState>) -> Response {
+async fn list_users(State(state): State<WebState>) -> Response {
     match db::list_users(&state.db).await {
         Ok(users) => Json(
             users
@@ -65,14 +65,14 @@ pub async fn list_users(State(state): State<WebState>) -> Response {
 }
 
 #[derive(Deserialize)]
-pub struct CreateUserRequest {
+struct CreateUserRequest {
     username: String,
     password: String,
     #[serde(default)]
     is_admin: bool,
 }
 
-pub async fn create_user(
+async fn create_user(
     State(state): State<WebState>,
     Json(body): Json<CreateUserRequest>,
 ) -> Response {
@@ -123,7 +123,7 @@ pub async fn create_user(
     }
 }
 
-pub async fn delete_user(
+async fn delete_user(
     State(state): State<WebState>,
     Extension(current): Extension<CurrentUser>,
     Path(username): Path<String>,
@@ -174,14 +174,14 @@ pub async fn delete_user(
 }
 
 #[derive(Deserialize)]
-pub struct SetPasswordRequest {
+struct SetPasswordRequest {
     password: String,
 }
 
 /// Anyone (admin-only routes, so always some admin) can change their own
 /// password; only root can change someone else's — see the field doc on
 /// `auth::CurrentUser::is_root`.
-pub async fn set_password(
+async fn set_password(
     State(state): State<WebState>,
     Extension(current): Extension<CurrentUser>,
     Path(username): Path<String>,
@@ -233,13 +233,13 @@ pub async fn set_password(
 }
 
 #[derive(Deserialize)]
-pub struct SetUsernameRequest {
+struct SetUsernameRequest {
     new_username: String,
 }
 
 /// Same authorization rule as `set_password`: anyone can rename themselves,
 /// only root can rename someone else.
-pub async fn set_username(
+async fn set_username(
     State(state): State<WebState>,
     Extension(current): Extension<CurrentUser>,
     Path(username): Path<String>,

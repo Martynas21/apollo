@@ -9,24 +9,25 @@
 //! management (import/play/refresh/remove), and per-guild play-count
 //! favourites.
 
-mod api;
 mod auth;
-mod users;
+mod response;
+mod routes;
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::middleware::{from_fn, from_fn_with_state};
-use axum::routing::{delete, get, post};
+use axum::routing::get;
 use serenity::all as serenity;
 
 pub use auth::bootstrap_user_if_needed;
 
-const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+const DASHBOARD_HTML: &str = include_str!("../../assets/dashboard.html");
 
 #[derive(Clone)]
 pub struct WebState {
     pub player: crate::voice::PlayerRegistry,
+    pub youtube: crate::youtube::api::YouTubeClient,
     pub db: sqlx::SqlitePool,
     pub cache: Arc<serenity::Cache>,
     pub sessions: auth::SessionStore,
@@ -35,11 +36,13 @@ pub struct WebState {
 impl WebState {
     pub fn new(
         player: crate::voice::PlayerRegistry,
+        youtube: crate::youtube::api::YouTubeClient,
         db: sqlx::SqlitePool,
         cache: Arc<serenity::Cache>,
     ) -> Self {
         Self {
             player,
+            youtube,
             db,
             cache,
             sessions: auth::SessionStore::default(),
@@ -47,101 +50,36 @@ impl WebState {
     }
 }
 
-fn playback_routes() -> Router<WebState> {
-    Router::new()
-        .route("/api/guilds", get(api::list_guilds))
-        .route(
-            "/api/guilds/{guild_id}/voice-channels",
-            get(api::list_voice_channels),
-        )
-        .route("/api/guilds/{guild_id}/join", post(api::join_voice_channel))
-        .route("/api/guilds/{guild_id}/now-playing", get(api::now_playing))
-        .route("/api/guilds/{guild_id}/ws", get(api::now_playing_ws))
-        .route(
-            "/api/guilds/{guild_id}/toggle-pause",
-            post(api::toggle_pause),
-        )
-        .route("/api/guilds/{guild_id}/skip", post(api::skip))
-        .route("/api/guilds/{guild_id}/stop", post(api::stop))
-        .route("/api/guilds/{guild_id}/shuffle", post(api::shuffle))
-        .route(
-            "/api/guilds/{guild_id}/toggle-radio",
-            post(api::toggle_radio),
-        )
-        .route("/api/guilds/{guild_id}/volume", post(api::set_volume))
-        .route(
-            "/api/guilds/{guild_id}/queue/{index}/remove",
-            post(api::remove_queue_track),
-        )
-        .route(
-            "/api/guilds/{guild_id}/queue/{index}/play",
-            post(api::play_queue_track),
-        )
-        .route(
-            "/api/guilds/{guild_id}/queue/{index}/move",
-            post(api::move_queue_track),
-        )
-        .route("/api/guilds/{guild_id}/queue/clear", post(api::clear_queue))
-        .route("/api/guilds/{guild_id}/search", get(api::search))
-        .route("/api/guilds/{guild_id}/queue/add", post(api::add_to_queue))
-        .route("/api/guilds/{guild_id}/favourites", get(api::favourites))
-}
-
-fn playlist_routes() -> Router<WebState> {
-    Router::new()
-        .route("/api/guilds/{guild_id}/playlists", get(api::list_playlists))
-        .route(
-            "/api/guilds/{guild_id}/playlists/import",
-            post(api::import_playlist),
-        )
-        .route(
-            "/api/guilds/{guild_id}/playlists/{playlist_id}/play",
-            post(api::play_playlist),
-        )
-        .route(
-            "/api/guilds/{guild_id}/playlists/{playlist_id}/refresh",
-            post(api::refresh_playlist),
-        )
-        .route(
-            "/api/guilds/{guild_id}/playlists/{playlist_id}/remove",
-            post(api::remove_playlist),
-        )
-}
-
-fn me_routes() -> Router<WebState> {
-    Router::new().route("/api/me", get(users::me))
-}
-
-fn admin_routes() -> Router<WebState> {
-    Router::new()
-        .route(
-            "/api/users",
-            get(users::list_users).post(users::create_user),
-        )
-        .route("/api/users/{username}", delete(users::delete_user))
-        .route("/api/users/{username}/password", post(users::set_password))
-        .route("/api/users/{username}/username", post(users::set_username))
-}
-
-pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {
+/// Builds the fully-wired dashboard `Router`, with every middleware layer
+/// applied but no listener bound yet — the seam `serve()` runs on, and the
+/// one integration tests drive directly via `tower::ServiceExt::oneshot`.
+pub fn router(state: WebState) -> Router {
     // `require_admin` needs `require_session` to have already resolved the
     // caller's identity into the request's extensions, so it's layered onto
     // `admin_routes()` alone before that merges into `protected` — the
     // outer `route_layer(require_session)` below then wraps the whole
     // merged router, running first on every request.
-    let admin_only = admin_routes().route_layer(from_fn(auth::require_admin));
+    let admin_only = routes::users::admin_routes().route_layer(from_fn(auth::require_admin));
 
-    let protected = playback_routes()
-        .merge(playlist_routes())
-        .merge(me_routes())
+    let protected = routes::guilds::routes()
+        .merge(routes::playback::routes())
+        .merge(routes::queue::routes())
+        .merge(routes::search::routes())
+        .merge(routes::playlists::routes())
+        .merge(routes::favourites::routes())
+        .merge(routes::users::routes())
         .merge(admin_only)
         .route_layer(from_fn_with_state(state.clone(), auth::require_session));
 
     let public = Router::new()
         .route("/", get(|| async { axum::response::Html(DASHBOARD_HTML) }))
-        .route("/api/login", post(api::login));
+        .merge(routes::auth::routes());
 
-    let app = public.merge(protected).with_state(state);
+    public.merge(protected).with_state(state)
+}
+
+pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {
+    let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(%bind_addr, "dashboard listening");

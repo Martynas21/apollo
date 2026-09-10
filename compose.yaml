@@ -33,10 +33,11 @@ services:
     build:
       context: .
       target: audio-worker
-    # Neither service sets AUDIO_WORKER_SOCKET — both fall back to
-    # apollo_ipc::DEFAULT_SOCKET_ADDR ("audio-worker:7878"), which is also
-    # what the healthcheck below assumes. If that default ever changes,
-    # update the healthcheck `test` to match.
+    # Neither service sets AUDIO_WORKER_SOCKET — both fall back to their own
+    # default of "audio-worker:7878" (apollo's src/config.rs and
+    # audio-worker's src/config.rs each define it), which is also what the
+    # healthcheck below assumes. If that default ever changes, update it in
+    # both places and the healthcheck `test` to match.
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "7878"]
       interval: 30s

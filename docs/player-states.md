@@ -1,7 +1,30 @@
 # Player state model
 
-Reference documentation for `src/voice/player.rs`'s `PlayerRegistry`/`GuildState`:
-what the code actually does, not an aspirational design.
+Reference documentation for `PlayerRegistry`/`GuildState`, split across
+`src/voice/state.rs` (the structs) and `src/voice/registry/*.rs` (the
+`impl PlayerRegistry` blocks that act on them): what the code actually does,
+not an aspirational design.
+
+```
+voice/backend.rs      VoiceEvents, VoiceBackend, VoiceCall, VoiceTrack traits
+                      + AudioSource, TrackStatus
+voice/error.rs        PlayerError
+voice/state.rs        GuildState, QueueSnapshot, SessionSnapshot,
+                      StartOutcome, AdvanceFill + derived-state accessors
+                      (`is_paused`, `track_position`, `queue_snapshot`)
+voice/registry/mod.rs        struct PlayerRegistry, new(), shared helpers
+voice/registry/queue.rs      enqueue, enqueue_next, enqueue_many, remove_queue_track,
+                             move_queue_track, play_queue_track, clear_queue, shuffle
+voice/registry/playback.rs   spawn/run_start_sequence, try_start_playback,
+                             resolve_for_start, commit_started_track, advance,
+                             pause, resume, skip, stop, get_volume/set_volume
+voice/registry/session.rs    join, leave, leave_if_idle, persist_session,
+                             restore_session_if_new, load/apply persisted session
+voice/registry/radio.rs      toggle_radio, is_radio_enabled, maybe_spawn_radio_refill,
+                             run_radio_refill*, radio_refill_*, push_radio_refill,
+                             await_radio_refill_then_repop, kick_off_if_idle
+voice/testing.rs      #[cfg(test)] FakeTrack, FakeCall, FakeBackend + test helpers
+```
 
 ## The five observable playback states
 
@@ -90,4 +113,4 @@ well-typed `PlayerError` — never panics — and the invariant
 `current_handle.is_some() == current_track_id.is_some()` holds afterward.
 This table is exercised directly by the table-driven test
 `every_action_is_panic_free_and_keeps_the_handle_track_id_invariant_in_every_state`
-in `src/voice/player.rs`.
+in `src/voice/registry/mod.rs`.

@@ -18,6 +18,12 @@ const DEFAULT_PLAYLIST_TRACK_LIMIT: usize = 500;
 
 const DEFAULT_DASHBOARD_BIND_ADDR: &str = "127.0.0.1:8787";
 
+// Deployment contract with `apollo-audio-worker`'s own default in
+// `audio-worker/src/config.rs` — both processes fall back to this same
+// value when `AUDIO_WORKER_SOCKET` is unset, matching compose.yaml's
+// service name. Keep the two in sync if it ever changes.
+const DEFAULT_AUDIO_WORKER_SOCKET: &str = "audio-worker:7878";
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         Self::from_source(|key| std::env::var(key))
@@ -29,14 +35,14 @@ impl Config {
             discord_application_id: env_var(&lookup, "DISCORD_APPLICATION_ID")?,
             discord_guild_id: optional_guild_id(&lookup)?,
             database_url: env_var(&lookup, "DATABASE_URL")?,
-            yt_dlp_cookies_file: apollo_ipc::optional_env_var(&lookup, "YT_DLP_COOKIES_FILE"),
+            yt_dlp_cookies_file: optional_env_var(&lookup, "YT_DLP_COOKIES_FILE"),
             playlist_track_limit: playlist_track_limit(&lookup)?,
-            audio_worker_socket: apollo_ipc::optional_env_var(&lookup, "AUDIO_WORKER_SOCKET")
-                .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_ADDR.to_string()),
-            dashboard_bind_addr: apollo_ipc::optional_env_var(&lookup, "DASHBOARD_BIND_ADDR")
+            audio_worker_socket: optional_env_var(&lookup, "AUDIO_WORKER_SOCKET")
+                .unwrap_or_else(|| DEFAULT_AUDIO_WORKER_SOCKET.to_string()),
+            dashboard_bind_addr: optional_env_var(&lookup, "DASHBOARD_BIND_ADDR")
                 .unwrap_or_else(|| DEFAULT_DASHBOARD_BIND_ADDR.to_string()),
-            dashboard_username: apollo_ipc::optional_env_var(&lookup, "DASHBOARD_USERNAME"),
-            dashboard_password: apollo_ipc::optional_env_var(&lookup, "DASHBOARD_PASSWORD"),
+            dashboard_username: optional_env_var(&lookup, "DASHBOARD_USERNAME"),
+            dashboard_password: optional_env_var(&lookup, "DASHBOARD_PASSWORD"),
         })
     }
 }
@@ -60,6 +66,13 @@ fn env_var(
     key: &str,
 ) -> Result<String> {
     lookup(key).with_context(|| format!("missing required environment variable: {key}"))
+}
+
+fn optional_env_var(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+    key: &str,
+) -> Option<String> {
+    lookup(key).ok().filter(|value| !value.trim().is_empty())
 }
 
 fn optional_guild_id(

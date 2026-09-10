@@ -1,11 +1,9 @@
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::process::Command;
 
-const STDERR_TRUNCATE_LEN: usize = 200;
+use crate::youtube::ytdlp::{STDERR_TRUNCATE_LEN, YtDlp, YtDlpError, truncate_tail};
 
 const MAX_TRACK_DURATION: Duration = Duration::from_hours(14);
 
@@ -15,35 +13,23 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const AUDIO_FORMAT_SELECTOR: &str = "ba[abr>0][vcodec=none]/best";
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PlaybackError {
+    #[error("video is age-restricted")]
     AgeRestricted,
+    #[error("video is not available in this region")]
     RegionLocked,
+    #[error("video is unavailable (private or deleted)")]
     Unavailable,
+    #[error("yt-dlp is not installed or not on PATH")]
     YtDlpMissing,
+    #[error("yt-dlp timed out")]
     Timeout,
+    #[error("track is too long to queue (over 14 hours, or a livestream)")]
     TooLong,
+    #[error("yt-dlp failed: {0}")]
     Other(String),
 }
-
-impl std::fmt::Display for PlaybackError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::AgeRestricted => write!(f, "video is age-restricted"),
-            Self::RegionLocked => write!(f, "video is not available in this region"),
-            Self::Unavailable => write!(f, "video is unavailable (private or deleted)"),
-            Self::YtDlpMissing => write!(f, "yt-dlp is not installed or not on PATH"),
-            Self::Timeout => write!(f, "yt-dlp timed out"),
-            Self::TooLong => write!(
-                f,
-                "track is too long to queue (over 14 hours, or a livestream)"
-            ),
-            Self::Other(message) => write!(f, "yt-dlp failed: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for PlaybackError {}
 
 fn truncate(s: &str, max_len: usize) -> String {
     match s.char_indices().nth(max_len) {
@@ -52,16 +38,13 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-fn truncate_tail(s: &str, max_len: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max_len {
-        return s.to_string();
+fn map_ytdlp_error(err: YtDlpError) -> PlaybackError {
+    match err {
+        YtDlpError::Missing => PlaybackError::YtDlpMissing,
+        YtDlpError::Timeout => PlaybackError::Timeout,
+        YtDlpError::Spawn(message) => PlaybackError::Other(truncate(&message, STDERR_TRUNCATE_LEN)),
+        YtDlpError::Failed(stderr) => classify_ytdlp_stderr(&stderr),
     }
-    let byte_idx = s
-        .char_indices()
-        .nth(char_count - max_len)
-        .map_or(0, |(idx, _)| idx);
-    format!("...{}", &s[byte_idx..])
 }
 
 pub fn classify_ytdlp_stderr(stderr: &str) -> PlaybackError {
@@ -88,38 +71,17 @@ pub async fn preflight_check(
     cookies_file: Option<&str>,
 ) -> Result<(), PlaybackError> {
     let url = format!("https://www.youtube.com/watch?v={video_id}");
+    let ytdlp = YtDlp::new(cookies_file.map(str::to_string));
+    let args = ["-j", "--no-playlist", "--simulate", url.as_str()];
 
-    let mut command = Command::new("yt-dlp");
-    command.kill_on_drop(true);
-    command.args(["-j", "--no-playlist", "--simulate"]);
-    if let Some(cookies_file) = cookies_file {
-        command.args(["--cookies", cookies_file]);
-    }
-    command.arg(&url);
-
-    let output = tokio::time::timeout(PREFLIGHT_TIMEOUT, command.output())
+    ytdlp
+        .run(&args, PREFLIGHT_TIMEOUT)
         .await
-        .map_err(|_elapsed| PlaybackError::Timeout)?
-        .map_err(|e| {
-            if e.kind() == ErrorKind::NotFound {
-                PlaybackError::YtDlpMissing
-            } else {
-                PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN))
-            }
-        })?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(classify_ytdlp_stderr(&stderr))
+        .map(|_stdout| ())
+        .map_err(map_ytdlp_error)
 }
 
-fn other_err(e: impl std::fmt::Display) -> PlaybackError {
-    PlaybackError::Other(truncate(&e.to_string(), STDERR_TRUNCATE_LEN))
-}
-
+#[derive(Debug)]
 pub struct ResolvedStream {
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -132,6 +94,16 @@ struct YtDlpJson {
     http_headers: HashMap<String, String>,
 }
 
+fn parse_resolved_stream(stdout: &str) -> Result<ResolvedStream, PlaybackError> {
+    let parsed: YtDlpJson = serde_json::from_str(stdout)
+        .map_err(|e| PlaybackError::Other(format!("failed to parse yt-dlp output: {e}")))?;
+
+    Ok(ResolvedStream {
+        url: parsed.url,
+        headers: parsed.http_headers.into_iter().collect(),
+    })
+}
+
 pub async fn resolve_stream(
     video_id: &str,
     duration: Option<Duration>,
@@ -142,35 +114,21 @@ pub async fn resolve_stream(
     }
 
     let url = format!("https://www.youtube.com/watch?v={video_id}");
+    let ytdlp = YtDlp::new(cookies_file.map(str::to_string));
+    let args = [
+        "-j",
+        "-f",
+        AUDIO_FORMAT_SELECTOR,
+        "--no-playlist",
+        url.as_str(),
+    ];
 
-    let mut command = Command::new("yt-dlp");
-    command.kill_on_drop(true);
-    command.args(["-j", "-f", AUDIO_FORMAT_SELECTOR, "--no-playlist"]);
-    if let Some(cookies_file) = cookies_file {
-        command.args(["--cookies", cookies_file]);
-    }
-    command.arg(&url);
+    let stdout = ytdlp
+        .run(&args, RESOLVE_TIMEOUT)
+        .await
+        .map_err(map_ytdlp_error)?;
 
-    let output = match tokio::time::timeout(RESOLVE_TIMEOUT, command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) if e.kind() == ErrorKind::NotFound => return Err(PlaybackError::YtDlpMissing),
-        Ok(Err(e)) => return Err(other_err(e)),
-        Err(_elapsed) => return Err(PlaybackError::Timeout),
-    };
-
-    if !output.status.success() {
-        return Err(classify_ytdlp_stderr(&String::from_utf8_lossy(
-            &output.stderr,
-        )));
-    }
-
-    let parsed: YtDlpJson = serde_json::from_slice(&output.stdout)
-        .map_err(|e| PlaybackError::Other(format!("failed to parse yt-dlp output: {e}")))?;
-
-    Ok(ResolvedStream {
-        url: parsed.url,
-        headers: parsed.http_headers.into_iter().collect(),
-    })
+    parse_resolved_stream(&stdout)
 }
 
 #[cfg(test)]
@@ -283,5 +241,75 @@ mod tests {
             }
             other => panic!("expected Other, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_resolved_stream_extracts_url_and_headers() {
+        let stdout = r#"{"url": "https://example.com/stream.m4a", "http_headers": {"User-Agent": "yt-dlp"}}"#;
+        let resolved = parse_resolved_stream(stdout).unwrap();
+        assert_eq!(resolved.url, "https://example.com/stream.m4a");
+        assert_eq!(
+            resolved.headers,
+            vec![("User-Agent".to_string(), "yt-dlp".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_resolved_stream_defaults_headers_to_empty_when_absent() {
+        let stdout = r#"{"url": "https://example.com/stream.m4a"}"#;
+        let resolved = parse_resolved_stream(stdout).unwrap();
+        assert!(resolved.headers.is_empty());
+    }
+
+    #[test]
+    fn parse_resolved_stream_errors_on_malformed_json() {
+        match parse_resolved_stream("not json") {
+            Err(PlaybackError::Other(message)) => {
+                assert!(message.contains("failed to parse yt-dlp output"));
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_resolved_stream_errors_when_url_field_missing() {
+        assert!(parse_resolved_stream(r#"{"http_headers": {}}"#).is_err());
+    }
+
+    #[test]
+    fn map_ytdlp_error_missing_maps_to_missing() {
+        assert!(matches!(
+            map_ytdlp_error(YtDlpError::Missing),
+            PlaybackError::YtDlpMissing
+        ));
+    }
+
+    #[test]
+    fn map_ytdlp_error_timeout_maps_to_timeout() {
+        assert!(matches!(
+            map_ytdlp_error(YtDlpError::Timeout),
+            PlaybackError::Timeout
+        ));
+    }
+
+    #[test]
+    fn map_ytdlp_error_spawn_head_truncates_into_other() {
+        let long = "x".repeat(500);
+        match map_ytdlp_error(YtDlpError::Spawn(long)) {
+            PlaybackError::Other(message) => {
+                assert!(message.ends_with("..."));
+                assert!(message.len() <= STDERR_TRUNCATE_LEN + 3);
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_ytdlp_error_failed_runs_through_classification() {
+        let stderr = "ERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm your age.";
+        assert!(matches!(
+            map_ytdlp_error(YtDlpError::Failed(stderr.to_string())),
+            PlaybackError::AgeRestricted
+        ));
     }
 }

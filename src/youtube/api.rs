@@ -1,8 +1,9 @@
-use std::io::ErrorKind;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::process::Command;
+
+use crate::model::{PlaylistListing, Track};
+use crate::youtube::ytdlp::{STDERR_TRUNCATE_LEN, YtDlp, YtDlpError, truncate_tail};
 
 const SEARCH_LIMIT: usize = 5;
 
@@ -28,43 +29,19 @@ const YOUTUBE_HOSTS: [&str; 5] = [
 
 const MAX_PLAYLIST_ID_LEN: usize = 64;
 
-const STDERR_TRUNCATE_LEN: usize = 200;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Track {
-    pub video_id: String,
-    pub title: String,
-    pub channel: String,
-    pub duration: Option<Duration>,
-}
-
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum YouTubeApiError {
+    #[error("yt-dlp is not installed or not on PATH")]
     YtDlpMissing,
+    #[error("yt-dlp failed: {0}")]
     YtDlpFailed(String),
+    #[error("invalid input: {0}")]
     InvalidInput(String),
+    #[error("yt-dlp timed out")]
     Timeout,
+    #[error("that's a livestream still in progress — try again once it's finished")]
     LiveStreamNotSupported,
 }
-
-impl std::fmt::Display for YouTubeApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::YtDlpMissing => write!(f, "yt-dlp is not installed or not on PATH"),
-            Self::YtDlpFailed(message) => write!(f, "yt-dlp failed: {message}"),
-            Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
-            Self::Timeout => write!(f, "yt-dlp timed out"),
-            Self::LiveStreamNotSupported => {
-                write!(
-                    f,
-                    "that's a livestream still in progress — try again once it's finished"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for YouTubeApiError {}
 
 pub fn extract_video_id(input: &str) -> Option<String> {
     let url = url::Url::parse(input).ok()?;
@@ -95,16 +72,17 @@ pub fn extract_video_id(input: &str) -> Option<String> {
     None
 }
 
-fn truncate_tail(s: &str, max_len: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max_len {
-        return s.to_string();
+fn map_ytdlp_error(err: YtDlpError) -> YouTubeApiError {
+    match err {
+        YtDlpError::Missing => YouTubeApiError::YtDlpMissing,
+        YtDlpError::Timeout => YouTubeApiError::Timeout,
+        YtDlpError::Spawn(message) => {
+            YouTubeApiError::YtDlpFailed(truncate_tail(&message, STDERR_TRUNCATE_LEN))
+        }
+        YtDlpError::Failed(stderr) => {
+            YouTubeApiError::YtDlpFailed(truncate_tail(stderr.trim_end(), STDERR_TRUNCATE_LEN))
+        }
     }
-    let byte_idx = s
-        .char_indices()
-        .nth(char_count - max_len)
-        .map_or(0, |(idx, _)| idx);
-    format!("...{}", &s[byte_idx..])
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,11 +143,6 @@ fn first_playlist_title(stdout: &str) -> Option<String> {
     })
 }
 
-pub struct PlaylistListing {
-    pub title: Option<String>,
-    pub tracks: Vec<Track>,
-}
-
 fn build_playlist_target(playlist_url_or_id: &str) -> Result<String, YouTubeApiError> {
     if playlist_url_or_id.contains("://") {
         let url = url::Url::parse(playlist_url_or_id)
@@ -208,14 +181,14 @@ fn build_playlist_target(playlist_url_or_id: &str) -> Result<String, YouTubeApiE
 
 #[derive(Debug, Clone)]
 pub struct YouTubeClient {
-    cookies_file: Option<String>,
+    ytdlp: YtDlp,
     playlist_track_limit: usize,
 }
 
 impl Default for YouTubeClient {
     fn default() -> Self {
         Self {
-            cookies_file: None,
+            ytdlp: YtDlp::default(),
             playlist_track_limit: DEFAULT_PLAYLIST_LIMIT,
         }
     }
@@ -224,7 +197,7 @@ impl Default for YouTubeClient {
 impl YouTubeClient {
     pub fn new(cookies_file: Option<String>, playlist_track_limit: usize) -> Self {
         Self {
-            cookies_file,
+            ytdlp: YtDlp::new(cookies_file),
             playlist_track_limit,
         }
     }
@@ -235,34 +208,13 @@ impl YouTubeClient {
         target: &str,
         timeout: Duration,
     ) -> Result<String, YouTubeApiError> {
-        let mut command = Command::new("yt-dlp");
-        command.kill_on_drop(true);
-        command.arg("-j").args(extra_args);
-        if let Some(cookies_file) = &self.cookies_file {
-            command.args(["--cookies", cookies_file]);
-        }
-        command.arg(target);
-
-        let output = tokio::time::timeout(timeout, command.output())
+        let mut args: Vec<&str> = vec!["-j"];
+        args.extend_from_slice(extra_args);
+        args.push(target);
+        self.ytdlp
+            .run(&args, timeout)
             .await
-            .map_err(|_elapsed| YouTubeApiError::Timeout)?
-            .map_err(|e| {
-                if e.kind() == ErrorKind::NotFound {
-                    YouTubeApiError::YtDlpMissing
-                } else {
-                    YouTubeApiError::YtDlpFailed(truncate_tail(&e.to_string(), STDERR_TRUNCATE_LEN))
-                }
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(YouTubeApiError::YtDlpFailed(truncate_tail(
-                stderr.trim_end(),
-                STDERR_TRUNCATE_LEN,
-            )));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            .map_err(map_ytdlp_error)
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<Track>, YouTubeApiError> {
@@ -325,28 +277,20 @@ impl YouTubeClient {
             return Ok(Vec::new());
         }
 
-        let mut command = Command::new("yt-dlp");
-        command.kill_on_drop(true);
-        command.args(["-j", "--no-playlist", "--ignore-errors"]);
-        if let Some(cookies_file) = &self.cookies_file {
-            command.args(["--cookies", cookies_file]);
-        }
-        for id in video_ids {
-            command.arg(format!("https://www.youtube.com/watch?v={id}"));
-        }
+        let urls: Vec<String> = video_ids
+            .iter()
+            .map(|id| format!("https://www.youtube.com/watch?v={id}"))
+            .collect();
+        let mut args: Vec<&str> = vec!["-j", "--no-playlist", "--ignore-errors"];
+        args.extend(urls.iter().map(String::as_str));
 
-        let output = tokio::time::timeout(YT_DLP_BATCH_TIMEOUT, command.output())
+        let stdout = self
+            .ytdlp
+            .run_ignoring_status(&args, YT_DLP_BATCH_TIMEOUT)
             .await
-            .map_err(|_elapsed| YouTubeApiError::Timeout)?
-            .map_err(|e| {
-                if e.kind() == ErrorKind::NotFound {
-                    YouTubeApiError::YtDlpMissing
-                } else {
-                    YouTubeApiError::YtDlpFailed(truncate_tail(&e.to_string(), STDERR_TRUNCATE_LEN))
-                }
-            })?;
+            .map_err(map_ytdlp_error)?;
 
-        Ok(parse_tracks(&String::from_utf8_lossy(&output.stdout)))
+        Ok(parse_tracks(&stdout))
     }
 }
 
@@ -565,21 +509,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_tail_keeps_final_error_over_leading_warning() {
-        let stderr = format!(
-            "WARNING: [youtube] {}\nERROR: [youtube] xyz: Requested format is not available.\n",
-            "x".repeat(300)
-        );
-        let truncated = truncate_tail(stderr.trim_end(), STDERR_TRUNCATE_LEN);
-        assert!(truncated.contains("Requested format is not available"));
-    }
-
-    #[test]
-    fn truncate_tail_leaves_short_strings_untouched() {
-        assert_eq!(truncate_tail("short", 200), "short");
-    }
-
-    #[test]
     fn accepts_bare_playlist_id() {
         let target = build_playlist_target("PLxxxxxxxxxxxx").unwrap();
         assert_eq!(
@@ -660,6 +589,36 @@ mod tests {
     #[test]
     fn rejects_garbage_url() {
         assert!(build_playlist_target("not a url://at all").is_err());
+    }
+
+    #[test]
+    fn map_ytdlp_error_missing_maps_to_missing() {
+        assert!(matches!(
+            map_ytdlp_error(YtDlpError::Missing),
+            YouTubeApiError::YtDlpMissing
+        ));
+    }
+
+    #[test]
+    fn map_ytdlp_error_timeout_maps_to_timeout() {
+        assert!(matches!(
+            map_ytdlp_error(YtDlpError::Timeout),
+            YouTubeApiError::Timeout
+        ));
+    }
+
+    #[test]
+    fn map_ytdlp_error_spawn_and_failed_both_truncate_the_tail() {
+        let long = "x".repeat(500);
+        for err in [YtDlpError::Spawn(long.clone()), YtDlpError::Failed(long)] {
+            match map_ytdlp_error(err) {
+                YouTubeApiError::YtDlpFailed(message) => {
+                    assert!(message.starts_with("..."));
+                    assert!(message.len() <= STDERR_TRUNCATE_LEN + 3);
+                }
+                other => panic!("expected YtDlpFailed, got {other:?}"),
+            }
+        }
     }
 
     #[test]

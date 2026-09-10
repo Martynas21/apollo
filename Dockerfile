@@ -41,7 +41,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && rm -rf src ipc/src audio-worker/src
 
 # sqlx::migrate! embeds migrations/*.sql into the binary at compile time
-# (see src/db.rs) — nothing extra to copy into the runtime stage for it.
+# (see src/db/mod.rs) — nothing extra to copy into the runtime stage for it.
 COPY src ./src
 COPY ipc/src ./ipc/src
 COPY audio-worker/src ./audio-worker/src

@@ -110,7 +110,7 @@ this — see `cargo clippy` in Development above:
   decrementing counter, capped retry count) or must be one of the small set
   of intentional long-running service loops: `apollo-audio-worker`'s driver
   loop, the IPC accept/read loops (`src/voice/ipc_backend.rs`,
-  `audio-worker/src/rpc.rs`), and the DB migration-retry loop (`src/db.rs`).
+  `audio-worker/src/rpc.rs`), and the DB migration-retry loop (`src/db/mod.rs`).
   A new unbounded loop outside that list needs explicit justification in
   review.
 - Functions stay under ~60 lines (`clippy::too_many_lines`) — split by
@@ -156,7 +156,7 @@ select. Unlike a Discord command (which could infer the caller's current
 voice channel), the dashboard has no such context — it prompts you to pick
 a voice channel the first time you play something for a guild. The bot
 leaves on its own ~2.5 minutes after the queue drains empty (see
-`IDLE_DISCONNECT` in `src/voice/player.rs`).
+`IDLE_DISCONNECT` in `src/voice/registry/mod.rs`).
 
 It listens on `DASHBOARD_BIND_ADDR` (default `127.0.0.1:8787`, i.e.
 localhost-only until you put something in front of it) and serves plain
@@ -230,18 +230,26 @@ setup, and premature before this has even been run live once.
 ## Project layout
 
 - `src/main.rs` — entrypoint: config, logging, Discord client wiring.
+- `src/lib.rs` — library root; `main.rs` is a thin binary over it.
 - `src/config.rs` — environment-based configuration.
-- `src/db.rs` — SQLite persistence for per-guild playback settings and saved
-  playlists (`sqlx`).
-- `src/youtube/api.rs` — `yt-dlp`-backed search/single-video/playlist client.
-- `src/voice/` — `player.rs` (per-guild queue engine), `resolve.rs`
-  (yt-dlp-backed audio resolution + startup dependency check), `radio.rs`
-  (Mix listing for radio mode), `ipc_backend.rs` (the `VoiceBackend` that
-  talks to `apollo-audio-worker`).
+- `src/model.rs` — the domain types (`Track`, `PlaylistListing`,
+  `QueuedTrack`) shared across the database, player and dashboard.
+- `src/db/` — SQLite persistence (`sqlx`), split by table group:
+  `settings.rs`, `playlists.rs`, `session.rs`, `queue.rs`, `stats.rs`,
+  `users.rs`, with `mod.rs` owning connect/migrate.
+- `src/youtube/` — `api.rs` (search/single-video/playlist client) and
+  `ytdlp.rs` (the `yt-dlp` subprocess runner every call goes through).
+- `src/voice/` — `registry/` (the per-guild queue engine, split into
+  `queue.rs`, `playback.rs`, `session.rs`, `radio.rs`), `state.rs` and
+  `backend.rs` (state types and the `Voice*` traits), `resolve.rs`
+  (yt-dlp-backed audio resolution), `radio.rs` (Mix listing for radio
+  mode), `ipc_backend.rs` (the `VoiceBackend` that talks to
+  `apollo-audio-worker`). See [docs/player-states.md](docs/player-states.md).
 - `src/web/` — the web dashboard (`axum`): `api.rs` (HTTP/WebSocket
-  handlers), `auth.rs` (password hashing + in-memory session tokens),
-  `dashboard.html` (the single-page frontend, served as-is). See
+  handlers), `auth.rs` (password hashing + in-memory session tokens). See
   [Web dashboard](#web-dashboard).
+- `assets/dashboard.html` — the single-page dashboard frontend, served
+  as-is and embedded into the binary at compile time.
 - `ipc/` — shared wire protocol/DTOs between `apollo` and
   `apollo-audio-worker` (a separate workspace crate, `apollo-ipc`).
 - `audio-worker/` — `apollo-audio-worker`: the standalone process holding

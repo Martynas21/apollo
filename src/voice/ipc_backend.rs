@@ -12,11 +12,11 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{Mutex, oneshot};
 
-use crate::voice::player::{
+use crate::model::Track;
+use crate::voice::backend::{
     AudioSource, TrackStatus, VoiceBackend, VoiceCall, VoiceEvents, VoiceTrack,
 };
 use crate::voice::resolve::{self, PlaybackError};
-use crate::youtube::api::Track;
 
 type PendingMap = StdMutex<HashMap<u64, oneshot::Sender<Result<Response, String>>>>;
 type EventsMap = StdMutex<HashMap<GuildId, Arc<dyn VoiceEvents>>>;

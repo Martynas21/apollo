@@ -1,16 +1,15 @@
+#![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
-
-mod rpc;
-mod session;
 
 use std::sync::Arc;
 
+use apollo_audio_worker::config::Config;
+use apollo_audio_worker::rpc;
+use apollo_audio_worker::session::Sessions;
 use apollo_ipc::proto::Event as IpcEvent;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tracing_subscriber::EnvFilter;
-
-use session::Sessions;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,11 +21,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let bind_addr = apollo_ipc::optional_env_var(&|key| std::env::var(key), "AUDIO_WORKER_SOCKET")
-        .unwrap_or_else(|| apollo_ipc::DEFAULT_SOCKET_ADDR.to_string());
+    let config = Config::from_env();
 
-    let listener = TcpListener::bind(&bind_addr).await?;
-    tracing::info!(bind_addr, "apollo-audio-worker listening");
+    let listener = TcpListener::bind(&config.bind_addr).await?;
+    tracing::info!(bind_addr = %config.bind_addr, "apollo-audio-worker listening");
 
     let (events_tx, events_rx) = mpsc::unbounded_channel::<IpcEvent>();
     let sessions = Arc::new(Sessions::new(events_tx));

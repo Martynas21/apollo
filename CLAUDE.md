@@ -73,7 +73,7 @@ Three-crate Cargo workspace:
   Docker) without sharing a filesystem — see `c99ee73` and the `AUDIO_WORKER_SOCKET`
   env var (`host:port`, defaults to Docker's `audio-worker:7878`).
 
-### Player state machine (`src/voice/player.rs`, ~3000 lines)
+### Player state machine (`src/voice/state.rs` + `src/voice/registry/`)
 
 The core of the bot. `PlayerRegistry`/`GuildState` hold **no explicit "state"
 field** — every observable state is derived from `now_playing`,
@@ -95,32 +95,41 @@ Key points:
 - Invariant that must hold after every action: `current_handle.is_some() ==
   current_track_id.is_some()`, and no action panics — it succeeds, no-ops, or
   returns a typed `PlayerError`. This is exercised by a table-driven test in
-  `player.rs` (`every_action_is_panic_free_and_keeps_the_handle_track_id_invariant_in_every_state`)
+  `src/voice/registry/mod.rs` (`every_action_is_panic_free_and_keeps_the_handle_track_id_invariant_in_every_state`)
   cross-referencing the action×state matrix in `docs/player-states.md` — extend
   both together when adding a new action or state transition.
 
 ### Other modules
 
-- `src/web/` — the web dashboard (axum): `api.rs` (HTTP/WebSocket handlers —
-  the only place playback actions are invoked from), `auth.rs` (password
-  hashing + in-memory session tokens), `dashboard.html` (the single-page
-  frontend, served as-is).
+- `src/web/` — the web dashboard (axum): `mod.rs` (`WebState`, the `router()`/
+  `serve()` seam, and the middleware layering), `response.rs` (shared JSON
+  error shape, guild/channel id parsing, `Track` wire-format mapping),
+  `routes/` (one file per surface — `guilds.rs`, `playback.rs`, `queue.rs`,
+  `search.rs`, `playlists.rs`, `favourites.rs`, `users.rs`, `auth.rs` — each
+  owning its handlers and its own `routes()`), `auth.rs` (password hashing +
+  in-memory session tokens — middleware, not a route module). The
+  single-page frontend it serves lives at `assets/dashboard.html`, embedded
+  at compile time via `include_str!`.
 - `src/youtube/api.rs` — the `yt-dlp` subprocess client (search,
   single-video metadata, playlist listing — all via `yt-dlp -j`) plus
   `extract_video_id` for pulling a video ID out of a YouTube URL.
 - `src/voice/resolve.rs` — resolves a track to a direct streamable URL
   (metadata-only `yt-dlp -j`, no download). `src/voice/mod.rs` does the
   `yt-dlp` startup dependency check.
-- `src/db.rs` — sqlx/SQLite: per-guild settings (volume), saved playlists,
-  guild sessions. Migrations in `migrations/` are embedded into the binary at
-  compile time (sqlx `migrate!`).
+- `src/db/` — sqlx/SQLite, split by table group: `settings.rs` (per-guild
+  volume), `playlists.rs` (saved playlists + cached tracks), `session.rs`
+  (guild session persistence), `queue.rs` (the persisted play queue),
+  `stats.rs` (play counts), `users.rs` (dashboard accounts). `mod.rs` holds
+  `connect` and re-exports everything else under `crate::db::*`. Migrations
+  in `migrations/` are embedded into the binary at compile time (sqlx
+  `migrate!`).
 
 ## Code style (enforced by `clippy.toml` + workspace `[lints]`, not just convention)
 
 - **No recursion** — use iteration.
 - **No unbounded loops** outside an explicitly-allowed list: `apollo-audio-worker`'s
   driver loop, the IPC accept/read loops (`ipc_backend.rs`, `audio-worker/src/rpc.rs`),
-  and the DB migration-retry loop (`db.rs`). A new unbounded loop anywhere else
+  and the DB migration-retry loop (`db/mod.rs`). A new unbounded loop anywhere else
   needs explicit justification in review.
 - **Functions stay under ~60 lines** (`clippy::too_many_lines`, threshold set
   in `clippy.toml`) — split by sub-step, not arbitrary truncation.

@@ -8,14 +8,14 @@ publish = false
 workspace = true
 
 [dependencies]
-anyhow = "1"
+anyhow = { workspace = true }
 apollo-ipc = { path = "../ipc" }
-async-trait = "0.1"
-dotenvy = "0.15.7"
+async-trait = { workspace = true }
+dotenvy = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-tokio = { version = "1.53", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
-songbird = { version = "0.6.0", default-features = false, features = ["driver", "rustls", "tungstenite"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
+songbird = { workspace = true, features = ["driver", "rustls", "tungstenite"] }
 symphonia = { version = "0.5", features = ["aac", "isomp4"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-uuid = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

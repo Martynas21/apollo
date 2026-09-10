@@ -4,29 +4,14 @@ use crate::proto::Envelope;
 
 const MAX_FRAME_LEN: u32 = 1 << 20;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum FramingError {
-    Io(std::io::Error),
+    #[error("IPC I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("IPC codec error: {0}")]
     Codec(String),
+    #[error("IPC frame too large: {0} bytes")]
     FrameTooLarge(u32),
-}
-
-impl std::fmt::Display for FramingError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "IPC I/O error: {e}"),
-            Self::Codec(e) => write!(f, "IPC codec error: {e}"),
-            Self::FrameTooLarge(len) => write!(f, "IPC frame too large: {len} bytes"),
-        }
-    }
-}
-
-impl std::error::Error for FramingError {}
-
-impl From<std::io::Error> for FramingError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
 }
 
 pub async fn write_frame<W: AsyncWrite + Unpin>(

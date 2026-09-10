@@ -1,6 +1,18 @@
 [workspace]
 members = ["ipc", "audio-worker"]
 
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+dotenvy = "0.15.7"
+serde = { version = "1", features = ["derive"] }
+songbird = { version = "0.6.0", default-features = false }
+thiserror = "2"
+tokio = "1.53"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = "1"
+
 [workspace.lints.clippy]
 too_many_lines = "warn"
 unwrap_used = "warn"
@@ -18,23 +30,28 @@ workspace = true
 
 [dependencies]
 apollo-ipc = { path = "ipc" }
-tokio = { version = "1.53", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "cache", "voice", "rustls_backend"] }
 # apollo never drives audio itself (that's apollo-audio-worker, over IPC) —
 # it only uses songbird to join/leave voice channels via the gateway and
 # hand off the resulting ConnectionInfo, so it needs "gateway" and "serenity"
 # only, not "driver" (which pulls in symphonia, reqwest, opus, etc.).
-songbird = { version = "0.6.0", default-features = false, features = ["gateway", "serenity"] }
+songbird = { workspace = true, features = ["gateway", "serenity"] }
 url = "2"
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
 serde_json = "1"
-dotenvy = "0.15.7"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+dotenvy = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "macros", "migrate"] }
-anyhow = "1"
-async-trait = "0.1"
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
 rand = "0.10.2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 axum = { version = "0.8.9", features = ["ws"] }
 argon2 = "0.6.0"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
