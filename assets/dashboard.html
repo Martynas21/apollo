@@ -861,7 +861,10 @@
     });
   }
 
-  document.getElementById('logout-btn').addEventListener('click', () => showLogin());
+  document.getElementById('logout-btn').addEventListener('click', () => {
+    fetch('/api/logout', { method: 'POST', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
+    showLogin();
+  });
 
   // ---- Deterministic per-id color, used for server avatars, playlist
   // covers and search/queue thumbnails (the backend has no real artwork). ----

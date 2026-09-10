@@ -1,7 +1,7 @@
 //! User management: listing, creating and deleting dashboard accounts.
-//! Every route here except `/api/me` is admin-only (see `require_admin` in
-//! `auth.rs` and the route wiring in `mod.rs`) — this is not a playback
-//! surface, so it stays out of `api.rs`.
+//! Every route here except `/api/me` and `/api/logout` is admin-only (see
+//! `require_admin` in `auth.rs` and the route wiring in `mod.rs`) — this is
+//! not a playback surface, so it stays out of `api.rs`.
 
 use axum::Json;
 use axum::Router;
@@ -13,11 +13,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::db;
 use crate::web::WebState;
-use crate::web::auth::{self, CurrentUser};
+use crate::web::auth::{self, CurrentUser, SessionToken};
 use crate::web::response::error_response;
 
 pub fn routes() -> Router<WebState> {
-    Router::new().route("/api/me", get(me))
+    Router::new()
+        .route("/api/me", get(me))
+        .route("/api/logout", post(logout))
 }
 
 pub fn admin_routes() -> Router<WebState> {
@@ -42,6 +44,16 @@ async fn me(Extension(user): Extension<CurrentUser>) -> Response {
         is_root: user.is_root,
     })
     .into_response()
+}
+
+/// Revokes just the calling session, so signing out of one browser tab
+/// doesn't touch any other session open for the same account.
+async fn logout(
+    State(state): State<WebState>,
+    Extension(token): Extension<SessionToken>,
+) -> Response {
+    state.sessions.revoke_token(&token.0);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn list_users(State(state): State<WebState>) -> Response {
@@ -165,7 +177,10 @@ async fn delete_user(
     }
 
     match db::delete_user(&state.db, &username).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.sessions.revoke_user(&username);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(err) => {
             tracing::warn!(%err, "failed to delete user");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to delete user")
@@ -221,7 +236,10 @@ async fn set_password(
     };
 
     match db::set_user_password(&state.db, &username, &hash).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state.sessions.revoke_user(&username);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(err) => {
             tracing::warn!(%err, "failed to update password");
             error_response(

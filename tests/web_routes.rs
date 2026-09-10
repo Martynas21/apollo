@@ -162,6 +162,35 @@ async fn login_with_bad_credentials_fails_with_the_shared_error_shape() {
 }
 
 #[tokio::test]
+async fn repeated_bad_logins_for_the_same_username_eventually_return_too_many_requests() {
+    let app = test_app().await;
+
+    let mut saw_too_many_requests = false;
+    for _ in 0..20 {
+        let response = request(
+            &app,
+            "POST",
+            "/api/login",
+            None,
+            Some(json!({ "username": ADMIN_USERNAME, "password": "not-the-password" })),
+        )
+        .await;
+
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            assert!(response.headers().contains_key(header::RETRY_AFTER));
+            saw_too_many_requests = true;
+            break;
+        }
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    assert!(
+        saw_too_many_requests,
+        "expected repeated bad logins for one username to eventually be throttled"
+    );
+}
+
+#[tokio::test]
 async fn login_with_good_credentials_returns_a_session_token() {
     let app = test_app().await;
 

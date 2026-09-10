@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 use rand::Rng;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::db;
 
@@ -16,6 +17,29 @@ use crate::db;
 /// just has to log in again), which is fine for a small, self-hosted,
 /// single-operator tool.
 const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// Failed logins allowed for a single username inside [`LOGIN_THROTTLE_WINDOW`]
+/// before further attempts for that username are rejected outright — high
+/// enough that a few mistyped passwords in a row don't lock anyone out, low
+/// enough to make online brute-forcing impractical.
+const LOGIN_FAILURE_THRESHOLD: u32 = 5;
+
+/// Rolling window a username's failures are counted over, and how long a
+/// throttled username has to wait before it may try again.
+const LOGIN_THROTTLE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Hard cap on distinct usernames tracked at once. The map is keyed by
+/// attacker-controlled input, so without a cap it would grow without bound;
+/// entries also expire and get swept on every insert (see
+/// [`LoginThrottle::record_failure`]) — this cap is just a backstop against a
+/// burst of distinct usernames arriving faster than they expire.
+const MAX_TRACKED_USERNAMES: usize = 10_000;
+
+/// Upper bound on logins allowed to be hashing a password at once.
+/// `Argon2::default()` costs roughly 19 MiB per call, so this bounds peak
+/// memory attributable to the login endpoint to about this many times that,
+/// no matter how many requests arrive concurrently.
+const MAX_CONCURRENT_LOGIN_HASHES: usize = 16;
 
 /// The identity behind a validated session, as resolved at login time.
 /// Inserted into request extensions by [`require_session`] so downstream
@@ -29,6 +53,13 @@ pub struct CurrentUser {
     /// another user's password (see `web::users::set_password`).
     pub is_root: bool,
 }
+
+/// The bearer token behind a validated session, inserted into request
+/// extensions by [`require_session`] alongside [`CurrentUser`] so a handler
+/// that needs to act on the caller's own session (e.g. logout) can do so
+/// without re-parsing the `Authorization` header.
+#[derive(Clone)]
+pub struct SessionToken(pub String);
 
 struct SessionInfo {
     user: CurrentUser,
@@ -85,6 +116,110 @@ impl SessionStore {
             }
         }
     }
+
+    /// Drops every session belonging to this account, so a deleted user or
+    /// one whose password was just reset can't keep authenticating on a
+    /// token issued before that change.
+    pub fn revoke_user(&self, username: &str) {
+        let mut sessions = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions.retain(|_, info| info.user.username != username);
+    }
+
+    /// Drops a single session by its token, for signing out of just the
+    /// browser tab that asked.
+    pub fn revoke_token(&self, token: &str) {
+        let mut sessions = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions.remove(token);
+    }
+}
+
+struct LoginAttempts {
+    failures: u32,
+    window_started_at: Instant,
+}
+
+/// Guards `POST /api/login` against online brute-forcing: a per-username
+/// failure counter (see [`LoginThrottle::remaining_lockout`],
+/// [`LoginThrottle::record_failure`] and [`LoginThrottle::record_success`])
+/// plus a global cap on how many logins may be hashing a password at once
+/// (see [`LoginThrottle::try_acquire_hash_permit`]).
+#[derive(Clone)]
+pub struct LoginThrottle {
+    attempts: Arc<Mutex<HashMap<String, LoginAttempts>>>,
+    concurrent_hashes: Arc<Semaphore>,
+}
+
+impl Default for LoginThrottle {
+    fn default() -> Self {
+        Self {
+            attempts: Arc::new(Mutex::new(HashMap::new())),
+            concurrent_hashes: Arc::new(Semaphore::new(MAX_CONCURRENT_LOGIN_HASHES)),
+        }
+    }
+}
+
+impl LoginThrottle {
+    /// `Some(remaining)` if `username` is currently locked out, with the
+    /// wait left before it may try again; `None` if the attempt may proceed.
+    pub fn remaining_lockout(&self, username: &str) -> Option<Duration> {
+        let attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = attempts.get(username)?;
+        let elapsed = record.window_started_at.elapsed();
+        (record.failures >= LOGIN_FAILURE_THRESHOLD && elapsed < LOGIN_THROTTLE_WINDOW)
+            .then(|| LOGIN_THROTTLE_WINDOW - elapsed)
+    }
+
+    /// Records a failed attempt for `username`, starting a fresh window if
+    /// none is currently active for it. Sweeps expired records first,
+    /// mirroring the retain-on-insert pattern [`SessionStore::issue`] uses.
+    pub fn record_failure(&self, username: &str) {
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        attempts.retain(|_, record| record.window_started_at.elapsed() < LOGIN_THROTTLE_WINDOW);
+
+        if let Some(record) = attempts.get_mut(username) {
+            record.failures += 1;
+            return;
+        }
+        if attempts.len() < MAX_TRACKED_USERNAMES {
+            attempts.insert(
+                username.to_string(),
+                LoginAttempts {
+                    failures: 1,
+                    window_started_at: Instant::now(),
+                },
+            );
+        }
+    }
+
+    /// Clears any failure record for `username` — called on a successful
+    /// login so a past run of bad attempts doesn't linger against an account
+    /// that has since proven it holds the right password.
+    pub fn record_success(&self, username: &str) {
+        let mut attempts = self
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        attempts.remove(username);
+    }
+
+    /// Reserves one slot for doing Argon2 work, or `None` if
+    /// [`MAX_CONCURRENT_LOGIN_HASHES`] logins are already hashing a
+    /// password. The permit must be held for the duration of that work.
+    pub fn try_acquire_hash_permit(&self) -> Option<OwnedSemaphorePermit> {
+        self.concurrent_hashes.clone().try_acquire_owned().ok()
+    }
 }
 
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
@@ -126,6 +261,18 @@ pub async fn bootstrap_user_if_needed(
     Ok(())
 }
 
+/// A validly-formatted Argon2 hash with no corresponding account, computed
+/// once and reused so the unknown-username branch of [`verify_login`] pays
+/// the same Argon2 cost as a wrong password against a real account. Without
+/// this, the two failure modes are trivially distinguishable by timing,
+/// which is exactly what `verify_login`'s contract rules out.
+fn dummy_login_hash() -> Option<&'static str> {
+    static DUMMY_HASH: OnceLock<Option<String>> = OnceLock::new();
+    DUMMY_HASH
+        .get_or_init(|| hash_password("apollo dashboard dummy hash for timing equalization").ok())
+        .as_deref()
+}
+
 /// Returns the resolved identity on success, `None` for an unknown username
 /// or a wrong password (deliberately not distinguished, so a login failure
 /// can't be used to enumerate valid usernames).
@@ -135,6 +282,9 @@ pub async fn verify_login(
     password: &str,
 ) -> anyhow::Result<Option<CurrentUser>> {
     let Some(creds) = db::user_credentials(db, username).await? else {
+        if let Some(dummy_hash) = dummy_login_hash() {
+            verify_password(password, dummy_hash);
+        }
         return Ok(None);
     };
     Ok(
@@ -176,15 +326,15 @@ pub async fn require_session(
     mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let token = bearer_token(&request).or_else(|| query_token(&request));
-    let user = token.and_then(|token| state.sessions.get(&token));
-    match user {
-        Some(user) => {
-            request.extensions_mut().insert(user);
-            Ok(next.run(request).await)
-        }
-        None => Err(StatusCode::UNAUTHORIZED),
-    }
+    let Some(token) = bearer_token(&request).or_else(|| query_token(&request)) else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let Some(user) = state.sessions.get(&token) else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    request.extensions_mut().insert(user);
+    request.extensions_mut().insert(SessionToken(token));
+    Ok(next.run(request).await)
 }
 
 /// Must run after [`require_session`] on the same route (which puts the
@@ -276,6 +426,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn revoking_a_user_invalidates_that_users_session() {
+        let sessions = SessionStore::default();
+        let token = sessions.issue(CurrentUser {
+            username: "alice".to_string(),
+            is_admin: false,
+            is_root: false,
+        });
+
+        sessions.revoke_user("alice");
+
+        assert!(sessions.get(&token).is_none());
+    }
+
+    #[test]
+    fn revoking_a_user_leaves_other_users_sessions_valid() {
+        let sessions = SessionStore::default();
+        let alice_token = sessions.issue(CurrentUser {
+            username: "alice".to_string(),
+            is_admin: false,
+            is_root: false,
+        });
+        let bob_token = sessions.issue(CurrentUser {
+            username: "bob".to_string(),
+            is_admin: false,
+            is_root: false,
+        });
+
+        sessions.revoke_user("alice");
+
+        assert!(sessions.get(&alice_token).is_none());
+        assert_eq!(
+            sessions
+                .get(&bob_token)
+                .expect("bob's session should still be valid")
+                .username,
+            "bob"
+        );
+    }
+
+    #[test]
+    fn revoking_a_token_invalidates_only_that_token() {
+        let sessions = SessionStore::default();
+        let first_token = sessions.issue(CurrentUser {
+            username: "alice".to_string(),
+            is_admin: false,
+            is_root: false,
+        });
+        let second_token = sessions.issue(CurrentUser {
+            username: "alice".to_string(),
+            is_admin: false,
+            is_root: false,
+        });
+
+        sessions.revoke_token(&first_token);
+
+        assert!(sessions.get(&first_token).is_none());
+        assert!(sessions.get(&second_token).is_some());
+    }
+
     #[tokio::test]
     async fn bootstrap_creates_the_first_user_as_an_admin_and_root() -> anyhow::Result<()> {
         let pool = db::connect("sqlite::memory:").await?;
@@ -344,5 +554,97 @@ mod tests {
         assert!(!user.is_admin);
         assert!(!user.is_root);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unknown_username_and_a_wrong_password_for_a_known_username_both_return_none()
+    -> anyhow::Result<()> {
+        let pool = db::connect("sqlite::memory:").await?;
+        bootstrap_user_if_needed(&pool, Some("admin"), Some("hunter2")).await?;
+
+        assert!(
+            verify_login(&pool, "nobody-registered", "whatever")
+                .await?
+                .is_none()
+        );
+        assert!(
+            verify_login(&pool, "admin", "wrong-password")
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_throttle_locks_out_a_username_after_the_failure_threshold_and_resets_on_success() {
+        let throttle = LoginThrottle::default();
+        let username = "flaky-login";
+
+        for _ in 0..LOGIN_FAILURE_THRESHOLD {
+            assert!(throttle.remaining_lockout(username).is_none());
+            throttle.record_failure(username);
+        }
+        assert!(throttle.remaining_lockout(username).is_some());
+
+        throttle.record_success(username);
+        assert!(throttle.remaining_lockout(username).is_none());
+    }
+
+    #[test]
+    fn the_throttle_leaves_other_usernames_unaffected_by_one_usernames_failures() {
+        let throttle = LoginThrottle::default();
+
+        for _ in 0..LOGIN_FAILURE_THRESHOLD {
+            throttle.record_failure("attacker-controlled");
+        }
+
+        assert!(throttle.remaining_lockout("attacker-controlled").is_some());
+        assert!(throttle.remaining_lockout("someone-else").is_none());
+    }
+
+    #[test]
+    fn expired_throttle_records_are_swept_rather_than_accumulating() {
+        let throttle = LoginThrottle::default();
+        {
+            let mut attempts = throttle
+                .attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            attempts.insert(
+                "stale-user".to_string(),
+                LoginAttempts {
+                    failures: LOGIN_FAILURE_THRESHOLD,
+                    window_started_at: Instant::now()
+                        - LOGIN_THROTTLE_WINDOW
+                        - Duration::from_secs(1),
+                },
+            );
+        }
+
+        throttle.record_failure("someone-else");
+
+        let attempts = throttle
+            .attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!attempts.contains_key("stale-user"));
+    }
+
+    #[test]
+    fn hash_permits_are_bounded_by_the_concurrency_cap() {
+        let throttle = LoginThrottle::default();
+
+        let permits: Vec<_> = (0..MAX_CONCURRENT_LOGIN_HASHES)
+            .map(|_| {
+                throttle
+                    .try_acquire_hash_permit()
+                    .expect("permit should be available under the cap")
+            })
+            .collect();
+
+        assert!(throttle.try_acquire_hash_permit().is_none());
+
+        drop(permits);
+        assert!(throttle.try_acquire_hash_permit().is_some());
     }
 }
