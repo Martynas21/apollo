@@ -33,6 +33,13 @@
     --space-7: 28px;
     --space-8: 32px;
     --space-10: 40px;
+
+    /* ---- Shell rhythm ----
+       Outer padding and inter-card gaps scale with the viewport so a phone
+       doesn't lose a fifth of its width to the same padding a desktop uses. */
+    --shell-pad-x: clamp(var(--space-4), 3vw, var(--space-10));
+    --shell-pad-y: clamp(var(--space-4), 2vw, var(--space-8));
+    --gap: clamp(var(--space-4), 1.6vw, var(--space-6));
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
@@ -109,8 +116,10 @@
   }
 
   /* ---- Dashboard ---- */
+  /* A fixed height, not a minimum: the shell owns the viewport and the
+     scrolling happens inside it, so the queue can run full-height. */
   #dashboard {
-    display: none; width: 100%; min-height: 100vh;
+    display: none; width: 100%; height: 100dvh;
     background: var(--bg); color: var(--text); flex-direction: column;
   }
 
@@ -173,17 +182,35 @@
 
   .dashboard-body {
     flex: 1;
+    min-height: 0;
+    overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: var(--space-6);
-    padding: var(--space-8) var(--space-10);
+    gap: var(--gap);
+    padding: var(--shell-pad-y) var(--shell-pad-x);
   }
-  .dashboard-columns {
-    display: flex;
-    align-items: flex-start;
-    gap: var(--space-6);
+
+  /* Player, queue and library in one grid. The queue spans both rows, so it
+     runs the full height of the shell and scrolls internally — flexbox has
+     no way to size an item against a sibling's natural height, which is why
+     this used to need a ResizeObserver. */
+  .dashboard-grid {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    gap: var(--gap);
+    grid-template-columns: minmax(0, 1fr) minmax(320px, 480px);
+    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-areas:
+      "player  queue"
+      "library queue";
   }
-  .dashboard-main-col { flex: 2 1 0%; display: flex; flex-direction: column; gap: var(--space-6); min-width: 0; }
+  .player-card { grid-area: player; }
+  .library-area {
+    grid-area: library; min-height: 0;
+    display: grid; gap: var(--gap);
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  }
   .card {
     background: var(--bg-elevated); border: 1px solid var(--border-soft);
     border-radius: 18px; padding: var(--space-7); display: flex; flex-direction: column;
@@ -311,7 +338,7 @@
   .ghost-btn.danger:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
 
   /* Queue side card */
-  .queue-card { flex: 1 1 0%; min-width: 0; overflow: hidden; }
+  .queue-card { grid-area: queue; min-width: 0; min-height: 0; overflow: hidden; }
   .queue-card .scroll-list { flex: 1; min-height: 0; max-height: none; }
   .search-bar {
     display: flex; align-items: center; gap: var(--space-2-5); background: var(--bg); border: 1px solid var(--border-soft);
@@ -402,8 +429,6 @@
   .muted-note { font-size: 12.5px; color: var(--text-faint); margin: var(--space-1-5) var(--space-0-5); }
 
   /* Favourites cards */
-  .favourites-row { display: flex; gap: var(--space-6); align-items: stretch; }
-  .favourites-row .card { flex: 1; min-width: 0; }
   #favourite-tracks { max-height: 226px; }
 
   /* Playlists bottom strip */
@@ -471,6 +496,61 @@
     box-shadow: 0 0 16px 2px color-mix(in oklch, var(--accent) 45%, transparent);
   }
   .channel-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ---- Breakpoints ----
+     Two columns while there's room for them, one below 900, and a compact
+     phone layout below 600 where the transport detaches to the bottom. */
+  @media (min-width: 1200px) {
+    /* Only the two-column layout has spare vertical space to hand out. */
+    .library-area { height: 100%; }
+    .library-area .card { min-height: 0; }
+    .library-area .scroll-list { flex: 1; min-height: 0; max-height: none; }
+  }
+  /* Below this the two columns can't both breathe: the queue drops under
+     360px, which costs more in truncated titles than the side-by-side
+     arrangement is worth, so it stacks instead. */
+  @media (max-width: 1199px) {
+    .dashboard-grid {
+      /* Stacked, the grid is as tall as its content and `.dashboard-body`
+         scrolls — rather than the grid being capped to the shell height and
+         squeezing its rows. */
+      flex: 0 0 auto;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto auto auto;
+      grid-template-areas:
+        "player"
+        "queue"
+        "library";
+    }
+    /* Stacked, the card sizes to its content, so the list has to take its
+       natural height capped at 46vh rather than flexing into a parent that
+       has no height of its own to share out. */
+    .queue-card .list-panel { flex: none; }
+    .queue-card .scroll-list { flex: none; max-height: 46vh; }
+    .np-art { width: 116px; height: 116px; }
+    .topbar-search { margin: 0 var(--space-4); }
+  }
+  @media (max-width: 600px) {
+    .topbar { flex-wrap: wrap; padding: var(--space-3) var(--shell-pad-x); gap: var(--space-2-5); }
+    .topbar-search { order: 3; flex-basis: 100%; margin: 0; max-width: none; }
+    .topbar-nav { display: none; }
+    .card { padding: var(--space-4); border-radius: 14px; }
+    .np-hero { gap: var(--space-4); }
+    .np-art { width: 88px; height: 88px; }
+    .np-title { font-size: 19px; }
+    /* Pinned to the viewport rather than the card, so play/skip stays
+       reachable however far down the queue you've scrolled. */
+    .now-controls {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
+      margin: 0; border-top: 1px solid var(--border-soft);
+      padding: var(--space-3) var(--shell-pad-x) calc(var(--space-3) + env(safe-area-inset-bottom));
+      background: color-mix(in oklch, var(--bg-elevated) 94%, transparent);
+      backdrop-filter: blur(10px);
+    }
+    .control-row { justify-content: center; flex-wrap: wrap; }
+    .dashboard-body { padding-bottom: 92px; }
+    .volume-popover { bottom: calc(100% + 10px); }
+  }
 </style>
 </head>
 <body>
@@ -540,9 +620,8 @@
   </header>
 
   <div class="dashboard-body" id="page-dashboard-body">
-   <div class="dashboard-columns">
-    <div class="dashboard-main-col">
-      <section class="card">
+   <div class="dashboard-grid">
+      <section class="card player-card">
       <div id="np-hero" class="np-hero">
         <div class="np-art" id="np-art">
           <svg width="44" height="44" viewBox="0 0 28 28" fill="none" stroke="white" stroke-opacity="0.9" stroke-width="1.5" stroke-linecap="round">
@@ -611,23 +690,6 @@
       </div>
     </section>
 
-    <div class="favourites-row">
-      <section class="card">
-        <h2 class="card-title">Most Played Tracks</h2>
-        <div class="list-panel">
-          <div class="scroll-list" id="favourite-tracks"></div>
-          <div class="muted-note" id="favourite-tracks-empty-note" style="display:none">No plays yet — favourites show up once tracks have been played.</div>
-        </div>
-      </section>
-
-      <section class="card">
-        <h2 class="card-title">Most Played Playlists</h2>
-        <div class="playlist-row" id="favourite-playlists"></div>
-        <div class="muted-note" id="favourite-playlists-empty-note" style="display:none">No playlists played yet.</div>
-      </section>
-    </div>
-    </div>
-
    <section class="card queue-card">
       <div class="card-header-row">
         <h2 class="card-title">Queue<span class="count-badge" id="queue-count-badge">0</span></h2>
@@ -641,12 +703,28 @@
         <div class="muted-note" id="queue-empty-note" style="display:none">Queue is empty — add something from Search.</div>
       </div>
     </section>
-   </div>
 
-   <section class="card">
-    <h2 class="card-title">Playlists</h2>
-    <div class="playlist-row" id="playlist-row"></div>
-   </section>
+    <div class="library-area">
+      <section class="card">
+        <h2 class="card-title">Most Played Tracks</h2>
+        <div class="list-panel">
+          <div class="scroll-list" id="favourite-tracks"></div>
+          <div class="muted-note" id="favourite-tracks-empty-note" style="display:none">No plays yet — favourites show up once tracks have been played.</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">Most Played Playlists</h2>
+        <div class="playlist-row" id="favourite-playlists"></div>
+        <div class="muted-note" id="favourite-playlists-empty-note" style="display:none">No playlists played yet.</div>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">Playlists</h2>
+        <div class="playlist-row" id="playlist-row"></div>
+      </section>
+    </div>
+   </div>
   </div>
 
   <div class="dashboard-body" id="page-users" style="display:none">
@@ -780,17 +858,6 @@
   const loginError = document.getElementById('login-error');
   const statusLine = document.getElementById('status-line');
 
-  // The queue card sits beside the now-playing + favourites column and must
-  // match that column's height exactly so its own list scrolls internally
-  // rather than growing to fit its own (much longer) content — flexbox has
-  // no way to cap an item's height to a sibling's natural size, so it's
-  // measured here instead.
-  const dashboardMainCol = document.querySelector('.dashboard-main-col');
-  const queueCard = document.querySelector('.queue-card');
-  function syncQueueCardHeight() {
-    queueCard.style.height = `${dashboardMainCol.offsetHeight}px`;
-  }
-  new ResizeObserver(syncQueueCardHeight).observe(dashboardMainCol);
 
   // Shows a status message. Non-error messages fade in and auto-dismiss after
   // a few seconds; error messages stay up until the next status change so
