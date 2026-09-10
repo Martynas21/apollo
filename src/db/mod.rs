@@ -32,8 +32,8 @@ pub use stats::{
 };
 pub use users::{
     UserCredentials, UserPrivileges, UserSummary, admin_count, delete_user, insert_user,
-    list_users, rename_user, set_user_password, user_count, user_credentials, user_exists,
-    user_privileges,
+    list_users, rename_user, set_user_guild, set_user_password, user_count, user_credentials,
+    user_exists, user_privileges,
 };
 
 const TRACK_INSERT_BATCH_SIZE: usize = 500;

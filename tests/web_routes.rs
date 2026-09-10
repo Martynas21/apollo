@@ -263,3 +263,149 @@ async fn a_malformed_guild_id_is_rejected_with_bad_request_and_the_shared_error_
     let body = json_body(response).await;
     assert_eq!(body["error"], "invalid guild id");
 }
+
+#[tokio::test]
+async fn a_guild_pinned_user_is_confined_to_that_guild_on_every_guild_scoped_route() {
+    let app = test_app().await;
+    let admin_token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+
+    let create_response = request(
+        &app,
+        "POST",
+        "/api/users",
+        Some(&admin_token),
+        Some(json!({
+            "username": "pinned",
+            "password": "pinned-pw",
+            "guild_id": "111",
+        })),
+    )
+    .await;
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    let pinned_token = login(&app, "pinned", "pinned-pw")
+        .await
+        .expect("the pinned user should be able to log in");
+
+    let own_guild = request(
+        &app,
+        "GET",
+        "/api/guilds/111/now-playing",
+        Some(&pinned_token),
+        None,
+    )
+    .await;
+    assert_eq!(own_guild.status(), StatusCode::OK);
+
+    let other_guild = request(
+        &app,
+        "GET",
+        "/api/guilds/222/now-playing",
+        Some(&pinned_token),
+        None,
+    )
+    .await;
+    assert_eq!(other_guild.status(), StatusCode::FORBIDDEN);
+
+    // A write route is refused by the same middleware, not just the reads.
+    let other_guild_write = request(
+        &app,
+        "POST",
+        "/api/guilds/222/skip",
+        Some(&pinned_token),
+        None,
+    )
+    .await;
+    assert_eq!(other_guild_write.status(), StatusCode::FORBIDDEN);
+
+    // Routes that address no guild stay reachable.
+    let me_response = request(&app, "GET", "/api/me", Some(&pinned_token), None).await;
+    assert_eq!(me_response.status(), StatusCode::OK);
+    assert_eq!(json_body(me_response).await["guild_id"], "111");
+}
+
+#[tokio::test]
+async fn an_admin_reaches_every_guild_even_with_one_pinned_to_their_account() {
+    let app = test_app().await;
+    let admin_token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+
+    let pin_response = request(
+        &app,
+        "POST",
+        &format!("/api/users/{ADMIN_USERNAME}/guild"),
+        Some(&admin_token),
+        Some(json!({ "guild_id": "111" })),
+    )
+    .await;
+    assert_eq!(pin_response.status(), StatusCode::NO_CONTENT);
+
+    // Rescoping an account drops its sessions, so this is a fresh login.
+    let admin_token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should still succeed after being rescoped");
+
+    let other_guild = request(
+        &app,
+        "GET",
+        "/api/guilds/222/now-playing",
+        Some(&admin_token),
+        None,
+    )
+    .await;
+    assert_eq!(other_guild.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn rescoping_a_user_revokes_the_session_that_still_carries_the_old_guild() {
+    let app = test_app().await;
+    let admin_token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+
+    let create_response = request(
+        &app,
+        "POST",
+        "/api/users",
+        Some(&admin_token),
+        Some(json!({ "username": "rescoped", "password": "rescoped-pw" })),
+    )
+    .await;
+    assert_eq!(create_response.status(), StatusCode::OK);
+
+    let stale_token = login(&app, "rescoped", "rescoped-pw")
+        .await
+        .expect("the new user should be able to log in");
+    let before = request(
+        &app,
+        "GET",
+        "/api/guilds/222/now-playing",
+        Some(&stale_token),
+        None,
+    )
+    .await;
+    assert_eq!(before.status(), StatusCode::OK);
+
+    let pin_response = request(
+        &app,
+        "POST",
+        "/api/users/rescoped/guild",
+        Some(&admin_token),
+        Some(json!({ "guild_id": "111" })),
+    )
+    .await;
+    assert_eq!(pin_response.status(), StatusCode::NO_CONTENT);
+
+    let after = request(
+        &app,
+        "GET",
+        "/api/guilds/222/now-playing",
+        Some(&stale_token),
+        None,
+    )
+    .await;
+    assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+}

@@ -71,11 +71,12 @@
   #login-screen .brand { justify-content: center; margin-bottom: var(--space-7); }
   .field { display: flex; flex-direction: column; gap: var(--space-1-5); margin-bottom: var(--space-3-5); }
   .field label { font-size: 12px; color: var(--text-muted); }
-  .field input {
+  .field input, .field select {
     background: var(--bg-elevated); border: 1px solid var(--border-soft); border-radius: 10px;
     padding: var(--space-3) var(--space-3-5); color: var(--text); font-size: 14px; outline: none;
   }
-  .field input:focus { border-color: var(--accent); }
+  .field input:focus, .field select:focus { border-color: var(--accent); }
+  .field select { cursor: pointer; }
   .form-error { color: var(--danger); font-size: 13px; min-height: 18px; margin-bottom: var(--space-2); }
   .checkbox-field { display: flex; align-items: center; gap: var(--space-2); font-size: 13px; color: var(--text-muted); margin-bottom: var(--space-3-5); cursor: pointer; }
   .checkbox-field input { width: 15px; height: 15px; accent-color: var(--accent); }
@@ -352,7 +353,7 @@
     border-width: 0;
   }
   .compact-row.queue-row { grid-template-columns: 18px 34px 1fr auto auto; }
-  .compact-row.user-row { grid-template-columns: 1fr auto auto auto auto; }
+  .compact-row.user-row { grid-template-columns: 1fr auto auto auto auto auto; }
   .admin-badge { font-size: 11px; font-weight: 700; letter-spacing: .02em; color: var(--accent); background: color-mix(in oklch, var(--accent) 16%, transparent); padding: var(--space-0-5) var(--space-2-5); border-radius: 999px; }
   .compact-row.now-playing-row { background: color-mix(in oklch, var(--accent) 13%, transparent); }
   .compact-row.now-playing-row:hover { background: color-mix(in oklch, var(--accent) 18%, transparent); }
@@ -676,6 +677,10 @@
       <label for="new-user-password">Password</label>
       <input id="new-user-password" type="password" autocomplete="new-password">
     </div>
+    <div class="field">
+      <label for="new-user-guild">Server access</label>
+      <select id="new-user-guild"></select>
+    </div>
     <label class="checkbox-field"><input type="checkbox" id="new-user-is-admin"> Can manage users</label>
     <div class="form-error" id="add-user-error"></div>
     <div class="modal-actions">
@@ -713,6 +718,22 @@
     <div class="modal-actions">
       <button class="ghost-btn" id="rename-user-cancel" type="button">Cancel</button>
       <button class="primary-btn small" id="rename-user-submit" type="button">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="assign-guild-modal-overlay">
+  <div class="modal-card">
+    <h3 class="modal-title">Server access</h3>
+    <p class="modal-subtext" id="assign-guild-subtext"></p>
+    <div class="field">
+      <label for="assign-guild-select">Server</label>
+      <select id="assign-guild-select"></select>
+    </div>
+    <div class="form-error" id="assign-guild-error"></div>
+    <div class="modal-actions">
+      <button class="ghost-btn" id="assign-guild-cancel" type="button">Cancel</button>
+      <button class="primary-btn small" id="assign-guild-submit" type="button">Save</button>
     </div>
   </div>
 </div>
@@ -1188,6 +1209,7 @@
   const REFRESH_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>';
   const EDIT_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
   const USER_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
+  const SERVER_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg>';
 
   function makeMiniIconBtn(iconSvg, title, disabled, danger) {
     const btn = document.createElement('button');
@@ -2293,11 +2315,19 @@
     const title = document.createElement('div');
     title.className = 'compact-title';
     meta.appendChild(title);
+    const scope = document.createElement('div');
+    scope.className = 'compact-channel user-scope';
+    meta.appendChild(scope);
     row.appendChild(meta);
 
     const badge = document.createElement('div');
     badge.className = 'admin-badge';
     row.appendChild(badge);
+
+    const guildBtn = makeMiniIconBtn(SERVER_ICON, 'Server access', false, false);
+    guildBtn.classList.add('user-guild-btn');
+    guildBtn.addEventListener('click', () => openAssignGuildModal(row._username, row._guildId));
+    row.appendChild(guildBtn);
 
     const renameBtn = makeMiniIconBtn(USER_ICON, 'Rename user', false, false);
     renameBtn.classList.add('rename-user-btn');
@@ -2353,7 +2383,42 @@
         ? "You can't delete your own account"
         : 'Delete user';
 
+    // Admins reach every server regardless of what's stored against them, so
+    // the row says so rather than showing a pin that isn't being enforced —
+    // see web::auth::CurrentUser::may_access_guild.
+    row.querySelector('.user-scope').textContent = user.is_admin
+      ? 'All servers'
+      : guildLabel(user.guild_id);
+
     row._username = user.username;
+    row._guildId = user.guild_id || null;
+  }
+
+  // The server a user is pinned to, by name where the bot still knows it —
+  // an id the cache has no guild for (the bot was removed from it, say)
+  // falls back to the raw id so the row still says something true.
+  function guildLabel(guildId) {
+    if (!guildId) return 'All servers';
+    const guild = guilds.find((g) => g.id === guildId);
+    return guild ? guild.name : `Server ${guildId}`;
+  }
+
+  // "All servers" plus every guild this dashboard can see. An admin editing
+  // someone pinned to a guild the admin themselves can't see would drop that
+  // pin silently, so the current value is always included as an option.
+  function fillGuildSelect(select, selectedId) {
+    select.innerHTML = '';
+    const options = [{ id: '', name: 'All servers' }, ...guilds];
+    if (selectedId && !guilds.some((g) => g.id === selectedId)) {
+      options.push({ id: selectedId, name: guildLabel(selectedId) });
+    }
+    for (const option of options) {
+      const el = document.createElement('option');
+      el.value = option.id;
+      el.textContent = option.name;
+      select.appendChild(el);
+    }
+    select.value = selectedId || '';
   }
 
   async function loadUsers() {
@@ -2385,6 +2450,7 @@
   const addUserUsernameInput = document.getElementById('new-user-username');
   const addUserPasswordInput = document.getElementById('new-user-password');
   const addUserIsAdminInput = document.getElementById('new-user-is-admin');
+  const addUserGuildSelect = document.getElementById('new-user-guild');
   const addUserError = document.getElementById('add-user-error');
   const addUserSubmitBtn = document.getElementById('add-user-submit');
 
@@ -2392,6 +2458,7 @@
     addUserUsernameInput.value = '';
     addUserPasswordInput.value = '';
     addUserIsAdminInput.checked = false;
+    fillGuildSelect(addUserGuildSelect, '');
     addUserError.textContent = '';
     addUserModalOverlay.classList.add('open');
     addUserUsernameInput.focus();
@@ -2414,7 +2481,12 @@
       const response = await api('/api/users', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password, is_admin: addUserIsAdminInput.checked }),
+        body: JSON.stringify({
+          username,
+          password,
+          is_admin: addUserIsAdminInput.checked,
+          guild_id: addUserGuildSelect.value || null,
+        }),
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -2576,6 +2648,67 @@
   });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && renameUserModalOverlay.classList.contains('open')) closeRenameUserModal();
+  });
+
+  const assignGuildModalOverlay = document.getElementById('assign-guild-modal-overlay');
+  const assignGuildSubtext = document.getElementById('assign-guild-subtext');
+  const assignGuildSelect = document.getElementById('assign-guild-select');
+  const assignGuildError = document.getElementById('assign-guild-error');
+  const assignGuildSubmitBtn = document.getElementById('assign-guild-submit');
+  let assignGuildUsername = null;
+
+  function openAssignGuildModal(username, guildId) {
+    assignGuildUsername = username;
+    fillGuildSelect(assignGuildSelect, guildId || '');
+    assignGuildError.textContent = '';
+    assignGuildSubtext.textContent = `Choose which server "${username}" can see and control. Users who can manage users always reach every server.`;
+    assignGuildModalOverlay.classList.add('open');
+    assignGuildSelect.focus();
+  }
+
+  function closeAssignGuildModal() {
+    assignGuildModalOverlay.classList.remove('open');
+    assignGuildUsername = null;
+  }
+
+  async function submitAssignGuild() {
+    const username = assignGuildUsername;
+    const guildId = assignGuildSelect.value || null;
+    assignGuildError.textContent = '';
+    setButtonBusy(assignGuildSubmitBtn, true);
+    try {
+      const response = await api(`/api/users/${encodeURIComponent(username)}/guild`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ guild_id: guildId }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        assignGuildError.textContent = body.error || 'Could not change that server access.';
+        return;
+      }
+      closeAssignGuildModal();
+      // The server drops every session for the account it just rescoped, so
+      // a change to your own account has already invalidated this tab.
+      if (currentUser && username === currentUser.username) {
+        showLogin('Your server access changed — please sign in again.');
+        return;
+      }
+      showStatus(`"${username}" can now reach ${guildId ? guildLabel(guildId) : 'all servers'}.`);
+      loadUsers();
+    } catch (err) { /* showLogin already handled unauthorized */
+    } finally {
+      setButtonBusy(assignGuildSubmitBtn, false);
+    }
+  }
+
+  document.getElementById('assign-guild-cancel').addEventListener('click', closeAssignGuildModal);
+  assignGuildModalOverlay.addEventListener('click', (event) => {
+    if (event.target === assignGuildModalOverlay) closeAssignGuildModal();
+  });
+  assignGuildSubmitBtn.addEventListener('click', submitAssignGuild);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && assignGuildModalOverlay.classList.contains('open')) closeAssignGuildModal();
   });
 
   if (token) {

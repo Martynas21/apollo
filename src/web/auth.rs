@@ -52,6 +52,27 @@ pub struct CurrentUser {
     /// The single env-bootstrapped account — the only one allowed to change
     /// another user's password (see `web::users::set_password`).
     pub is_root: bool,
+    /// The one guild this account is confined to, or `None` for every guild
+    /// the bot is in. Only meaningful for non-admins — see
+    /// [`CurrentUser::may_access_guild`].
+    pub guild_id: Option<String>,
+}
+
+impl CurrentUser {
+    /// Whether this account may see and control `guild_id`. Admins reach
+    /// every guild, as does anyone with no guild pinned; everyone else is
+    /// confined to the single guild recorded on their account.
+    ///
+    /// Admins are exempt because they can reassign this field on any account
+    /// including their own (see `web::users::set_guild`), so enforcing it
+    /// against them would describe a boundary they could lift at will.
+    pub fn may_access_guild(&self, guild_id: &str) -> bool {
+        self.is_admin
+            || self
+                .guild_id
+                .as_deref()
+                .is_none_or(|pinned| pinned == guild_id)
+    }
 }
 
 /// The bearer token behind a validated session, inserted into request
@@ -256,7 +277,7 @@ pub async fn bootstrap_user_if_needed(
         return Ok(());
     };
     let hash = hash_password(password)?;
-    db::insert_user(db, username, &hash, true, true).await?;
+    db::insert_user(db, username, &hash, true, true, None).await?;
     tracing::info!(username, "bootstrapped the initial dashboard admin");
     Ok(())
 }
@@ -292,6 +313,7 @@ pub async fn verify_login(
             username: username.to_string(),
             is_admin: creds.is_admin,
             is_root: creds.is_root,
+            guild_id: creds.guild_id,
         }),
     )
 }
@@ -337,6 +359,33 @@ pub async fn require_session(
     Ok(next.run(request).await)
 }
 
+/// The guild a `/api/guilds/{guild_id}/...` path is addressing, or `None`
+/// for any other path.
+fn guild_id_from_path(path: &str) -> Option<&str> {
+    path.strip_prefix("/api/guilds/")?
+        .split('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+}
+
+/// Confines a guild-pinned account to its own guild. Paths outside
+/// `/api/guilds/{guild_id}/...` address no guild and pass straight through,
+/// so a guild-scoped route has to live under that prefix to be covered here.
+///
+/// Must run after [`require_session`], which puts the [`CurrentUser`] this
+/// reads into the request's extensions.
+pub async fn require_guild_access(request: Request, next: Next) -> Result<Response, StatusCode> {
+    let guild_id = guild_id_from_path(request.uri().path()).map(str::to_string);
+    let Some(guild_id) = guild_id else {
+        return Ok(next.run(request).await);
+    };
+    match request.extensions().get::<CurrentUser>() {
+        Some(user) if user.may_access_guild(&guild_id) => Ok(next.run(request).await),
+        Some(_) => Err(StatusCode::FORBIDDEN),
+        None => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
 /// Must run after [`require_session`] on the same route (which puts the
 /// [`CurrentUser`] extension in place) — see the merge-then-`route_layer`
 /// ordering in `web::serve`.
@@ -377,6 +426,7 @@ mod tests {
             username: "admin".to_string(),
             is_admin: true,
             is_root: true,
+            guild_id: None,
         });
         let user = sessions.get(&token).expect("session should be valid");
         assert_eq!(user.username, "admin");
@@ -397,6 +447,7 @@ mod tests {
             username: "old-name".to_string(),
             is_admin: true,
             is_root: false,
+            guild_id: None,
         });
 
         sessions.rename("old-name", "new-name");
@@ -413,6 +464,7 @@ mod tests {
             username: "someone-else".to_string(),
             is_admin: false,
             is_root: false,
+            guild_id: None,
         });
 
         sessions.rename("old-name", "new-name");
@@ -433,6 +485,7 @@ mod tests {
             username: "alice".to_string(),
             is_admin: false,
             is_root: false,
+            guild_id: None,
         });
 
         sessions.revoke_user("alice");
@@ -447,11 +500,13 @@ mod tests {
             username: "alice".to_string(),
             is_admin: false,
             is_root: false,
+            guild_id: None,
         });
         let bob_token = sessions.issue(CurrentUser {
             username: "bob".to_string(),
             is_admin: false,
             is_root: false,
+            guild_id: None,
         });
 
         sessions.revoke_user("alice");
@@ -473,11 +528,13 @@ mod tests {
             username: "alice".to_string(),
             is_admin: false,
             is_root: false,
+            guild_id: None,
         });
         let second_token = sessions.issue(CurrentUser {
             username: "alice".to_string(),
             is_admin: false,
             is_root: false,
+            guild_id: None,
         });
 
         sessions.revoke_token(&first_token);
@@ -546,7 +603,7 @@ mod tests {
     -> anyhow::Result<()> {
         let pool = db::connect("sqlite::memory:").await?;
         let hash = hash_password("hunter2")?;
-        db::insert_user(&pool, "listener", &hash, false, false).await?;
+        db::insert_user(&pool, "listener", &hash, false, false, None).await?;
 
         let user = verify_login(&pool, "listener", "hunter2")
             .await?

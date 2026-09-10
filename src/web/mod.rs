@@ -60,7 +60,9 @@ pub fn router(state: WebState) -> Router {
     // caller's identity into the request's extensions, so it's layered onto
     // `admin_routes()` alone before that merges into `protected` — the
     // outer `route_layer(require_session)` below then wraps the whole
-    // merged router, running first on every request.
+    // merged router, running first on every request. `require_guild_access`
+    // reads that same identity, so it's layered inside `require_session`
+    // too, where it covers every guild-scoped route in one place.
     let admin_only = routes::users::admin_routes().route_layer(from_fn(auth::require_admin));
 
     let protected = routes::guilds::routes()
@@ -71,6 +73,7 @@ pub fn router(state: WebState) -> Router {
         .merge(routes::favourites::routes())
         .merge(routes::users::routes())
         .merge(admin_only)
+        .route_layer(from_fn(auth::require_guild_access))
         .route_layer(from_fn_with_state(state.clone(), auth::require_session));
 
     let public = Router::new()

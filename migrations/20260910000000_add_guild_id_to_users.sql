@@ -1,0 +1,12 @@
+-- Optionally pins an account to a single guild: when set, that user only
+-- sees and controls that one guild from the dashboard. NULL means every
+-- guild the bot is in, which is what accounts without an assignment get.
+--
+-- Enforced for non-admins only (see `web::auth::CurrentUser::may_access_guild`).
+-- Admins can create accounts and reassign this column, so binding one to a
+-- guild would be a display preference rather than a boundary they couldn't
+-- lift themselves.
+--
+-- TEXT for the same reason as guild_settings.guild_id: Discord snowflakes
+-- can exceed i64::MAX.
+ALTER TABLE users ADD COLUMN guild_id TEXT;

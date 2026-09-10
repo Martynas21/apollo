@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serenity::all::ChannelType;
 
 use crate::web::WebState;
+use crate::web::auth::CurrentUser;
 use crate::web::response::{error_response, parse_channel_id, parse_guild_id};
 use crate::web::routes::playback::respond_after;
 
@@ -27,11 +28,17 @@ struct GuildJson {
     name: String,
 }
 
-async fn list_guilds(State(state): State<WebState>) -> Response {
+/// Only the guilds the caller may reach, so the dashboard's server switcher
+/// never offers one that `require_guild_access` would then refuse.
+async fn list_guilds(
+    State(state): State<WebState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
     let guilds: Vec<GuildJson> = state
         .cache
         .guilds()
         .into_iter()
+        .filter(|id| user.may_access_guild(&id.to_string()))
         .filter_map(|id| {
             state.cache.guild(id).map(|guild| GuildJson {
                 id: id.to_string(),
