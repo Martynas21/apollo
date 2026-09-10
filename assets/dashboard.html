@@ -209,7 +209,7 @@
   .library-area {
     grid-area: library; min-height: 0;
     display: grid; gap: var(--gap);
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
   }
   .card {
     background: var(--bg-elevated); border: 1px solid var(--border-soft);
@@ -356,15 +356,20 @@
   .search-bar.loading .search-icon { display: none; }
   .search-bar.loading .search-spinner { display: block; }
   .search-loading-note { display: flex; align-items: center; gap: var(--space-2); }
-  .scroll-list { display: flex; flex-direction: column; gap: var(--space-1-5); max-height: 178px; overflow-y: auto; overflow-x: hidden; padding-right: var(--space-2-5); }
+  .scroll-list { display: flex; flex-direction: column; gap: var(--space-1-5); max-height: clamp(160px, 26vh, 280px); overflow-y: auto; overflow-x: hidden; padding-right: var(--space-2-5); }
   .list-panel {
     background: var(--bg); border: 1px solid var(--border-soft); border-radius: 12px; padding: var(--space-2);
   }
   .list-panel .scroll-list { padding-right: var(--space-1); }
   .queue-card .list-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  /* One row shape for the queue, search results, favourites and users. The
+     leading handle/indicator and the trailing badge/actions are optional,
+     which is why this is flex rather than grid: a grid needs a column count
+     per variant, and its empty tracks still cost a gap. Each row is its own
+     container either way, so nothing aligns across rows to lose. */
   .compact-row {
     position: relative;
-    display: grid; grid-template-columns: 34px 1fr auto auto; gap: var(--space-2-5); align-items: center; padding: var(--space-2); border-radius: 9px;
+    display: flex; gap: var(--space-2-5); align-items: center; padding: var(--space-2); border-radius: 9px;
     background: var(--bg); border: 1px solid var(--border-soft);
     overflow: hidden;
     flex-shrink: 0;
@@ -379,9 +384,7 @@
     opacity: 0; max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; margin-bottom: 0;
     border-width: 0;
   }
-  .compact-row.queue-row { grid-template-columns: 18px 34px 1fr auto auto; }
-  .compact-row.user-row { grid-template-columns: 1fr auto auto auto auto auto; }
-  .admin-badge { font-size: 11px; font-weight: 700; letter-spacing: .02em; color: var(--accent); background: color-mix(in oklch, var(--accent) 16%, transparent); padding: var(--space-0-5) var(--space-2-5); border-radius: 999px; }
+  .admin-badge { flex: none; font-size: 11px; font-weight: 700; letter-spacing: .02em; color: var(--accent); background: color-mix(in oklch, var(--accent) 16%, transparent); padding: var(--space-0-5) var(--space-2-5); border-radius: 999px; }
   .compact-row.now-playing-row { background: color-mix(in oklch, var(--accent) 13%, transparent); }
   .compact-row.now-playing-row:hover { background: color-mix(in oklch, var(--accent) 18%, transparent); }
   .compact-row.now-playing-row .compact-title { color: var(--accent); }
@@ -412,12 +415,12 @@
   .drag-handle:active { cursor: grabbing; }
   .compact-thumb { width: 34px; height: 34px; border-radius: 7px; flex-shrink: 0; position: relative; overflow: hidden; }
   .compact-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-  .compact-meta { min-width: 0; }
+  .compact-meta { min-width: 0; flex: 1; }
   .compact-title-line { display: flex; align-items: center; gap: var(--space-1-5); }
   .compact-title { font-size: 12.5px; color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .compact-channel { font-size: 11.5px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .compact-duration { font-size: 11px; color: var(--text-faint); }
-  .compact-actions { display: flex; gap: var(--space-1); }
+  .compact-duration { flex: none; font-size: 11px; color: var(--text-faint); }
+  .compact-actions { flex: none; display: flex; gap: var(--space-1); }
   .mini-icon-btn { width: 24px; height: 24px; border-radius: 6px; background: var(--bg); border: 1px solid var(--border-soft); display: flex; align-items: center; justify-content: center; color: var(--text-muted); }
   .mini-icon-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border); }
   .mini-icon-btn.danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
@@ -427,12 +430,22 @@
   }
   .outline-btn:hover { background: color-mix(in oklch, var(--accent) 15%, transparent); }
   .muted-note { font-size: 12.5px; color: var(--text-faint); margin: var(--space-1-5) var(--space-0-5); }
-
   /* Favourites cards */
-  #favourite-tracks { max-height: 226px; }
+  /* The users page is a single card, so its list takes the height the page
+     has rather than a fixed cap that leaves the card half empty. */
+  #page-users .card { flex: 1; min-height: 0; }
+  #page-users .list-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  #users-list { flex: 1; min-height: 0; max-height: none; }
 
   /* Playlists bottom strip */
-  .playlist-row { display: flex; gap: var(--space-4); overflow-x: auto; padding-bottom: var(--space-1); }
+  /* A slimmer scrollbar than the page-wide one: at 18px it dominated a strip
+     only a little taller than the chips it scrolls. */
+  .playlist-row {
+    display: flex; gap: var(--space-4); overflow-x: auto;
+    padding-bottom: var(--space-2); scrollbar-width: thin;
+  }
+  .playlist-row::-webkit-scrollbar { height: 8px; }
+  .playlist-row::-webkit-scrollbar-thumb { border-width: 2px; }
   .playlist-chip {
     flex: 0 0 148px; min-width: 0; display: flex; flex-direction: column; gap: var(--space-2);
     background: var(--bg); border: 1px solid var(--border-soft); border-radius: 14px; padding: var(--space-3);
@@ -501,10 +514,15 @@
      Two columns while there's room for them, one below 900, and a compact
      phone layout below 600 where the transport detaches to the bottom. */
   @media (min-width: 1200px) {
-    /* Only the two-column layout has spare vertical space to hand out. */
-    .library-area { height: 100%; }
-    .library-area .card { min-height: 0; }
-    .library-area .scroll-list { flex: 1; min-height: 0; max-height: none; }
+    /* Only the two-column layout has spare vertical space to hand out. The
+       band scrolls rather than growing, so the queue beside it keeps the
+       full height of the shell. */
+    /* Two cards per row rather than three: at three a card is ~270px and the
+       title loses its space fight with the thumbnail, duration and button.
+       The cards keep their natural height and the band scrolls, so a short
+       band never squeezes a card down to one visible row — the queue beside
+       it still gets the full height of the shell. */
+    .library-area { height: 100%; overflow-y: auto; align-content: start; }
   }
   /* Below this the two columns can't both breathe: the queue drops under
      360px, which costs more in truncated titles than the side-by-side
@@ -532,8 +550,9 @@
   }
   @media (max-width: 600px) {
     .topbar { flex-wrap: wrap; padding: var(--space-3) var(--shell-pad-x); gap: var(--space-2-5); }
+    /* The search bar takes its own row; the nav stays put, since hiding it
+       leaves no way back from the Users page. */
     .topbar-search { order: 3; flex-basis: 100%; margin: 0; max-width: none; }
-    .topbar-nav { display: none; }
     .card { padding: var(--space-4); border-radius: 14px; }
     .np-hero { gap: var(--space-4); }
     .np-art { width: 88px; height: 88px; }
@@ -2253,11 +2272,16 @@
   const favouritePlaylistsRow = document.getElementById('favourite-playlists');
   const favouritePlaylistsEmptyNote = document.getElementById('favourite-playlists-empty-note');
 
-  function applyFavouriteDuration(row, track) {
-    const durationEl = row.querySelector('.compact-duration');
-    const base = formatDuration(track.duration_secs);
+  // The play count rides in the row's sub-line next to the channel rather
+  // than in the duration slot: these cards are narrow, and a combined
+  // "4:14 · played 40×" there takes the width from the title, which matters
+  // more than either.
+  function applyFavouritePlayCount(row, track) {
+    const channelEl = row.querySelector('.compact-channel');
     const playCountText = `played ${track.play_count}×`;
-    durationEl.textContent = base ? `${base} · ${playCountText}` : playCountText;
+    channelEl.textContent = track.channel
+      ? `${track.channel} · ${playCountText}`
+      : playCountText;
   }
 
   function createFavouriteTrackRow(track) {
@@ -2274,7 +2298,7 @@
 
   function updateFavouriteTrackRow(row, track) {
     updateTrackRowContent(row, track);
-    applyFavouriteDuration(row, track);
+    applyFavouritePlayCount(row, track);
     row._videoId = track.video_id;
     row._title = track.title;
   }
