@@ -247,6 +247,11 @@
   .np-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--space-1-5); transition: opacity .15s ease; }
   .np-info.np-fade-out { opacity: 0; }
   .eyebrow { font-size: 11.5px; font-weight: 700; letter-spacing: .12em; color: var(--accent); text-transform: uppercase; }
+  /* The snapshot feed has gone quiet: say so on the eyebrow and dim the
+     frozen progress fill so the card reads as "last known", not live. */
+  .snapshot-stale #np-eyebrow::after { content: ' · no updates'; color: var(--text-faint); animation: stale-blink 1.6s ease-in-out infinite; }
+  .snapshot-stale .np-progress-fill { opacity: .45; }
+  @keyframes stale-blink { 50% { opacity: .35; } }
   .np-title { font-family: 'Spectral', serif; font-size: 25px; font-weight: 600; margin: 0; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .np-channel { font-size: 14px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .np-duration { font-size: 12px; color: var(--text-faint); }
@@ -860,6 +865,15 @@
   let currentGuildId = null;
   let guilds = [];
   let socket = null;
+  const SOCKET_RETRY_MIN_MS = 1000;
+  const SOCKET_RETRY_MAX_MS = 10000;
+  // Three missed pushes of the 1.5 s snapshot feed.
+  const SNAPSHOT_STALE_MS = 5000;
+  const STALE_STATUS_MESSAGE = 'No update from the bot for a few seconds — waiting for it to answer.';
+  let socketRetryTimer = null;
+  let socketRetryDelay = SOCKET_RETRY_MIN_MS;
+  let staleTimer = null;
+  let progressFrozen = false;
   let volumeDebounce = null;
   let searchDebounce = null;
   let searchSeq = 0;
@@ -916,7 +930,7 @@
   function showLogin(message) {
     token = null;
     sessionStorage.removeItem(TOKEN_KEY);
-    if (socket) { socket.close(); socket = null; }
+    closeSocket();
     loginScreen.style.display = 'block';
     dashboard.style.display = 'none';
     loginError.textContent = message || '';
@@ -1074,6 +1088,7 @@
     const guild = guilds.find((g) => g.id === guildId);
     if (guild) updateServerButton(guild);
     renderServerMenu();
+    closeSocket();
     connectSocket(guildId);
     clearSearch();
     closeJoinModal();
@@ -1081,15 +1096,87 @@
     loadFavourites(guildId);
   }
 
+  // Tears the feed down completely: the socket, any pending reconnect and
+  // the stale-feed timer, so nothing fires again until the next connect.
+  function closeSocket() {
+    clearTimeout(socketRetryTimer);
+    socketRetryTimer = null;
+    clearTimeout(staleTimer);
+    staleTimer = null;
+    if (socket) { socket.close(); socket = null; }
+    setSnapshotStale(false);
+  }
+
+  // Replaces the socket only: the stale-feed timer keeps running across
+  // reconnect attempts, so an outage is flagged even while the feed is
+  // still trying to come back.
   function connectSocket(guildId) {
-    if (socket) socket.close();
+    clearTimeout(socketRetryTimer);
+    socketRetryTimer = null;
+    if (socket) { socket.close(); socket = null; }
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    socket = new WebSocket(`${protocol}//${location.host}/api/guilds/${guildId}/ws?token=${encodeURIComponent(token)}`);
-    socket.addEventListener('message', (event) => {
+    const ws = new WebSocket(`${protocol}//${location.host}/api/guilds/${guildId}/ws?token=${encodeURIComponent(token)}`);
+    socket = ws;
+    let opened = false;
+    ws.addEventListener('open', () => { opened = true; socketRetryDelay = SOCKET_RETRY_MIN_MS; });
+    ws.addEventListener('message', (event) => {
       try {
         renderSnapshot(JSON.parse(event.data));
       } catch (err) { /* ignore malformed frame */ }
     });
+    // A feed that drops (bot restart, network blip) comes back on its own
+    // with a growing delay, unless this socket was already replaced or the
+    // user signed out in the meantime.
+    ws.addEventListener('close', () => {
+      if (socket !== ws) return;
+      socket = null;
+      if (!token || currentGuildId !== guildId) return;
+      if (!staleTimer) staleTimer = setTimeout(() => setSnapshotStale(true), SNAPSHOT_STALE_MS);
+      socketRetryTimer = setTimeout(() => retrySocket(guildId, opened), socketRetryDelay);
+      socketRetryDelay = Math.min(socketRetryDelay * 2, SOCKET_RETRY_MAX_MS);
+    });
+  }
+
+  // A handshake the server refuses only shows up as a close, so a socket
+  // that never opened is preceded by a plain request: a revoked session
+  // lands on the sign-in screen there instead of retrying forever, while
+  // a bot that is merely down keeps the retries going.
+  async function retrySocket(guildId, hadOpened) {
+    socketRetryTimer = null;
+    if (!hadOpened) {
+      try {
+        await api('/api/guilds');
+      } catch (err) {
+        if (err.message === 'unauthorized') return;
+      }
+    }
+    if (!token || currentGuildId !== guildId || socket) return;
+    connectSocket(guildId);
+  }
+
+  // Flags the now-playing card as running on stale data once the snapshot
+  // feed goes quiet, and pins the progress bar where it is so it stops
+  // sailing on to 100% with nothing behind it.
+  function setSnapshotStale(stale) {
+    if (stale === dashboard.classList.contains('snapshot-stale')) return;
+    dashboard.classList.toggle('snapshot-stale', stale);
+    if (stale) {
+      freezeProgress();
+      showStatus(STALE_STATUS_MESSAGE, { isError: true });
+    } else if (statusLine.textContent === STALE_STATUS_MESSAGE) {
+      showStatus('');
+    }
+  }
+
+  // Reading the computed width forces a layout, so the bar is only pinned
+  // once per outage; the next real position unfreezes it.
+  function freezeProgress() {
+    if (progressFrozen) return;
+    progressFrozen = true;
+    const fill = document.getElementById('np-progress-fill');
+    const width = getComputedStyle(fill).width;
+    fill.style.transition = 'none';
+    fill.style.width = width;
   }
 
   const STATE_LABELS = {
@@ -1628,12 +1715,21 @@
     const fill = document.getElementById('np-progress-fill');
     const elapsedEl = document.getElementById('np-elapsed');
     const duration = snapshot.track ? snapshot.track.duration_secs : null;
-    const showProgress = !!snapshot.track && duration != null && snapshot.position_ms != null;
+    const hasBar = !!snapshot.track && duration != null;
+    const live = snapshot.state === 'playing' || snapshot.state === 'paused';
+    if (hasBar && live && snapshot.position_ms == null) {
+      // The bot has a track but couldn't say where it is (the audio worker
+      // didn't answer in time): keep the bar up and hold it in place.
+      freezeProgress();
+      return;
+    }
+    const showProgress = hasBar && snapshot.position_ms != null;
     wrap.style.display = showProgress ? 'flex' : 'none';
     if (!showProgress) return;
 
     const positionSecs = Math.min(snapshot.position_ms / 1000, duration);
     elapsedEl.textContent = formatDuration(positionSecs);
+    progressFrozen = false;
     fill.style.transition = 'none';
     fill.style.width = `${duration > 0 ? (positionSecs / duration) * 100 : 0}%`;
     if (snapshot.state === 'playing') {
@@ -1654,6 +1750,9 @@
   }
 
   function renderSnapshot(snapshot) {
+    setSnapshotStale(false);
+    clearTimeout(staleTimer);
+    staleTimer = setTimeout(() => setSnapshotStale(true), SNAPSHOT_STALE_MS);
     const playingVideoId = snapshot.track ? snapshot.track.video_id : null;
     const trackChanged = playingVideoId !== lastSeenPlayingVideoId;
     if (snapshot.state === 'playing' && trackChanged) {
