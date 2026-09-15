@@ -10,7 +10,7 @@ use crate::db;
 use crate::model::{QueuedTrack, Track};
 use crate::voice::radio;
 use crate::voice::registry::PlayerRegistry;
-use crate::voice::state::AdvanceFill;
+use crate::voice::state::{AdvanceFill, Promotion};
 
 const RADIO_REFILL_BATCH: usize = 4;
 
@@ -157,22 +157,16 @@ impl PlayerRegistry {
         }
     }
 
-    async fn kick_off_if_idle(&self, guild_id: GuildId) {
-        let idle = {
-            let guilds = self.guilds.lock().await;
-            guilds
-                .get(&guild_id)
-                .is_some_and(|state| state.now_playing.is_none())
-        };
-        if !idle {
-            return;
-        }
+    pub(super) async fn kick_off_if_idle(&self, guild_id: GuildId) {
         let Some(call) = self.voice.call(guild_id) else {
             return;
         };
-        match self.promote_next(guild_id).await {
-            Some((queued, epoch)) => self.spawn_start_sequence(guild_id, call, queued, epoch, None),
-            None => self.schedule_idle_disconnect(guild_id),
+        match self.promote_next_if_idle(guild_id).await {
+            Promotion::Track(queued, epoch) => {
+                self.spawn_start_sequence(guild_id, call, queued, epoch, None, false)
+            }
+            Promotion::QueueEmpty => self.schedule_idle_disconnect(guild_id),
+            Promotion::Busy => {}
         }
     }
 
@@ -310,7 +304,9 @@ mod tests {
     use serenity::all::ChannelId;
 
     use super::*;
-    use crate::voice::testing::{current_track_id, joined_registry, new_registry, queued};
+    use crate::voice::testing::{
+        current_track_id, joined_registry, new_registry, queued, upcoming_ids,
+    };
 
     #[test]
     fn empty_history_yields_no_seed() {
@@ -371,6 +367,28 @@ mod tests {
         assert_eq!(call.played_video_ids(), vec!["a", "b"]);
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(snapshot.now_playing.unwrap().track.video_id, "b");
+    }
+
+    #[tokio::test]
+    async fn concurrent_kick_offs_start_only_one_track() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        for id in ["a", "b"] {
+            db::queue_push_back(&registry.db, &guild_id.to_string(), &queued(id))
+                .await
+                .unwrap();
+        }
+
+        tokio::join!(
+            registry.kick_off_if_idle(guild_id),
+            registry.kick_off_if_idle(guild_id),
+        );
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["b"]);
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
     }
 
     #[tokio::test]

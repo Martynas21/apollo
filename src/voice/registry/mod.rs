@@ -11,17 +11,23 @@ use crate::db;
 use crate::model::{QueuedTrack, Track};
 use crate::voice::backend::{AudioSource, VoiceBackend, VoiceEvents};
 use crate::voice::resolve::PlaybackError;
-use crate::voice::state::GuildState;
+use crate::voice::state::{GuildState, Promotion, TrackOutcome};
 use crate::youtube::api::YouTubeClient;
 
 mod playback;
 mod queue;
 mod radio;
+mod recovery;
 mod session;
+mod watchdog;
 
 pub(super) type Prefetch = JoinHandle<Result<AudioSource, PlaybackError>>;
 
 const IDLE_DISCONNECT: Duration = Duration::from_secs(150);
+
+/// Stream URLs from yt-dlp are good for a few hours; a prefetch older than
+/// this is resolved again rather than handed to the worker and refused.
+const PREFETCH_MAX_AGE: Duration = Duration::from_hours(1);
 
 fn discard_prefetch(prefetch: Prefetch) {
     prefetch.abort();
@@ -43,12 +49,30 @@ pub struct PlayerRegistry {
     pub(super) db: sqlx::SqlitePool,
     pub(super) youtube: YouTubeClient,
     pub(super) guilds: Arc<Mutex<HashMap<GuildId, GuildState>>>,
+    pub(super) stall_timing: watchdog::StallTiming,
+    pub(super) prefetch_max_age: Duration,
 }
 
 #[async_trait::async_trait]
 impl VoiceEvents for PlayerRegistry {
     async fn track_finished(&self, guild_id: GuildId, track_id: Uuid) {
-        self.advance(guild_id, track_id).await;
+        self.apply_track_outcome(guild_id, track_id, TrackOutcome::Finished)
+            .await;
+    }
+
+    async fn track_errored(
+        &self,
+        guild_id: GuildId,
+        track_id: Uuid,
+        position: Duration,
+        error: String,
+    ) {
+        self.apply_track_outcome(
+            guild_id,
+            track_id,
+            TrackOutcome::Errored { position, error },
+        )
+        .await;
     }
 
     async fn connection_lost(&self, guild_id: GuildId) {
@@ -71,6 +95,8 @@ impl PlayerRegistry {
             db,
             youtube,
             guilds: Arc::new(Mutex::new(HashMap::new())),
+            stall_timing: watchdog::STALL_TIMING,
+            prefetch_max_age: PREFETCH_MAX_AGE,
         }
     }
 
@@ -84,7 +110,7 @@ impl PlayerRegistry {
     }
 
     #[cfg(test)]
-    async fn settle_playback_start(&self, guild_id: GuildId) {
+    pub(super) async fn settle_playback_start(&self, guild_id: GuildId) {
         for _ in 0..500 {
             let settled = {
                 let guilds = self.guilds.lock().await;
@@ -114,16 +140,38 @@ impl PlayerRegistry {
         if !guilds.contains_key(&guild_id) {
             return None;
         }
-        let next = match db::queue_pop_front(&self.db, &guild_id.to_string()).await {
+        let next = self.pop_queue_front(guild_id).await;
+        let state = guilds.get_mut(&guild_id)?;
+        state.now_playing = next.clone();
+        next.map(|queued| (queued, state.epoch))
+    }
+
+    /// Promotes the front of the queue only if nothing is playing or
+    /// loading, with the check and the pop under one lock so two callers
+    /// cannot both find the guild idle and each start a track.
+    async fn promote_next_if_idle(&self, guild_id: GuildId) -> Promotion {
+        let mut guilds = self.guilds.lock().await;
+        let Some(state) = guilds.get_mut(&guild_id) else {
+            return Promotion::Busy;
+        };
+        if state.now_playing.is_some() {
+            return Promotion::Busy;
+        }
+        let Some(next) = self.pop_queue_front(guild_id).await else {
+            return Promotion::QueueEmpty;
+        };
+        state.now_playing = Some(next.clone());
+        Promotion::Track(next, state.epoch)
+    }
+
+    async fn pop_queue_front(&self, guild_id: GuildId) -> Option<QueuedTrack> {
+        match db::queue_pop_front(&self.db, &guild_id.to_string()).await {
             Ok(next) => next,
             Err(err) => {
                 tracing::warn!(%guild_id, %err, "failed to pop the next queued track");
                 None
             }
-        };
-        let state = guilds.get_mut(&guild_id)?;
-        state.now_playing = next.clone();
-        next.map(|queued| (queued, state.epoch))
+        }
     }
 
     fn schedule_idle_disconnect(&self, guild_id: GuildId) {
@@ -134,6 +182,29 @@ impl PlayerRegistry {
             registry.leave_if_idle(guild_id).await;
         });
     }
+}
+
+/// A joined registry with `ids` enqueued in order and the first of them
+/// committed as the current track.
+#[cfg(test)]
+async fn playing(
+    ids: &[&str],
+) -> (
+    PlayerRegistry,
+    Arc<crate::voice::testing::FakeBackend>,
+    GuildId,
+) {
+    use crate::voice::testing::{joined_registry, queued};
+
+    let (registry, backend, guild_id) = joined_registry().await;
+    for id in ids {
+        registry
+            .enqueue(guild_id, queued(id))
+            .await
+            .expect("enqueue on a joined fake backend succeeds");
+    }
+    registry.settle_playback_start(guild_id).await;
+    (registry, backend, guild_id)
 }
 
 #[cfg(test)]
@@ -148,6 +219,9 @@ mod tests {
         Playing,
         Paused,
         QueueFinished,
+        /// Connected with nothing playing but tracks left in the queue, as an
+        /// abandoned start leaves it.
+        QueueLeftBehind,
     }
 
     enum MatrixAction {
@@ -275,6 +349,11 @@ mod tests {
                 let a_id = current_track_id(&registry, guild_id).await;
                 backend.finish_track(guild_id, a_id).await;
             }
+            MatrixState::QueueLeftBehind => {
+                db::queue_push_back(&registry.db, &guild_id.to_string(), &queued("a"))
+                    .await
+                    .unwrap();
+            }
         }
 
         {
@@ -295,6 +374,7 @@ mod tests {
             MatrixState::Playing,
             MatrixState::Paused,
             MatrixState::QueueFinished,
+            MatrixState::QueueLeftBehind,
         ];
 
         for &state in &states {

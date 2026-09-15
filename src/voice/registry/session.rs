@@ -23,7 +23,7 @@ impl PlayerRegistry {
             // which is both wasted latency and (on the real IPC backend)
             // what used to cause a self-inflicted disconnect.
             if let Some(call) = self.voice.call(guild_id) {
-                self.restore_session_if_new(guild_id, call).await;
+                self.resume_after_join(guild_id, call).await;
             }
             return Ok(());
         }
@@ -37,18 +37,46 @@ impl PlayerRegistry {
             .await
             .map_err(PlayerError::Join)?;
 
+        let Some(call) = self.voice.call(guild_id) else {
+            return Ok(());
+        };
         if was_replacing_existing_driver {
-            let mut guilds = self.guilds.lock().await;
-            if let Some(state) = guilds.get_mut(&guild_id) {
-                state.epoch = state.epoch.wrapping_add(1);
-            }
+            self.restart_on_new_driver(guild_id, call.clone()).await;
         }
-
-        if let Some(call) = self.voice.call(guild_id) {
-            self.restore_session_if_new(guild_id, call).await;
-        }
-
+        self.resume_after_join(guild_id, call).await;
         Ok(())
+    }
+
+    /// The old driver took its track with it: whatever was playing or
+    /// loading is started again on the new one, and any start still running
+    /// against the old driver is made stale by the epoch bump.
+    async fn restart_on_new_driver(&self, guild_id: GuildId, call: Arc<dyn VoiceCall>) {
+        let restart = {
+            let mut guilds = self.guilds.lock().await;
+            let Some(state) = guilds.get_mut(&guild_id) else {
+                return;
+            };
+            state.epoch = state.epoch.wrapping_add(1);
+            state.current_handle = None;
+            state.current_track_id = None;
+            state.paused = false;
+            state
+                .now_playing
+                .clone()
+                .map(|queued| (queued, state.epoch))
+        };
+        if let Some((queued, epoch)) = restart {
+            self.spawn_start_sequence(guild_id, call, queued, epoch, None, true);
+        }
+    }
+
+    /// Restores a persisted session on the guild's first join and, either
+    /// way, starts whatever the queue holds if nothing is playing, or arms the
+    /// idle disconnect if there is nothing to start. Joining is therefore
+    /// also how a queue left behind by an abandoned start gets going.
+    async fn resume_after_join(&self, guild_id: GuildId, call: Arc<dyn VoiceCall>) {
+        self.restore_session_if_new(guild_id, call).await;
+        self.kick_off_if_idle(guild_id).await;
     }
 
     async fn restore_session_if_new(&self, guild_id: GuildId, call: Arc<dyn VoiceCall>) {
@@ -73,9 +101,8 @@ impl PlayerRegistry {
             return;
         };
 
-        match candidate {
-            Some(queued) => self.spawn_start_sequence(guild_id, call, queued, epoch, None),
-            None => self.schedule_idle_disconnect(guild_id),
+        if let Some(queued) = candidate {
+            self.spawn_start_sequence(guild_id, call, queued, epoch, None, false);
         }
     }
 
@@ -189,6 +216,17 @@ impl PlayerRegistry {
         self.voice.remove(guild_id).await.map_err(PlayerError::Join)
     }
 
+    /// Idle means nothing is playing or loading, or the current track is
+    /// paused. A queue left behind with nothing playing does not keep the
+    /// bot in voice; the next join starts it.
+    fn is_idle(state: &GuildState) -> bool {
+        match (&state.now_playing, state.current_track_id) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(_), Some(_)) => state.paused,
+        }
+    }
+
     fn take_guild_state(guild_id: GuildId, guilds: &mut HashMap<GuildId, GuildState>) {
         let mut removed = guilds.remove(&guild_id);
         if let Some(prefetch) = removed.as_mut().and_then(|state| state.prefetch.take()) {
@@ -197,30 +235,19 @@ impl PlayerRegistry {
     }
 
     pub(super) async fn leave_if_idle(&self, guild_id: GuildId) {
+        // Several idle timers can be armed for one guild; whichever fires
+        // first does the leaving and the rest find nothing to do.
+        if !self.is_connected(guild_id) {
+            return;
+        }
         let snapshot = {
             let mut guilds = self.guilds.lock().await;
-            let now_playing_set = guilds
+            if guilds
                 .get(&guild_id)
-                .is_some_and(|state| state.now_playing.is_some());
-            let handle = guilds
-                .get(&guild_id)
-                .and_then(|state| state.current_handle.clone());
-
-            let still_idle = if now_playing_set {
-                match handle {
-                    Some(handle) => handle.status().await.is_some_and(|status| status.paused),
-                    None => false,
-                }
-            } else {
-                db::queue_len(&self.db, &guild_id.to_string())
-                    .await
-                    .unwrap_or(0)
-                    == 0
-            };
-            if !still_idle {
+                .is_some_and(|state| !Self::is_idle(state))
+            {
                 return;
             }
-
             let snapshot = guilds.get(&guild_id).map(SessionSnapshot::from);
             Self::take_guild_state(guild_id, &mut guilds);
             snapshot
@@ -267,7 +294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leave_if_idle_does_nothing_if_only_the_queue_is_non_empty() {
+    async fn leave_if_idle_leaves_voice_when_only_the_queue_is_non_empty() {
         let (registry, backend, guild_id) = joined_registry().await;
         db::queue_push_back(&registry.db, &guild_id.to_string(), &queued("a"))
             .await
@@ -275,7 +302,11 @@ mod tests {
 
         registry.leave_if_idle(guild_id).await;
 
-        assert!(backend.call_for(guild_id).is_some());
+        assert!(backend.call_for(guild_id).is_none());
+        assert_eq!(
+            upcoming_ids(&registry.queue_snapshot(guild_id).await),
+            vec!["a"]
+        );
     }
 
     #[tokio::test]
@@ -494,6 +525,25 @@ mod tests {
         assert_eq!(backend.join_call_count(guild_id), 1);
         assert!(backend.call_for(guild_id).is_some());
         let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+    }
+
+    #[tokio::test]
+    async fn joining_a_different_channel_restarts_the_current_track_on_the_new_driver() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.enqueue(guild_id, queued("b")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+        let track_id_before = current_track_id(&registry, guild_id).await;
+
+        registry.join(guild_id, ChannelId::new(3)).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        assert_ne!(current_track_id(&registry, guild_id).await, track_id_before);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["b"]);
         assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
     }
 

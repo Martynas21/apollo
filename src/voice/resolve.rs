@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::youtube::ytdlp::{STDERR_TRUNCATE_LEN, YtDlp, YtDlpError, truncate_tail};
 
-const MAX_TRACK_DURATION: Duration = Duration::from_hours(14);
+pub(crate) const MAX_TRACK_DURATION: Duration = Duration::from_hours(14);
 
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 

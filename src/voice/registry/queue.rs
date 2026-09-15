@@ -32,7 +32,7 @@ impl PlayerRegistry {
         };
 
         if let Some(epoch) = start {
-            self.spawn_start_sequence(guild_id, call, queued, epoch, None);
+            self.spawn_start_sequence(guild_id, call, queued, epoch, None, false);
         }
 
         self.persist_session(guild_id).await;
@@ -68,7 +68,7 @@ impl PlayerRegistry {
         };
 
         if let Some(epoch) = start {
-            self.spawn_start_sequence(guild_id, call, queued, epoch, None);
+            self.spawn_start_sequence(guild_id, call, queued, epoch, None, false);
         }
 
         self.persist_session(guild_id).await;
@@ -124,7 +124,7 @@ impl PlayerRegistry {
         };
 
         if let Some((first, epoch)) = start {
-            self.spawn_start_sequence(guild_id, call, first, epoch, None);
+            self.spawn_start_sequence(guild_id, call, first, epoch, None, false);
         }
 
         self.persist_session(guild_id).await;
@@ -227,9 +227,6 @@ impl PlayerRegistry {
             let mut guilds = self.guilds.lock().await;
             let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
             let state = guilds.entry(guild_id).or_default();
-            if state.now_playing.is_none() {
-                return Err(PlayerError::NothingPlaying);
-            }
 
             let mut items = db::queue_all(&self.db, &guild_id_str)
                 .await
@@ -261,7 +258,7 @@ impl PlayerRegistry {
             let _ = handle.stop().await;
         }
 
-        self.spawn_start_sequence(guild_id, call, target, epoch, None);
+        self.spawn_start_sequence(guild_id, call, target, epoch, None, false);
         self.persist_session(guild_id).await;
         Ok(())
     }
@@ -298,7 +295,7 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    fn restart_prefetch(&self, state: &mut GuildState, next: Option<QueuedTrack>) {
+    pub(super) fn restart_prefetch(&self, state: &mut GuildState, next: Option<QueuedTrack>) {
         if let Some(old) = state.prefetch.take() {
             discard_prefetch(old);
         }
@@ -485,12 +482,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn play_queue_track_with_nothing_playing_reports_nothing_playing() {
-        let (registry, _backend, guild_id) = joined_registry().await;
+    async fn play_queue_track_starts_a_queue_left_behind_with_nothing_playing() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        db::queue_push_back(&registry.db, &guild_id.to_string(), &queued("a"))
+            .await
+            .unwrap();
 
-        let result = registry.play_queue_track(guild_id, 0).await;
+        registry.play_queue_track(guild_id, 0).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
 
-        assert!(matches!(result, Err(PlayerError::NothingPlaying)));
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+        assert!(snapshot.upcoming.is_empty());
     }
 
     #[tokio::test]

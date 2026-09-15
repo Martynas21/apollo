@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serenity::all::{ChannelId, GuildId};
 use uuid::Uuid;
@@ -11,6 +11,9 @@ pub struct AudioSource {
     pub(crate) video_id: String,
     pub(crate) url: String,
     pub(crate) headers: Vec<(String, String)>,
+    /// When the stream URL was resolved. Stream URLs expire, so a source
+    /// that sat in a prefetch for too long is resolved again before use.
+    pub(crate) resolved_at: Instant,
 }
 
 pub struct TrackStatus {
@@ -21,6 +24,15 @@ pub struct TrackStatus {
 #[async_trait::async_trait]
 pub trait VoiceEvents: Send + Sync + 'static {
     async fn track_finished(&self, guild_id: GuildId, track_id: Uuid);
+
+    /// The track stopped with an error after playing for `position`.
+    async fn track_errored(
+        &self,
+        guild_id: GuildId,
+        track_id: Uuid,
+        position: Duration,
+        error: String,
+    );
 
     async fn connection_lost(&self, guild_id: GuildId);
 }

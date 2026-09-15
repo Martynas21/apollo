@@ -1,6 +1,7 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serenity::all::{ChannelId, GuildId, UserId};
 use tokio::sync::Notify;
@@ -31,6 +32,7 @@ pub(super) fn queued(video_id: &str) -> QueuedTrack {
 struct FakeTrackState {
     stopped: bool,
     paused: bool,
+    position: Duration,
     volume: Option<f32>,
     stop_error: Option<String>,
     registered: Option<(GuildId, Arc<dyn VoiceEvents>)>,
@@ -39,14 +41,31 @@ struct FakeTrackState {
 pub(super) struct FakeTrack {
     uuid: Uuid,
     state: StdMutex<FakeTrackState>,
+    shared: Arc<FakeShared>,
+}
+
+/// Behaviour switches shared by the backend, its calls and their tracks.
+#[derive(Default)]
+struct FakeShared {
+    /// Whether a stop is followed by the track-finished report a real
+    /// worker sends once the track has ended.
+    confirm_stops: AtomicBool,
+    /// Holds the next `set_volume` call, which is where a start sits
+    /// between the worker accepting the track and the commit landing.
+    volume_gate: StdMutex<Option<Arc<Notify>>>,
 }
 
 impl FakeTrack {
-    fn new() -> Arc<Self> {
+    fn new(shared: Arc<FakeShared>) -> Arc<Self> {
         Arc::new(Self {
             uuid: Uuid::new_v4(),
             state: StdMutex::new(FakeTrackState::default()),
+            shared,
         })
+    }
+
+    pub(super) fn fail_next_stop(&self, message: &str) {
+        self.state.lock().unwrap().stop_error = Some(message.to_string());
     }
 
     pub(super) fn was_stopped(&self) -> bool {
@@ -61,6 +80,10 @@ impl FakeTrack {
         self.state.lock().unwrap().volume
     }
 
+    pub(super) fn set_position(&self, position: Duration) {
+        self.state.lock().unwrap().position = position;
+    }
+
     fn registered(&self) -> Option<(GuildId, Arc<dyn VoiceEvents>)> {
         self.state.lock().unwrap().registered.clone()
     }
@@ -73,16 +96,28 @@ impl VoiceTrack for FakeTrack {
     }
 
     async fn set_volume(&self, multiplier: f32) -> Result<(), String> {
+        let gate = self.shared.volume_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         self.state.lock().unwrap().volume = Some(multiplier);
         Ok(())
     }
 
     async fn stop(&self) -> Result<(), String> {
-        let mut state = self.state.lock().unwrap();
-        if let Some(message) = state.stop_error.take() {
-            return Err(message);
+        let registered = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(message) = state.stop_error.take() {
+                return Err(message);
+            }
+            state.stopped = true;
+            state.registered.clone()
+        };
+        if self.shared.confirm_stops.load(Ordering::Relaxed)
+            && let Some((guild_id, events)) = registered
+        {
+            events.track_finished(guild_id, self.uuid).await;
         }
-        state.stopped = true;
         Ok(())
     }
 
@@ -103,7 +138,7 @@ impl VoiceTrack for FakeTrack {
     async fn status(&self) -> Option<TrackStatus> {
         let state = self.state.lock().unwrap();
         Some(TrackStatus {
-            position: Duration::ZERO,
+            position: state.position,
             paused: state.paused,
         })
     }
@@ -117,9 +152,17 @@ struct PlayedTrack {
 #[derive(Default)]
 pub(super) struct FakeCall {
     played: StdMutex<Vec<PlayedTrack>>,
+    shared: Arc<FakeShared>,
 }
 
 impl FakeCall {
+    fn new(shared: Arc<FakeShared>) -> Arc<Self> {
+        Arc::new(Self {
+            played: StdMutex::new(Vec::new()),
+            shared,
+        })
+    }
+
     pub(super) fn played_video_ids(&self) -> Vec<String> {
         self.played
             .lock()
@@ -152,7 +195,7 @@ impl FakeCall {
 #[async_trait::async_trait]
 impl VoiceCall for FakeCall {
     async fn play(&self, source: AudioSource) -> Result<Arc<dyn VoiceTrack>, String> {
-        let track = FakeTrack::new();
+        let track = FakeTrack::new(self.shared.clone());
         self.played.lock().unwrap().push(PlayedTrack {
             video_id: source.video_id,
             handle: track.clone(),
@@ -164,13 +207,20 @@ impl VoiceCall for FakeCall {
 #[derive(Default)]
 struct FakeBackendState {
     calls: HashMap<GuildId, Arc<FakeCall>>,
+    /// Calls replaced by a rejoin or dropped by a leave, so a test can
+    /// count plays across a rebuilt session.
+    retired_calls: Vec<(GuildId, Arc<FakeCall>)>,
+    shared: Arc<FakeShared>,
     events: HashMap<GuildId, Arc<dyn VoiceEvents>>,
     current_channel: HashMap<GuildId, ChannelId>,
     join_call_count: HashMap<GuildId, u32>,
     simulate_eviction_disconnect: bool,
     next_join_failure: Option<String>,
     download_gate: Option<Arc<Notify>>,
-    failing_video_ids: HashMap<String, String>,
+    /// Video ids whose resolve fails: `Some(message)` as an unclassified
+    /// error, `None` as an already-classified one, which skips the preflight
+    /// (a real yt-dlp call) on the way to the next track.
+    failing_video_ids: HashMap<String, Option<String>>,
     buffered_source_calls: Vec<String>,
 }
 
@@ -199,7 +249,15 @@ impl FakeBackend {
             .lock()
             .unwrap()
             .failing_video_ids
-            .insert(video_id.to_string(), message.to_string());
+            .insert(video_id.to_string(), Some(message.to_string()));
+    }
+
+    pub(super) fn make_unplayable(&self, video_id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_video_ids
+            .insert(video_id.to_string(), None);
     }
 
     pub(super) fn buffered_source_calls(&self) -> Vec<String> {
@@ -212,6 +270,44 @@ impl FakeBackend {
 
     pub(super) fn call_for(&self, guild_id: GuildId) -> Option<Arc<FakeCall>> {
         self.state.lock().unwrap().calls.get(&guild_id).cloned()
+    }
+
+    /// Every video id played for the guild, across retired calls and the
+    /// current one, in start order.
+    pub(super) fn all_played_video_ids(&self, guild_id: GuildId) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        state
+            .retired_calls
+            .iter()
+            .filter(|(id, _)| *id == guild_id)
+            .map(|(_, call)| call)
+            .chain(state.calls.get(&guild_id))
+            .flat_map(|call| call.played_video_ids())
+            .collect()
+    }
+
+    pub(super) fn set_stop_confirmation(&self, confirm: bool) {
+        self.state
+            .lock()
+            .unwrap()
+            .shared
+            .confirm_stops
+            .store(confirm, Ordering::Relaxed);
+    }
+
+    /// Holds the next track start just before its commit; the returned
+    /// notify lets it through.
+    pub(super) fn hold_volume(&self) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .shared
+            .volume_gate
+            .lock()
+            .unwrap() = Some(notify.clone());
+        notify
     }
 
     pub(super) fn join_call_count(&self, guild_id: GuildId) -> u32 {
@@ -234,13 +330,29 @@ impl FakeBackend {
         self.state.lock().unwrap().simulate_eviction_disconnect = true;
     }
 
-    pub(super) async fn finish_track(&self, guild_id: GuildId, track_id: Uuid) {
-        let registered = self
-            .call_for(guild_id)
+    fn registered_events(
+        &self,
+        guild_id: GuildId,
+        track_id: Uuid,
+    ) -> Option<(GuildId, Arc<dyn VoiceEvents>)> {
+        self.call_for(guild_id)
             .and_then(|call| call.track(track_id))
-            .and_then(|track| track.registered());
-        if let Some((guild_id, events)) = registered {
+            .and_then(|track| track.registered())
+    }
+
+    pub(super) async fn finish_track(&self, guild_id: GuildId, track_id: Uuid) {
+        if let Some((guild_id, events)) = self.registered_events(guild_id, track_id) {
             events.track_finished(guild_id, track_id).await;
+        }
+    }
+
+    /// Reports the track as having errored after playing for `position`,
+    /// the way the audio worker does for a refused or broken stream.
+    pub(super) async fn fail_track(&self, guild_id: GuildId, track_id: Uuid, position: Duration) {
+        if let Some((guild_id, events)) = self.registered_events(guild_id, track_id) {
+            events
+                .track_errored(guild_id, track_id, position, "stream refused".to_string())
+                .await;
         }
     }
 
@@ -268,7 +380,10 @@ impl VoiceBackend for FakeBackend {
             *state.join_call_count.entry(guild_id).or_default() += 1;
             let old_events = state.events.get(&guild_id).cloned();
             let simulate = state.simulate_eviction_disconnect;
-            state.calls.insert(guild_id, Arc::new(FakeCall::default()));
+            let call = FakeCall::new(state.shared.clone());
+            if let Some(old_call) = state.calls.insert(guild_id, call) {
+                state.retired_calls.push((guild_id, old_call));
+            }
             state.events.insert(guild_id, events);
             state.current_channel.insert(guild_id, channel_id);
             (old_events, simulate)
@@ -281,7 +396,9 @@ impl VoiceBackend for FakeBackend {
 
     async fn remove(&self, guild_id: GuildId) -> Result<(), String> {
         let mut state = self.state.lock().unwrap();
-        state.calls.remove(&guild_id);
+        if let Some(old_call) = state.calls.remove(&guild_id) {
+            state.retired_calls.push((guild_id, old_call));
+        }
         state.events.remove(&guild_id);
         state.current_channel.remove(&guild_id);
         Ok(())
@@ -322,10 +439,11 @@ impl VoiceBackend for FakeBackend {
             .failing_video_ids
             .get(&track.video_id)
             .cloned();
-        if let Some(message) = failure {
-            return Err(PlaybackError::Other(message));
+        match failure {
+            Some(Some(message)) => Err(PlaybackError::Other(message)),
+            Some(None) => Err(PlaybackError::Unavailable),
+            None => Ok(empty_source(&track.video_id)),
         }
-        Ok(empty_source(&track.video_id))
     }
 }
 
@@ -344,6 +462,7 @@ pub(super) fn empty_source(video_id: &str) -> AudioSource {
         video_id: video_id.to_string(),
         url: "https://example.invalid/apollo-test.audio".to_string(),
         headers: Vec::new(),
+        resolved_at: Instant::now(),
     }
 }
 

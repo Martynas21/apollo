@@ -146,7 +146,7 @@ mod tests {
         let (client_read, client_write) = tokio::io::split(client);
 
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let sessions = Arc::new(Sessions::new(events_tx));
+        let sessions = Arc::new(Sessions::new(events_tx).unwrap());
         let events_rx = Arc::new(Mutex::new(events_rx));
         tokio::spawn(handle_connection(
             worker_read,

@@ -70,6 +70,8 @@ pub enum Event {
         guild_id: u64,
         track_id: Uuid,
         error: String,
+        /// How far into the track playback had got when it failed.
+        position_ms: u64,
     },
     ConnectionLost {
         guild_id: u64,

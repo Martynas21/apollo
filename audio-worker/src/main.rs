@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(bind_addr = %config.bind_addr, "apollo-audio-worker listening");
 
     let (events_tx, events_rx) = mpsc::unbounded_channel::<IpcEvent>();
-    let sessions = Arc::new(Sessions::new(events_tx));
+    let sessions = Arc::new(Sessions::new(events_tx)?);
     let events_rx = Arc::new(Mutex::new(events_rx));
 
     loop {

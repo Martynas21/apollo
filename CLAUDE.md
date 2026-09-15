@@ -128,7 +128,7 @@ Key points:
 
 - **No recursion** — use iteration.
 - **No unbounded loops** outside an explicitly-allowed list: `apollo-audio-worker`'s
-  driver loop, the IPC accept/read loops (`ipc_backend.rs`, `audio-worker/src/rpc.rs`),
+  driver loop, the IPC accept/read/write loops (`ipc_backend.rs`, `audio-worker/src/rpc.rs`),
   and the DB migration-retry loop (`db/mod.rs`). A new unbounded loop anywhere else
   needs explicit justification in review.
 - **Functions stay under ~60 lines** (`clippy::too_many_lines`, threshold set

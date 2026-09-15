@@ -109,7 +109,7 @@ this — see `cargo clippy` in Development above:
 - Every loop needs either a statically-visible bound (fixed range,
   decrementing counter, capped retry count) or must be one of the small set
   of intentional long-running service loops: `apollo-audio-worker`'s driver
-  loop, the IPC accept/read loops (`src/voice/ipc_backend.rs`,
+  loop, the IPC accept/read/write loops (`src/voice/ipc_backend.rs`,
   `audio-worker/src/rpc.rs`), and the DB migration-retry loop (`src/db/mod.rs`).
   A new unbounded loop outside that list needs explicit justification in
   review.

@@ -41,10 +41,16 @@ struct SnapshotJson {
 }
 
 async fn build_snapshot(player: &PlayerRegistry, guild_id: GuildId) -> SnapshotJson {
-    let snapshot = player.queue_snapshot(guild_id).await;
-    let paused = player.is_paused(guild_id).await;
-    let volume = player.get_volume(guild_id).await;
-    let radio_enabled = player.is_radio_enabled(guild_id).await;
+    // One bounded round trip to the worker per snapshot: a worker that is
+    // slow to answer costs a missing position, not a silent feed.
+    let (snapshot, paused, status, volume, radio_enabled) = tokio::join!(
+        player.queue_snapshot(guild_id),
+        player.is_paused(guild_id),
+        tokio::time::timeout(SNAPSHOT_PUSH_INTERVAL, player.track_status(guild_id)),
+        player.get_volume(guild_id),
+        player.is_radio_enabled(guild_id),
+    );
+    let status = status.ok().flatten();
 
     let (state, track) = if let Some(queued) = &snapshot.now_playing {
         let state = if paused == Some(true) {
@@ -64,10 +70,7 @@ async fn build_snapshot(player: &PlayerRegistry, guild_id: GuildId) -> SnapshotJ
     let upcoming: Vec<TrackJson> = snapshot.upcoming.iter().map(track_json).collect();
 
     let position_ms = if matches!(state, "playing" | "paused") {
-        player
-            .track_position(guild_id)
-            .await
-            .map(|position| u64::try_from(position.as_millis()).unwrap_or(u64::MAX))
+        status.map(|status| u64::try_from(status.position.as_millis()).unwrap_or(u64::MAX))
     } else {
         None
     };

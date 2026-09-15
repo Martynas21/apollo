@@ -9,11 +9,16 @@ use crate::voice::backend::{AudioSource, VoiceCall, VoiceTrack};
 use crate::voice::error::PlayerError;
 use crate::voice::registry::{PlayerRegistry, Prefetch, discard_prefetch};
 use crate::voice::resolve::{self, PlaybackError};
-use crate::voice::state::{AdvanceFill, StartOutcome};
+use crate::voice::state::{AdvanceFill, GuildState, StartOutcome, TrackOutcome};
 
 const MAX_VOLUME: u8 = 100;
 
 const RADIO_HISTORY_CAP: usize = 5;
+
+/// Consecutive tracks that may fail to start before the start sequence gives
+/// up and leaves the rest of the queue untouched, so a broken yt-dlp or a
+/// YouTube-side outage cannot quietly eat an entire queue.
+const MAX_CONSECUTIVE_START_FAILURES: u32 = 3;
 
 fn volume_multiplier(volume: u8) -> f32 {
     f32::from(volume.min(MAX_VOLUME)) / 100.0
@@ -39,7 +44,14 @@ impl PlayerRegistry {
         prefetched: Prefetch,
     ) -> Result<AudioSource, PlaybackError> {
         match prefetched.await {
-            Ok(Ok(source)) => return Ok(source),
+            Ok(Ok(source)) if source.resolved_at.elapsed() < self.prefetch_max_age => {
+                return Ok(source);
+            }
+            Ok(Ok(_)) => {
+                tracing::info!(
+                    "prefetched stream URL is too old to trust, resolving fresh instead"
+                );
+            }
             Ok(Err(err)) => tracing::warn!(%err, "prefetch failed, resolving fresh instead"),
             Err(err) => tracing::warn!(%err, "prefetch task panicked, resolving fresh instead"),
         }
@@ -64,11 +76,12 @@ impl PlayerRegistry {
         first: QueuedTrack,
         epoch: u64,
         prefetch: Option<Prefetch>,
+        retry: bool,
     ) {
         let registry = self.clone();
         tokio::spawn(async move {
             registry
-                .run_start_sequence(guild_id, call, first, epoch, prefetch)
+                .run_start_sequence(guild_id, call, first, epoch, prefetch, retry)
                 .await;
         });
     }
@@ -80,13 +93,22 @@ impl PlayerRegistry {
         first: QueuedTrack,
         first_epoch: u64,
         prefetch: Option<Prefetch>,
+        retry: bool,
     ) {
-        let mut candidate = Some((first, first_epoch));
+        let mut candidate = Some((first, first_epoch, retry));
         let mut prefetch = prefetch;
         let mut started = false;
-        while let Some((queued, epoch)) = candidate.take() {
+        let mut failures = 0;
+        while let Some((queued, epoch, retry)) = candidate.take() {
             match self
-                .try_start_playback(guild_id, call.clone(), queued, prefetch.take(), epoch)
+                .try_start_playback(
+                    guild_id,
+                    call.clone(),
+                    queued,
+                    prefetch.take(),
+                    epoch,
+                    retry,
+                )
                 .await
             {
                 StartOutcome::Committed => {
@@ -95,8 +117,22 @@ impl PlayerRegistry {
                 }
                 StartOutcome::Stale => return,
                 StartOutcome::Failed(err) => {
+                    failures += 1;
+                    if failures >= MAX_CONSECUTIVE_START_FAILURES {
+                        tracing::error!(
+                            %guild_id,
+                            %err,
+                            failures,
+                            "giving up on starting playback; the remaining queue is kept"
+                        );
+                        self.abandon_start(guild_id, epoch).await;
+                        break;
+                    }
                     tracing::warn!(%err, "failed to start queued track, trying the next one");
-                    candidate = self.promote_next(guild_id).await;
+                    candidate = self
+                        .promote_next(guild_id)
+                        .await
+                        .map(|(queued, epoch)| (queued, epoch, false));
                 }
             }
         }
@@ -108,6 +144,17 @@ impl PlayerRegistry {
         self.persist_session(guild_id).await;
     }
 
+    /// Clears the abandoned candidate so the guild reads as idle with its
+    /// remaining queue intact; the next join starts that queue again.
+    async fn abandon_start(&self, guild_id: GuildId, epoch: u64) {
+        let mut guilds = self.guilds.lock().await;
+        if let Some(state) = guilds.get_mut(&guild_id)
+            && state.epoch == epoch
+        {
+            state.now_playing = None;
+        }
+    }
+
     async fn try_start_playback(
         &self,
         guild_id: GuildId,
@@ -115,6 +162,7 @@ impl PlayerRegistry {
         queued: QueuedTrack,
         prefetched: Option<Prefetch>,
         expected_epoch: u64,
+        retry: bool,
     ) -> StartOutcome {
         let source = match self
             .resolve_for_start(guild_id, &queued, prefetched, expected_epoch)
@@ -129,7 +177,7 @@ impl PlayerRegistry {
             Err(err) => return StartOutcome::Failed(PlayerError::Playback(err)),
         };
 
-        self.commit_started_track(guild_id, queued, handle, expected_epoch)
+        self.commit_started_track(guild_id, queued, handle, expected_epoch, retry)
             .await
     }
 
@@ -172,6 +220,7 @@ impl PlayerRegistry {
         queued: QueuedTrack,
         handle: Arc<dyn VoiceTrack>,
         expected_epoch: u64,
+        retry: bool,
     ) -> StartOutcome {
         let track_id = handle.uuid();
 
@@ -193,34 +242,29 @@ impl PlayerRegistry {
         }
 
         let mut needs_radio_refill = false;
+        let mut parked_outcome = None;
         if let Some(state) = guilds.get_mut(&guild_id) {
             handle.notify_when_finished(guild_id, self.events());
-            state.current_handle = Some(handle);
+            state.current_handle = Some(handle.clone());
             state.current_track_id = Some(track_id);
-            state.last_played = Some(queued.clone());
-            state.radio_history.push_back(queued.track.video_id.clone());
-            if state.radio_history.len() > RADIO_HISTORY_CAP {
-                state.radio_history.pop_front();
-            }
-            state.radio_requested_by = Some(queued.requested_by);
-
-            let next = db::queue_peek_front(&self.db, &guild_id.to_string())
-                .await
-                .ok()
-                .flatten();
-            if let Some(next) = next {
-                let registry = self.clone();
-                state.prefetch = Some(tokio::spawn(
-                    async move { registry.cached_input(&next).await },
-                ));
-            } else {
-                needs_radio_refill = true;
-            }
+            state.paused = false;
+            parked_outcome = state.take_uncommitted_outcome(track_id);
+            Self::note_track_started(state, &queued, retry);
+            needs_radio_refill = self.arm_next_prefetch(state, guild_id, retry).await;
         }
         drop(guilds);
 
-        if let Err(err) =
-            db::record_track_play(&self.db, &guild_id.to_string(), &queued.track).await
+        self.spawn_stall_watchdog(guild_id, handle, queued.track.duration);
+
+        // The worker may have ended the track while the commit was under
+        // way; that report was parked and takes effect now.
+        if let Some(outcome) = parked_outcome {
+            self.apply_track_outcome(guild_id, track_id, outcome).await;
+        }
+
+        if !retry
+            && let Err(err) =
+                db::record_track_play(&self.db, &guild_id.to_string(), &queued.track).await
         {
             tracing::warn!(%guild_id, %err, "failed to record track play count");
         }
@@ -230,6 +274,75 @@ impl PlayerRegistry {
         }
 
         StartOutcome::Committed
+    }
+
+    /// Records the track as the guild's latest. The fresh-URL retry of a
+    /// track that already went through here keeps its history entry and its
+    /// spent retry; any other start gets a history entry and a fresh retry.
+    fn note_track_started(state: &mut GuildState, queued: &QueuedTrack, is_retry: bool) {
+        state.last_played = Some(queued.clone());
+        state.radio_requested_by = Some(queued.requested_by);
+        if is_retry {
+            return;
+        }
+        state.retry_used = false;
+        state.radio_history.push_back(queued.track.video_id.clone());
+        if state.radio_history.len() > RADIO_HISTORY_CAP {
+            state.radio_history.pop_front();
+        }
+    }
+
+    /// Resolves the next queued track's stream ahead of time. Returns whether
+    /// the queue is empty and radio should refill it instead. A retry keeps
+    /// the prefetch its first attempt already started.
+    async fn arm_next_prefetch(
+        &self,
+        state: &mut GuildState,
+        guild_id: GuildId,
+        is_retry: bool,
+    ) -> bool {
+        if is_retry && state.prefetch.is_some() {
+            return false;
+        }
+        let next = db::queue_peek_front(&self.db, &guild_id.to_string())
+            .await
+            .ok()
+            .flatten();
+        if next.is_none() {
+            return true;
+        }
+        self.restart_prefetch(state, next);
+        false
+    }
+
+    /// Routes a worker report to `advance` or the error handling, or parks
+    /// it when the track's start has not been committed yet.
+    pub(super) async fn apply_track_outcome(
+        &self,
+        guild_id: GuildId,
+        track_id: Uuid,
+        outcome: TrackOutcome,
+    ) {
+        {
+            let mut guilds = self.guilds.lock().await;
+            if let Some(state) = guilds.get_mut(&guild_id)
+                && state.current_track_id.is_none()
+                && state.now_playing.is_some()
+            {
+                state.uncommitted_outcome = Some((track_id, outcome));
+                return;
+            }
+        }
+        match outcome {
+            TrackOutcome::Finished => {
+                self.clear_early_failures(guild_id).await;
+                self.advance(guild_id, track_id).await;
+            }
+            TrackOutcome::Errored { position, error } => {
+                self.handle_track_error(guild_id, track_id, position, &error)
+                    .await;
+            }
+        }
     }
 
     pub(super) async fn advance(&self, guild_id: GuildId, track_id: Uuid) {
@@ -243,6 +356,7 @@ impl PlayerRegistry {
             }
             state.current_handle = None;
             state.current_track_id = None;
+            state.paused = false;
             let next = match db::queue_pop_front(&self.db, &guild_id.to_string()).await {
                 Ok(next) => next,
                 Err(err) => {
@@ -266,7 +380,7 @@ impl PlayerRegistry {
 
         match (fill, self.voice.call(guild_id)) {
             (AdvanceFill::Track(next, epoch), Some(call)) => {
-                self.spawn_start_sequence(guild_id, call, next, epoch, prefetch)
+                self.spawn_start_sequence(guild_id, call, next, epoch, prefetch, false)
             }
             (AdvanceFill::AlreadyStarted, _) => {
                 // The in-flight radio refill's own `kick_off_if_idle` beat
@@ -293,12 +407,18 @@ impl PlayerRegistry {
             let Some(state) = guilds.get_mut(&guild_id) else {
                 return Err(PlayerError::NothingPlaying);
             };
-            if state.now_playing.is_none() {
+            let queue_len = db::queue_len(&self.db, &guild_id.to_string())
+                .await
+                .unwrap_or(0);
+            if state.now_playing.is_none() && queue_len == 0 {
                 return Err(PlayerError::NothingPlaying);
             }
             state.now_playing = None;
             state.last_played = None;
             state.current_track_id = None;
+            state.paused = false;
+            state.consecutive_early_failures = 0;
+            state.uncommitted_outcome = None;
             state.epoch = state.epoch.wrapping_add(1);
             state.radio_enabled = false;
             state.radio_history.clear();
@@ -315,17 +435,18 @@ impl PlayerRegistry {
             handle
         };
 
-        if let Some(handle) = handle
-            && let Err(err) = handle.stop().await
-        {
-            return Err(PlayerError::Playback(err));
-        }
-
+        // The registry has already forgotten the track, so the idle timer
+        // and the persisted session are settled whether or not the worker
+        // confirms the stop in time.
+        let stopped = match handle {
+            Some(handle) => handle.stop().await.map_err(PlayerError::Playback),
+            None => Ok(()),
+        };
         self.schedule_idle_disconnect(guild_id);
         if let Err(err) = db::clear_guild_session(&self.db, &guild_id.to_string()).await {
             tracing::warn!(%guild_id, %err, "failed to clear the persisted session on stop");
         }
-        Ok(())
+        stopped
     }
 
     pub async fn skip(&self, guild_id: GuildId) -> Result<(), PlayerError> {
@@ -355,23 +476,45 @@ impl PlayerRegistry {
             .await
             .map_err(|e| PlayerError::Playback(e.to_string()));
         if result.is_ok() {
+            self.set_paused(guild_id, &handle, true).await;
             self.schedule_idle_disconnect(guild_id);
         }
         result
     }
 
+    /// Clears the pause flag before asking the worker, so an idle check that
+    /// lands during the round trip already sees the track as resumed.
     pub async fn resume(&self, guild_id: GuildId) -> Result<(), PlayerError> {
         let handle = {
-            let guilds = self.guilds.lock().await;
-            guilds
-                .get(&guild_id)
-                .and_then(|state| state.current_handle.clone())
+            let mut guilds = self.guilds.lock().await;
+            let state = guilds.get_mut(&guild_id);
+            let handle = state
+                .as_ref()
+                .and_then(|state| state.current_handle.clone());
+            if let (Some(state), Some(_)) = (state, &handle) {
+                state.paused = false;
+            }
+            handle
         };
         let handle = handle.ok_or(PlayerError::NothingPlaying)?;
-        handle
+        let result = handle
             .resume()
             .await
-            .map_err(|e| PlayerError::Playback(e.to_string()))
+            .map_err(|e| PlayerError::Playback(e.to_string()));
+        if result.is_err() {
+            self.set_paused(guild_id, &handle, true).await;
+        }
+        result
+    }
+
+    /// Records the pause flag for `handle` if it is still the current track.
+    async fn set_paused(&self, guild_id: GuildId, handle: &Arc<dyn VoiceTrack>, paused: bool) {
+        let mut guilds = self.guilds.lock().await;
+        if let Some(state) = guilds.get_mut(&guild_id)
+            && state.current_track_id == Some(handle.uuid())
+        {
+            state.paused = paused;
+        }
     }
 
     pub async fn get_volume(&self, guild_id: GuildId) -> u8 {
@@ -575,6 +718,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_clears_a_queue_left_behind_with_nothing_playing() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        db::queue_push_back(&registry.db, &guild_id.to_string(), &queued("a"))
+            .await
+            .unwrap();
+
+        registry.stop(guild_id).await.unwrap();
+
+        assert!(registry.queue_snapshot(guild_id).await.upcoming.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_still_settles_the_session_when_the_worker_does_not_answer() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+        backend
+            .call_for(guild_id)
+            .unwrap()
+            .last_track()
+            .fail_next_stop("did not answer");
+
+        let err = registry.stop(guild_id).await.unwrap_err();
+
+        assert!(matches!(err, PlayerError::Playback(_)));
+        assert_eq!(
+            db::load_guild_session(&registry.db, &guild_id.to_string())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn pause_and_resume_toggle_the_current_track() {
         let (registry, backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
@@ -583,9 +760,11 @@ mod tests {
 
         registry.pause(guild_id).await.unwrap();
         assert!(track.is_paused());
+        assert_eq!(registry.is_paused(guild_id).await, Some(true));
 
         registry.resume(guild_id).await.unwrap();
         assert!(!track.is_paused());
+        assert_eq!(registry.is_paused(guild_id).await, Some(false));
     }
 
     #[tokio::test]

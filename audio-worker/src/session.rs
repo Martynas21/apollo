@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use apollo_ipc::dto::{ConnectionInfoDto, TrackStatusDto};
 use apollo_ipc::proto::Event as IpcEvent;
 use async_trait::async_trait;
@@ -16,6 +18,16 @@ use songbird::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
+
+const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest gap between two chunks of stream data before the read fails.
+/// songbird's mixer pulls the stream through a blocking read, so this bounds
+/// how long a quiet CDN connection can hold the mixer and every track
+/// command queued behind it. On a failed read songbird re-requests the
+/// stream from the byte offset it reached, so a stall costs about this long
+/// of silence and then resumes.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct GuildSession {
     driver: Driver,
@@ -37,6 +49,11 @@ pub struct Sessions {
     http: reqwest::Client,
 }
 
+/// Saturating `Duration` to wire milliseconds.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn nonzero(id: u64, what: &str) -> Result<NonZeroU64, String> {
     NonZeroU64::new(id).ok_or_else(|| format!("{what} must not be zero"))
 }
@@ -52,33 +69,53 @@ fn to_connection_info(dto: ConnectionInfoDto) -> Result<ConnectionInfo, String> 
     })
 }
 
-#[derive(Clone)]
+/// Registered on `End` only: songbird fires `End` for an errored track as
+/// well, with `playing` still `Errored`, so one registration sees every way
+/// a track can finish and reports it exactly once.
 struct TrackEndHandler {
     guild_id: u64,
     track_id: Uuid,
+    started_at: Instant,
     events: UnboundedSender<IpcEvent>,
 }
 
 #[async_trait]
 impl SongbirdEventHandler for TrackEndHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        let error = match ctx {
-            EventContext::Track(tracks) => {
-                tracks.first().and_then(|(state, _)| match &state.playing {
-                    PlayMode::Errored(err) => Some(err.to_string()),
-                    _ => None,
-                })
-            }
+        let state = match ctx {
+            EventContext::Track(tracks) => tracks.first().map(|(state, _)| *state),
             _ => None,
         };
+        let error = state.and_then(|state| match &state.playing {
+            PlayMode::Errored(err) => Some(err.to_string()),
+            _ => None,
+        });
+        let position = state.map_or(Duration::ZERO, |state| state.position);
+        let position_secs = position.as_secs();
+        let elapsed_secs = self.started_at.elapsed().as_secs();
         let event = if let Some(error) = error {
-            tracing::warn!(guild_id = self.guild_id, %error, "track playback failed");
+            tracing::warn!(
+                guild_id = self.guild_id,
+                track_id = %self.track_id,
+                elapsed_secs,
+                position_secs,
+                %error,
+                "track playback failed"
+            );
             IpcEvent::TrackErrored {
                 guild_id: self.guild_id,
                 track_id: self.track_id,
                 error,
+                position_ms: millis(position),
             }
         } else {
+            tracing::info!(
+                guild_id = self.guild_id,
+                track_id = %self.track_id,
+                elapsed_secs,
+                position_secs,
+                "track ended"
+            );
             IpcEvent::TrackFinished {
                 guild_id: self.guild_id,
                 track_id: self.track_id,
@@ -86,6 +123,27 @@ impl SongbirdEventHandler for TrackEndHandler {
         };
         let _ = self.events.send(event);
         None
+    }
+}
+
+/// Logs how long a track spent between `play` and its input becoming
+/// playable, which is the time the initial stream request took.
+struct TrackPlayableHandler {
+    guild_id: u64,
+    track_id: Uuid,
+    started_at: Instant,
+}
+
+#[async_trait]
+impl SongbirdEventHandler for TrackPlayableHandler {
+    async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        tracing::info!(
+            guild_id = self.guild_id,
+            track_id = %self.track_id,
+            after_ms = millis(self.started_at.elapsed()),
+            "track playable"
+        );
+        Some(Event::Cancel)
     }
 }
 
@@ -113,13 +171,18 @@ impl SongbirdEventHandler for DriverDisconnectHandler {
 }
 
 impl Sessions {
-    pub fn new(events: UnboundedSender<IpcEvent>) -> Self {
-        Self {
+    pub fn new(events: UnboundedSender<IpcEvent>) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            .connect_timeout(STREAM_CONNECT_TIMEOUT)
+            .read_timeout(STREAM_READ_TIMEOUT)
+            .build()
+            .context("failed to build the stream HTTP client")?;
+        Ok(Self {
             guilds: Mutex::new(HashMap::new()),
             join_locks: Mutex::new(HashMap::new()),
             events,
-            http: reqwest::Client::new(),
-        }
+            http,
+        })
     }
 
     fn join_lock_for(&self, guild_id: u64) -> Arc<tokio::sync::Mutex<()>> {
@@ -230,17 +293,31 @@ impl Sessions {
             }
         }
         let input = HttpRequest::new_with_headers(self.http.clone(), stream_url, header_map).into();
+        // One track per guild: whatever is still current is stopped first, so
+        // a Play the other side had already given up on cannot leave two
+        // tracks mixing.
+        if let Some((_, previous)) = session.current.take() {
+            let _ = previous.stop();
+        }
+        let started_at = Instant::now();
         let handle = session.driver.play_input(input);
+        tracing::info!(guild_id, %track_id, "track started");
         let end_handler = TrackEndHandler {
             guild_id,
             track_id,
+            started_at,
             events: self.events.clone(),
         };
-        if let Err(err) = handle.add_event(Event::Track(TrackEvent::End), end_handler.clone()) {
+        if let Err(err) = handle.add_event(Event::Track(TrackEvent::End), end_handler) {
             tracing::warn!(%err, "failed to register track-end handler");
         }
-        if let Err(err) = handle.add_event(Event::Track(TrackEvent::Error), end_handler) {
-            tracing::warn!(%err, "failed to register track-error handler");
+        let playable_handler = TrackPlayableHandler {
+            guild_id,
+            track_id,
+            started_at,
+        };
+        if let Err(err) = handle.add_event(Event::Track(TrackEvent::Playable), playable_handler) {
+            tracing::warn!(%err, "failed to register track-playable handler");
         }
         session.current = Some((track_id, handle));
         Ok(())
@@ -321,7 +398,7 @@ impl Sessions {
         let handle = self.current_handle(guild_id, track_id)?;
         let state = handle.get_info().await.map_err(|e| e.to_string())?;
         Ok(TrackStatusDto {
-            position_ms: u64::try_from(state.position.as_millis()).unwrap_or(u64::MAX),
+            position_ms: millis(state.position),
             paused: matches!(state.playing, PlayMode::Pause),
         })
     }
@@ -335,7 +412,7 @@ mod tests {
 
     fn sessions() -> Sessions {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        Sessions::new(tx)
+        Sessions::new(tx).unwrap()
     }
 
     fn offline_driver_with_track() -> (Driver, TrackHandle) {
