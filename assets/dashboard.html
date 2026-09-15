@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Apollo</title>
+<meta name="theme-color" content="#15130f">
+<!-- Painted by setTabIcon() below so the icon shares this page's palette and
+     can dim itself while nothing is playing. -->
+<link rel="icon" id="favicon" href="data:,">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spectral:wght@500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap">
 <style>
   :root {
@@ -931,6 +935,7 @@
     token = null;
     sessionStorage.removeItem(TOKEN_KEY);
     closeSocket();
+    setTabIcon(false);
     loginScreen.style.display = 'block';
     dashboard.style.display = 'none';
     loginError.textContent = message || '';
@@ -1162,6 +1167,9 @@
     dashboard.classList.toggle('snapshot-stale', stale);
     if (stale) {
       freezeProgress();
+      // The feed has stopped saying anything about playback, so the tab
+      // icon stops claiming it.
+      setTabIcon(false);
       showStatus(STALE_STATUS_MESSAGE, { isError: true });
     } else if (statusLine.textContent === STALE_STATUS_MESSAGE) {
       showStatus('');
@@ -1749,6 +1757,38 @@
     npArt.addEventListener('animationend', () => npArt.classList.remove('np-pulse'), { once: true });
   }
 
+  // The tab icon: the header's sun, drawn to hold together on a 16px tab
+  // strip — a solid disc and eight rays with a clear gap between them,
+  // filling the icon rather than sitting on a tile. Lit while audio is
+  // running and dimmed when it is not, so a background tab shows at a
+  // glance whether the bot is playing.
+  const TAB_ICON_LIT = { from: '#f6c76a', mid: '#e3a53f', to: '#d9784a' };
+  const TAB_ICON_DIM = { from: '#b99a63', mid: '#977a44', to: '#7f5a3e' };
+
+  function tabIconSvg(tone) {
+    let rays = '';
+    for (let i = 0; i < 8; i++) {
+      rays += `<line x1='16' y1='6' x2='16' y2='2' transform='rotate(${i * 45} 16 16)'/>`;
+    }
+    // A stroke has no width of its own to hang a gradient on, so the sun's
+    // runs in user space and covers disc and rays alike.
+    return `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs>` +
+      `<linearGradient id='s' gradientUnits='userSpaceOnUse' x1='5' y1='3' x2='27' y2='29'>` +
+        `<stop offset='0' stop-color='${tone.from}'/><stop offset='.48' stop-color='${tone.mid}'/>` +
+        `<stop offset='1' stop-color='${tone.to}'/></linearGradient></defs>` +
+      `<circle cx='16' cy='16' r='6.2' fill='url(#s)'/>` +
+      `<g stroke='url(#s)' stroke-width='3.6' stroke-linecap='round'>${rays}</g>` +
+      `</svg>`;
+  }
+
+  let tabIconTone = null;
+  function setTabIcon(playing) {
+    const tone = playing ? TAB_ICON_LIT : TAB_ICON_DIM;
+    if (tone === tabIconTone) return;
+    tabIconTone = tone;
+    document.getElementById('favicon').href = `data:image/svg+xml,${encodeURIComponent(tabIconSvg(tone))}`;
+  }
+
   function renderSnapshot(snapshot) {
     setSnapshotStale(false);
     clearTimeout(staleTimer);
@@ -1792,6 +1832,7 @@
     document.getElementById('skip-btn').disabled = transportDisabled;
     document.getElementById('stop-btn').disabled = transportDisabled;
 
+    setTabIcon(snapshot.state === 'playing');
     document.getElementById('play-icon').classList.toggle('visible', snapshot.state !== 'playing');
     document.getElementById('pause-icon').classList.toggle('visible', snapshot.state === 'playing');
 
@@ -2900,6 +2941,8 @@
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && assignGuildModalOverlay.classList.contains('open')) closeAssignGuildModal();
   });
+
+  setTabIcon(false);
 
   if (token) {
     showDashboard();
