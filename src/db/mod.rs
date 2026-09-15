@@ -19,11 +19,12 @@ pub use playlists::{
 #[cfg(test)]
 pub use queue::queue_push_back;
 pub use queue::{
-    queue_all, queue_clear, queue_len, queue_peek_front, queue_pop_front, queue_push_many,
-    queue_replace_all,
+    queue_all, queue_clear, queue_current, queue_finish_current, queue_len, queue_push_front,
+    queue_push_many, queue_replace_all, queue_upcoming_front,
 };
 pub use session::{
     PersistedSession, clear_guild_session, load_guild_session, save_guild_session_meta,
+    set_guild_radio_enabled,
 };
 pub use settings::{DEFAULT_VOLUME, get_guild_volume, set_guild_volume};
 pub use stats::{

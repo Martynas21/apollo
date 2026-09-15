@@ -144,15 +144,19 @@ impl PlayerRegistry {
         self.persist_session(guild_id).await;
     }
 
-    /// Clears the abandoned candidate so the guild reads as idle with its
-    /// remaining queue intact; the next join starts that queue again.
+    /// Drops the abandoned candidate, off the head of the queue as well as
+    /// out of `now_playing`, so the guild reads as idle with the rest of its
+    /// queue intact; the next join starts that queue again.
     async fn abandon_start(&self, guild_id: GuildId, epoch: u64) {
         let mut guilds = self.guilds.lock().await;
-        if let Some(state) = guilds.get_mut(&guild_id)
-            && state.epoch == epoch
-        {
-            state.now_playing = None;
+        let Some(state) = guilds.get_mut(&guild_id) else {
+            return;
+        };
+        if state.epoch != epoch {
+            return;
         }
+        state.now_playing = None;
+        self.finish_queue_head(guild_id).await;
     }
 
     async fn try_start_playback(
@@ -304,7 +308,7 @@ impl PlayerRegistry {
         if is_retry && state.prefetch.is_some() {
             return false;
         }
-        let next = db::queue_peek_front(&self.db, &guild_id.to_string())
+        let next = db::queue_upcoming_front(&self.db, &guild_id.to_string())
             .await
             .ok()
             .flatten();
@@ -357,10 +361,12 @@ impl PlayerRegistry {
             state.current_handle = None;
             state.current_track_id = None;
             state.paused = false;
-            let next = match db::queue_pop_front(&self.db, &guild_id.to_string()).await {
+            // The finished track is the head of the queue; dropping it
+            // hands back whatever now leads the queue.
+            let next = match db::queue_finish_current(&self.db, &guild_id.to_string()).await {
                 Ok(next) => next,
                 Err(err) => {
-                    tracing::warn!(%guild_id, %err, "failed to pop the next queued track");
+                    tracing::warn!(%guild_id, %err, "failed to drop the finished track");
                     None
                 }
             };
@@ -633,7 +639,12 @@ mod tests {
             .unwrap()
             .expect("radio history should survive the queue draining");
         assert_eq!(session.radio_history, vec!["a".to_string()]);
-        assert!(session.now_playing.is_none());
+        assert_eq!(
+            db::queue_len(&registry.db, &guild_id.to_string())
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -743,11 +754,24 @@ mod tests {
         let err = registry.stop(guild_id).await.unwrap_err();
 
         assert!(matches!(err, PlayerError::Playback(_)));
+        // Nothing survives to be played later: the queue is gone, and so is
+        // everything a session could resume from, even if a start sequence
+        // that was still finishing up writes the row back.
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert!(snapshot.now_playing.is_none());
+        assert!(snapshot.upcoming.is_empty());
         assert_eq!(
-            db::load_guild_session(&registry.db, &guild_id.to_string())
+            db::queue_len(&registry.db, &guild_id.to_string())
                 .await
                 .unwrap(),
-            None
+            0
+        );
+        let session = db::load_guild_session(&registry.db, &guild_id.to_string())
+            .await
+            .unwrap();
+        assert!(
+            session
+                .is_none_or(|session| { !session.radio_enabled && session.last_played.is_none() })
         );
     }
 
@@ -775,10 +799,19 @@ mod tests {
         registry.stop(guild_id).await.unwrap();
 
         assert_eq!(
-            db::load_guild_session(&registry.db, &guild_id.to_string())
+            db::queue_len(&registry.db, &guild_id.to_string())
                 .await
                 .unwrap(),
-            None
+            0
+        );
+        // A start sequence still finishing up can write the row back, but
+        // only ever with the state stop left behind: nothing to resume.
+        let session = db::load_guild_session(&registry.db, &guild_id.to_string())
+            .await
+            .unwrap();
+        assert!(
+            session
+                .is_none_or(|session| { !session.radio_enabled && session.last_played.is_none() })
         );
     }
 

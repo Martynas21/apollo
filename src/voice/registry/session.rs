@@ -94,10 +94,7 @@ impl PlayerRegistry {
             return;
         };
 
-        let Some((candidate, epoch)) = self
-            .apply_restored_session(guild_id, &guild_id_str, session)
-            .await
-        else {
+        let Some((candidate, epoch)) = self.apply_restored_session(guild_id, session).await else {
             return;
         };
 
@@ -124,7 +121,6 @@ impl PlayerRegistry {
     async fn apply_restored_session(
         &self,
         guild_id: GuildId,
-        guild_id_str: &str,
         session: db::PersistedSession,
     ) -> Option<(Option<QueuedTrack>, u64)> {
         let mut guilds = self.guilds.lock().await;
@@ -139,18 +135,11 @@ impl PlayerRegistry {
             .and_then(|id| id.parse().ok())
             .map(UserId::new);
         state.radio_history = session.radio_history.into();
-        state.now_playing = persisted_to_queued_track(session.now_playing);
         state.last_played = persisted_to_queued_track(session.last_played);
-        if state.now_playing.is_none() {
-            let next = match db::queue_pop_front(&self.db, guild_id_str).await {
-                Ok(next) => next,
-                Err(err) => {
-                    tracing::warn!(%guild_id, %err, "failed to pop the next queued track");
-                    None
-                }
-            };
-            state.now_playing = next.clone();
-        }
+        // The head of the queue is the track to resume: whatever was
+        // playing when this guild was last torn down, or the front of a
+        // queue left behind.
+        state.now_playing = self.queue_head(guild_id).await;
         Some((state.now_playing.clone(), state.epoch))
     }
 
@@ -169,15 +158,6 @@ impl PlayerRegistry {
     async fn save_session_snapshot(&self, guild_id: GuildId, snapshot: SessionSnapshot) {
         let guild_id_str = guild_id.to_string();
         let radio_requested_by = snapshot.radio_requested_by.map(|id| id.to_string());
-        let now_playing_requested_by = snapshot
-            .now_playing
-            .as_ref()
-            .map(|q| q.requested_by.to_string());
-        let now_playing_arg = snapshot
-            .now_playing
-            .as_ref()
-            .zip(now_playing_requested_by.as_deref())
-            .map(|(q, rb)| (&q.track, rb));
         let last_played_requested_by = snapshot
             .last_played
             .as_ref()
@@ -193,7 +173,6 @@ impl PlayerRegistry {
             snapshot.radio_enabled,
             radio_requested_by.as_deref(),
             &snapshot.radio_history,
-            now_playing_arg,
             last_played_arg,
         )
         .await;
@@ -268,7 +247,8 @@ mod tests {
     use super::*;
     use crate::voice::backend::VoiceBackend;
     use crate::voice::testing::{
-        current_track_id, joined_registry, new_registry, queued, upcoming_ids,
+        current_track_id, joined_registry, new_registry, persist_queue, persist_radio, queued,
+        upcoming_ids,
     };
 
     #[tokio::test]
@@ -345,13 +325,11 @@ mod tests {
         registry.leave_if_idle(guild_id).await;
 
         assert!(backend.call_for(guild_id).is_none());
-        let session = db::load_guild_session(&registry.db, &guild_id.to_string())
-            .await
-            .unwrap()
-            .expect("the paused track should be preserved for a later resume");
+        let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(
-            session.now_playing.map(|(track, _)| track.video_id),
-            Some("a".to_string())
+            upcoming_ids(&snapshot),
+            vec!["a"],
+            "the paused track should be preserved for a later resume"
         );
     }
 
@@ -411,33 +389,58 @@ mod tests {
 
         registry.leave(guild_id).await.unwrap();
 
-        let session = db::load_guild_session(&registry.db, &guild_id.to_string())
-            .await
-            .unwrap()
-            .expect("an involuntary disconnect should not wipe the persisted session");
+        let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(
-            session.now_playing.map(|(track, _)| track.video_id),
-            Some("a".to_string())
+            upcoming_ids(&snapshot),
+            vec!["a"],
+            "an involuntary disconnect should not wipe what was playing"
         );
+    }
+
+    #[tokio::test]
+    async fn leaving_keeps_the_current_track_at_the_head_of_the_queue() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        registry
+            .enqueue_many(guild_id, vec![queued("a"), queued("b")])
+            .await
+            .unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        registry.leave(guild_id).await.unwrap();
+
+        // Nothing is playing any more, so the track that was playing shows
+        // up as what it now is: the first thing the queue will play.
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert!(snapshot.now_playing.is_none());
+        assert!(snapshot.loading.is_none());
+        assert_eq!(upcoming_ids(&snapshot), vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn clearing_a_queue_nothing_is_playing_leaves_no_track_to_resurrect() {
+        let (registry, backend, guild_id) = new_registry().await;
+        persist_queue(&registry, guild_id, &["interrupted"]).await;
+
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["interrupted"]);
+        registry.clear_queue(guild_id).await.unwrap();
+
+        registry.join(guild_id, ChannelId::new(2)).await.unwrap();
+        registry.enqueue(guild_id, queued("new")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["new"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "new");
+        assert!(snapshot.upcoming.is_empty());
     }
 
     #[tokio::test]
     async fn join_restores_a_persisted_session_and_starts_its_now_playing() {
         let (registry, backend, guild_id) = new_registry().await;
-        db::save_guild_session_meta(
-            &registry.db,
-            &guild_id.to_string(),
-            true,
-            Some("1"),
-            &["a".to_string()],
-            Some((&queued("a").track, "1")),
-            None,
-        )
-        .await
-        .unwrap();
-        db::queue_push_back(&registry.db, &guild_id.to_string(), &queued("b"))
-            .await
-            .unwrap();
+        persist_queue(&registry, guild_id, &["a", "b"]).await;
+        persist_radio(&registry, guild_id, Some("1"), &["a"]).await;
 
         registry.join(guild_id, ChannelId::new(2)).await.unwrap();
         registry.settle_playback_start(guild_id).await;
@@ -453,17 +456,7 @@ mod tests {
     #[tokio::test]
     async fn enqueue_after_restore_appends_behind_the_resumed_queue() {
         let (registry, backend, guild_id) = new_registry().await;
-        db::save_guild_session_meta(
-            &registry.db,
-            &guild_id.to_string(),
-            false,
-            None,
-            &[],
-            Some((&queued("a").track, "1")),
-            None,
-        )
-        .await
-        .unwrap();
+        persist_queue(&registry, guild_id, &["a"]).await;
 
         registry.join(guild_id, ChannelId::new(2)).await.unwrap();
         registry.enqueue(guild_id, queued("new")).await.unwrap();

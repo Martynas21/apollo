@@ -81,6 +81,11 @@ field** — every observable state is derived from `now_playing`,
 reference: **`docs/player-states.md`** — read it before touching player logic.
 Key points:
 
+- The persisted queue (`guild_session_queue`) holds the current track at its
+  **head**, then the upcoming tracks: starting a track leaves its row alone
+  and only ending it removes the row, so nothing a guild will play is stored
+  outside the queue the dashboard shows. `GuildState::upcoming_offset()` is
+  the shift every queue action applies because of it.
 - Five derived states: Empty, Buffering, Playing, Paused, Queue-finished.
   Buffering is the gap between `enqueue`/`advance` (sets `now_playing`
   immediately) and `commit_started_track` (sets `current_track_id` once audio

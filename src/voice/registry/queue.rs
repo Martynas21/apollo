@@ -7,6 +7,18 @@ use crate::voice::error::PlayerError;
 use crate::voice::registry::{PlayerRegistry, discard_prefetch};
 use crate::voice::state::GuildState;
 
+/// Where an index into the upcoming list lands in the stored queue, which
+/// carries the current track at its head; `None` when it points past the end
+/// of the queue.
+fn upcoming_index(items: &[QueuedTrack], offset: usize, index: usize) -> Option<usize> {
+    let at = offset.checked_add(index)?;
+    (at < items.len()).then_some(at)
+}
+
+fn storage_error(err: impl std::fmt::Display) -> PlayerError {
+    PlayerError::Storage(err.to_string())
+}
+
 impl PlayerRegistry {
     #[cfg(test)]
     pub(super) async fn enqueue(
@@ -14,6 +26,7 @@ impl PlayerRegistry {
         guild_id: GuildId,
         queued: QueuedTrack,
     ) -> Result<(), PlayerError> {
+        let guild_id_str = guild_id.to_string();
         let (call, start) = {
             let mut guilds = self.guilds.lock().await;
             let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
@@ -21,12 +34,15 @@ impl PlayerRegistry {
             state.radio_exhausted = false;
             let should_start = state.now_playing.is_none();
             if should_start {
+                db::queue_push_front(&self.db, &guild_id_str, &queued)
+                    .await
+                    .map_err(storage_error)?;
                 state.radio_history.clear();
                 state.now_playing = Some(queued.clone());
-            } else if let Err(err) =
-                db::queue_push_back(&self.db, &guild_id.to_string(), &queued).await
-            {
-                return Err(PlayerError::Storage(err.to_string()));
+            } else {
+                db::queue_push_back(&self.db, &guild_id_str, &queued)
+                    .await
+                    .map_err(storage_error)?;
             }
             (call, should_start.then_some(state.epoch))
         };
@@ -52,17 +68,21 @@ impl PlayerRegistry {
             state.radio_exhausted = false;
             let should_start = state.now_playing.is_none();
             if should_start {
+                db::queue_push_front(&self.db, &guild_id_str, &queued)
+                    .await
+                    .map_err(storage_error)?;
                 state.radio_history.clear();
                 state.now_playing = Some(queued.clone());
             } else {
                 let mut items = db::queue_all(&self.db, &guild_id_str)
                     .await
-                    .map_err(|e| PlayerError::Storage(e.to_string()))?;
-                items.insert(0, queued.clone());
+                    .map_err(storage_error)?;
+                let at = state.upcoming_offset().min(items.len());
+                items.insert(at, queued.clone());
                 db::queue_replace_all(&self.db, &guild_id_str, &items)
                     .await
-                    .map_err(|e| PlayerError::Storage(e.to_string()))?;
-                self.restart_prefetch(state, items.first().cloned());
+                    .map_err(storage_error)?;
+                self.restart_prefetch(state, items.get(at).cloned());
             }
             (call, should_start.then_some(state.epoch))
         };
@@ -93,23 +113,25 @@ impl PlayerRegistry {
             let state = guilds.entry(guild_id).or_default();
             state.radio_exhausted = false;
             let needs_start = state.now_playing.is_none();
-            if needs_start {
-                state.radio_history.clear();
-                state.now_playing = first.clone();
-            }
 
             let rest: Vec<QueuedTrack> = if needs_start {
                 tracks.split_off(1)
             } else {
                 std::mem::take(&mut tracks)
             };
-            if !rest.is_empty()
-                && let Err(err) = db::queue_push_many(&self.db, &guild_id_str, &rest).await
-            {
-                if needs_start {
-                    state.now_playing = None;
-                }
-                return Err(PlayerError::Storage(err.to_string()));
+            if !rest.is_empty() {
+                db::queue_push_many(&self.db, &guild_id_str, &rest)
+                    .await
+                    .map_err(storage_error)?;
+            }
+            // The track to start goes in at the head, where the current
+            // track lives, so nothing reads as playing before it is queued.
+            if needs_start && let Some(first) = first.as_ref() {
+                db::queue_push_front(&self.db, &guild_id_str, first)
+                    .await
+                    .map_err(storage_error)?;
+                state.radio_history.clear();
+                state.now_playing = Some(first.clone());
             }
 
             if !needs_start && state.prefetch.is_none() {
@@ -134,19 +156,20 @@ impl PlayerRegistry {
     pub async fn shuffle(&self, guild_id: GuildId) -> Result<(), PlayerError> {
         let guild_id_str = guild_id.to_string();
         let mut guilds = self.guilds.lock().await;
+        let offset = guilds.get(&guild_id).map_or(0, GuildState::upcoming_offset);
         let mut items = db::queue_all(&self.db, &guild_id_str)
             .await
-            .map_err(|e| PlayerError::Storage(e.to_string()))?;
-        if items.len() < 2 {
+            .map_err(storage_error)?;
+        if items.len().saturating_sub(offset) < 2 {
             return Err(PlayerError::NothingToShuffle);
         }
 
-        items.shuffle(&mut rand::rng());
+        items[offset..].shuffle(&mut rand::rng());
         db::queue_replace_all(&self.db, &guild_id_str, &items)
             .await
-            .map_err(|e| PlayerError::Storage(e.to_string()))?;
+            .map_err(storage_error)?;
         if let Some(state) = guilds.get_mut(&guild_id) {
-            self.restart_prefetch(state, items.first().cloned());
+            self.restart_prefetch(state, items.get(offset).cloned());
         }
         drop(guilds);
 
@@ -161,19 +184,20 @@ impl PlayerRegistry {
     ) -> Result<(), PlayerError> {
         let guild_id_str = guild_id.to_string();
         let mut guilds = self.guilds.lock().await;
+        let offset = guilds.get(&guild_id).map_or(0, GuildState::upcoming_offset);
         let mut items = db::queue_all(&self.db, &guild_id_str)
             .await
-            .map_err(|e| PlayerError::Storage(e.to_string()))?;
-        if index >= items.len() {
+            .map_err(storage_error)?;
+        let Some(at) = upcoming_index(&items, offset, index) else {
             return Err(PlayerError::InvalidQueueIndex);
-        }
+        };
 
-        items.remove(index);
+        items.remove(at);
         db::queue_replace_all(&self.db, &guild_id_str, &items)
             .await
-            .map_err(|e| PlayerError::Storage(e.to_string()))?;
+            .map_err(storage_error)?;
         if let Some(state) = guilds.get_mut(&guild_id) {
-            self.restart_prefetch(state, items.first().cloned());
+            self.restart_prefetch(state, items.get(offset).cloned());
         }
         drop(guilds);
 
@@ -189,20 +213,27 @@ impl PlayerRegistry {
     ) -> Result<(), PlayerError> {
         let guild_id_str = guild_id.to_string();
         let mut guilds = self.guilds.lock().await;
+        let offset = guilds.get(&guild_id).map_or(0, GuildState::upcoming_offset);
         let mut items = db::queue_all(&self.db, &guild_id_str)
             .await
-            .map_err(|e| PlayerError::Storage(e.to_string()))?;
-        if from >= items.len() || to >= items.len() || from == to {
+            .map_err(storage_error)?;
+        let (Some(at_from), Some(at_to)) = (
+            upcoming_index(&items, offset, from),
+            upcoming_index(&items, offset, to),
+        ) else {
+            return Err(PlayerError::InvalidQueueIndex);
+        };
+        if at_from == at_to {
             return Err(PlayerError::InvalidQueueIndex);
         }
 
-        let track = items.remove(from);
-        items.insert(to, track);
+        let track = items.remove(at_from);
+        items.insert(at_to, track);
         db::queue_replace_all(&self.db, &guild_id_str, &items)
             .await
-            .map_err(|e| PlayerError::Storage(e.to_string()))?;
+            .map_err(storage_error)?;
         if let Some(state) = guilds.get_mut(&guild_id) {
-            self.restart_prefetch(state, items.first().cloned());
+            self.restart_prefetch(state, items.get(offset).cloned());
         }
         drop(guilds);
 
@@ -210,13 +241,13 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    /// Jumps straight to an upcoming queue entry: pulls it out of the queue,
-    /// stops whatever is currently playing/buffering without requeuing it
-    /// (like `skip`, but landing on a chosen track instead of the front of
-    /// the queue), and starts it immediately. Every other upcoming track
-    /// keeps its relative order behind the new current track. Bumping the
-    /// epoch invalidates any start sequence still in flight for the track
-    /// that was buffering, the same guard `stop()` uses.
+    /// Jumps straight to an upcoming queue entry: makes it the head of the
+    /// queue, dropping the track it replaces instead of requeuing it (like
+    /// `skip`, but landing on a chosen track rather than the front of the
+    /// queue), and starts it immediately. Every other upcoming track keeps
+    /// its relative order behind the new current track. Bumping the epoch
+    /// invalidates any start sequence still in flight for the track that was
+    /// buffering, the same guard `stop()` uses.
     pub async fn play_queue_track(
         &self,
         guild_id: GuildId,
@@ -230,14 +261,19 @@ impl PlayerRegistry {
 
             let mut items = db::queue_all(&self.db, &guild_id_str)
                 .await
-                .map_err(|e| PlayerError::Storage(e.to_string()))?;
-            if index >= items.len() {
+                .map_err(storage_error)?;
+            let offset = state.upcoming_offset();
+            let Some(at) = upcoming_index(&items, offset, index) else {
                 return Err(PlayerError::InvalidQueueIndex);
+            };
+            let target = items.remove(at);
+            if offset > 0 && !items.is_empty() {
+                items.remove(0);
             }
-            let target = items.remove(index);
+            items.insert(0, target.clone());
             db::queue_replace_all(&self.db, &guild_id_str, &items)
                 .await
-                .map_err(|e| PlayerError::Storage(e.to_string()))?;
+                .map_err(storage_error)?;
 
             if let Some(prefetch) = state.prefetch.take() {
                 discard_prefetch(prefetch);
@@ -263,19 +299,24 @@ impl PlayerRegistry {
         Ok(())
     }
 
+    /// Clears the upcoming tracks. The current track is the head of the same
+    /// queue, so it is the one row that survives — and with nothing playing,
+    /// nothing survives at all.
     pub async fn clear_queue(&self, guild_id: GuildId) -> Result<(), PlayerError> {
         let guild_id_str = guild_id.to_string();
         let needs_refill = {
             let mut guilds = self.guilds.lock().await;
-            let len = db::queue_len(&self.db, &guild_id_str)
+            let offset = guilds.get(&guild_id).map_or(0, GuildState::upcoming_offset);
+            let mut items = db::queue_all(&self.db, &guild_id_str)
                 .await
-                .map_err(|e| PlayerError::Storage(e.to_string()))?;
-            if len == 0 {
+                .map_err(storage_error)?;
+            if items.len() <= offset {
                 return Err(PlayerError::QueueEmpty);
             }
-            db::queue_clear(&self.db, &guild_id_str)
+            items.truncate(offset);
+            db::queue_replace_all(&self.db, &guild_id_str, &items)
                 .await
-                .map_err(|e| PlayerError::Storage(e.to_string()))?;
+                .map_err(storage_error)?;
             match guilds.get_mut(&guild_id) {
                 Some(state) => {
                     if let Some(prefetch) = state.prefetch.take() {
@@ -529,6 +570,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clear_queue_keeps_the_current_track_as_the_one_row_it_leaves() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        registry
+            .enqueue_many(guild_id, vec![queued("a"), queued("b"), queued("c")])
+            .await
+            .unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        registry.clear_queue(guild_id).await.unwrap();
+
+        assert_eq!(
+            db::queue_all(&registry.db, &guild_id.to_string())
+                .await
+                .unwrap()
+                .iter()
+                .map(|q| q.track.video_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_queue_with_nothing_playing_leaves_the_queue_empty() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        db::queue_push_back(&registry.db, &guild_id.to_string(), &queued("left"))
+            .await
+            .unwrap();
+
+        registry.clear_queue(guild_id).await.unwrap();
+
+        assert_eq!(
+            db::queue_len(&registry.db, &guild_id.to_string())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_onto_a_queue_left_behind_plays_the_new_track_first() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        db::queue_push_back(&registry.db, &guild_id.to_string(), &queued("left"))
+            .await
+            .unwrap();
+
+        registry.enqueue(guild_id, queued("new")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["new"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["left"]);
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "new");
+    }
+
+    #[tokio::test]
     async fn clear_queue_with_nothing_queued_reports_queue_empty() {
         let (registry, _backend, guild_id) = joined_registry().await;
         registry.enqueue(guild_id, queued("a")).await.unwrap();
@@ -569,20 +666,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_persists_a_resumable_session() {
+    async fn enqueue_persists_a_resumable_queue() {
         let (registry, _backend, guild_id) = joined_registry().await;
 
         registry.enqueue(guild_id, queued("a")).await.unwrap();
         registry.enqueue(guild_id, queued("b")).await.unwrap();
 
-        let session = db::load_guild_session(&registry.db, &guild_id.to_string())
-            .await
-            .unwrap()
-            .expect("a session should have been persisted");
-        assert_eq!(
-            session.now_playing.map(|(track, _)| track.video_id),
-            Some("a".to_string())
-        );
+        // The track being played stays at the head of the persisted queue,
+        // so coming back resumes at "a" instead of skipping it.
         assert_eq!(
             db::queue_all(&registry.db, &guild_id.to_string())
                 .await
@@ -590,7 +681,7 @@ mod tests {
                 .iter()
                 .map(|q| q.track.video_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["b"]
+            vec!["a", "b"]
         );
     }
 

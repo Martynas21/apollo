@@ -134,6 +134,9 @@ impl PlayerRegistry {
         state.current_track_id = None;
         state.now_playing = None;
         state.paused = false;
+        // The stalled track is skipped, so it comes off the head of the
+        // queue rather than being started again by the rejoin.
+        self.finish_queue_head(guild_id).await;
         true
     }
 

@@ -140,15 +140,16 @@ impl PlayerRegistry {
         if !guilds.contains_key(&guild_id) {
             return None;
         }
-        let next = self.pop_queue_front(guild_id).await;
+        let next = self.finish_queue_head(guild_id).await;
         let state = guilds.get_mut(&guild_id)?;
         state.now_playing = next.clone();
         next.map(|queued| (queued, state.epoch))
     }
 
-    /// Promotes the front of the queue only if nothing is playing or
-    /// loading, with the check and the pop under one lock so two callers
-    /// cannot both find the guild idle and each start a track.
+    /// Takes the head of the queue as the current track, but only if nothing
+    /// is playing or loading, with the check and the claim under one lock so
+    /// two callers cannot both find the guild idle and each start a track.
+    /// The track stays at the head of the queue for as long as it is current.
     async fn promote_next_if_idle(&self, guild_id: GuildId) -> Promotion {
         let mut guilds = self.guilds.lock().await;
         let Some(state) = guilds.get_mut(&guild_id) else {
@@ -157,18 +158,32 @@ impl PlayerRegistry {
         if state.now_playing.is_some() {
             return Promotion::Busy;
         }
-        let Some(next) = self.pop_queue_front(guild_id).await else {
+        let Some(next) = self.queue_head(guild_id).await else {
             return Promotion::QueueEmpty;
         };
         state.now_playing = Some(next.clone());
         Promotion::Track(next, state.epoch)
     }
 
-    async fn pop_queue_front(&self, guild_id: GuildId) -> Option<QueuedTrack> {
-        match db::queue_pop_front(&self.db, &guild_id.to_string()).await {
+    /// The track at the head of the queue: the current one while a guild is
+    /// playing, the one to start next while it is not.
+    pub(super) async fn queue_head(&self, guild_id: GuildId) -> Option<QueuedTrack> {
+        match db::queue_current(&self.db, &guild_id.to_string()).await {
             Ok(next) => next,
             Err(err) => {
-                tracing::warn!(%guild_id, %err, "failed to pop the next queued track");
+                tracing::warn!(%guild_id, %err, "failed to read the head of the queue");
+                None
+            }
+        }
+    }
+
+    /// Drops the track at the head of the queue, which is done with, and
+    /// hands back the one that takes its place.
+    pub(super) async fn finish_queue_head(&self, guild_id: GuildId) -> Option<QueuedTrack> {
+        match db::queue_finish_current(&self.db, &guild_id.to_string()).await {
+            Ok(next) => next,
+            Err(err) => {
+                tracing::warn!(%guild_id, %err, "failed to drop the finished track");
                 None
             }
         }

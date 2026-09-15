@@ -42,6 +42,13 @@ pub(super) struct GuildState {
 }
 
 impl GuildState {
+    /// The stored queue keeps a guild's current track at its head, so an
+    /// index into the upcoming list sits one further along whenever the
+    /// guild has one.
+    pub(super) fn upcoming_offset(&self) -> usize {
+        usize::from(self.now_playing.is_some())
+    }
+
     /// Takes the outcome parked for `track_id`, dropping one parked for any
     /// other track since that track can no longer be committed.
     pub(super) fn take_uncommitted_outcome(&mut self, track_id: Uuid) -> Option<TrackOutcome> {
@@ -84,7 +91,6 @@ pub(super) enum AdvanceFill {
 }
 
 pub(super) struct SessionSnapshot {
-    pub(super) now_playing: Option<QueuedTrack>,
     pub(super) last_played: Option<QueuedTrack>,
     pub(super) radio_enabled: bool,
     pub(super) radio_requested_by: Option<UserId>,
@@ -94,7 +100,6 @@ pub(super) struct SessionSnapshot {
 impl From<&GuildState> for SessionSnapshot {
     fn from(state: &GuildState) -> Self {
         Self {
-            now_playing: state.now_playing.clone(),
             last_played: state.last_played.clone(),
             radio_enabled: state.radio_enabled,
             radio_requested_by: state.radio_requested_by,
@@ -143,12 +148,20 @@ impl PlayerRegistry {
         } else {
             self.load_last_played_from_db(guild_id).await
         };
-        let upcoming = db::queue_all(&self.db, &guild_id.to_string())
+        let mut queued = db::queue_all(&self.db, &guild_id.to_string())
             .await
             .unwrap_or_else(|err| {
                 tracing::warn!(%guild_id, %err, "failed to load queue snapshot");
                 Vec::new()
             });
+        // The head of the stored queue is the current track itself, so it
+        // belongs to `now_playing`/`loading` rather than to the upcoming
+        // list the dashboard renders behind them.
+        let upcoming = if (now_playing.is_some() || loading.is_some()) && !queued.is_empty() {
+            queued.split_off(1)
+        } else {
+            queued
+        };
         QueueSnapshot {
             now_playing,
             loading,

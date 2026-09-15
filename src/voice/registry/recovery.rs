@@ -126,6 +126,7 @@ impl PlayerRegistry {
                 if let Some(prefetch) = state.prefetch.take() {
                     discard_prefetch(prefetch);
                 }
+                self.finish_queue_head(guild_id).await;
             }
         }
         self.schedule_idle_disconnect(guild_id);
@@ -331,7 +332,9 @@ mod tests {
         let a_id = current_track_id(&registry, guild_id).await;
 
         backend.finish_track(guild_id, a_id).await;
-        registry.settle_playback_start(guild_id).await;
+        // Waiting on the track itself, since the guild still reads as playing
+        // "a" for as long as it takes the finish to be applied.
+        wait_until(|| backend.call_for(guild_id).unwrap().played_video_ids().len() == 2).await;
 
         assert_eq!(
             backend.call_for(guild_id).unwrap().played_video_ids(),

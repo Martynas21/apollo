@@ -12,7 +12,8 @@ voice/error.rs        PlayerError
 voice/state.rs        GuildState, QueueSnapshot, SessionSnapshot,
                       StartOutcome, AdvanceFill + derived-state accessors
                       (`is_paused`, `track_status`, `queue_snapshot`)
-voice/registry/mod.rs        struct PlayerRegistry, new(), shared helpers
+voice/registry/mod.rs        struct PlayerRegistry, new(), queue_head/finish_queue_head,
+                             promote_next*, shared helpers
 voice/registry/queue.rs      enqueue, enqueue_next, enqueue_many, remove_queue_track,
                              move_queue_track, play_queue_track, clear_queue, shuffle
 voice/registry/playback.rs   spawn/run_start_sequence, try_start_playback,
@@ -49,7 +50,9 @@ round trip.
 Buffering is the gap between `enqueue`/`advance` setting `now_playing`
 (so a track shows immediately) and `commit_started_track` setting
 `current_track_id` once the audio source has actually resolved and playback
-has started via `VoiceCall::play`.
+has started via `VoiceCall::play`. In all three of Buffering, Playing and
+Paused, `now_playing` is the head of the persisted queue — see "The queue
+holds the current track".
 
 Dashboard transport buttons: Pause/Resume, Skip, and Stop are disabled
 whenever `now_playing` is `None` (Empty and Queue-finished). Shuffle is
@@ -68,6 +71,13 @@ it changes what happens around the edges:
   `run_radio_refill`, which picks a weighted-random seed from
   `radio_history`, lists a YouTube mix, hydrates a few unplayed candidates,
   and pushes them onto the queue.
+- **The persisted flag is the truth.** `is_radio_enabled` answers from
+  `GuildState` while a guild has one and from its persisted session when it
+  does not, and `toggle_radio` flips whichever of the two it was showing. With
+  no live session to persist, the toggle writes only the flag
+  (`db::set_guild_radio_enabled`), leaving the radio seed, the history and
+  `last_played` as they are, so what the dashboard shows is what the next join
+  restores.
 - **`stop()` silently disables it.** It unconditionally clears
   `radio_enabled`, `radio_history`, `radio_requested_by`, and
   `radio_played` — there is no separate "radio survives a stop" mode.
@@ -95,8 +105,8 @@ the track handle for its status; a track that is not paused and whose
 reported position has not changed for 30 s is stopped, which ends it like any
 other track and lets `advance()` promote the next one. If the audio worker
 has not reported the stopped track as ended within a further 10 s, the
-watchdog drops the track (`now_playing` and the handle are cleared without
-starting another) and rebuilds the guild's voice session (`leave` then
+watchdog drops the track (`now_playing`, the handle, and the track's row at
+the head of the queue are cleared without starting another) and rebuilds the guild's voice session (`leave` then
 `join` on the same channel, which replaces the worker's driver; the rejoin
 restores the persisted session and starts the rest of the queue exactly
 once), since a worker that ignores a stop is not going to play the next
@@ -107,12 +117,51 @@ plus the stall allowance. The audio worker's own stream reads time out after
 reached, so the watchdog only fires for a track that genuinely cannot recover
 on its own.
 
+## The queue holds the current track
+
+`guild_session_queue` is the only place a playable track is ever stored: a
+guild's current track sits at the **head** of its queue, with the upcoming
+tracks behind it. Starting a track does not remove its row — claiming it
+(`queue_head`) only copies it into `GuildState::now_playing`; the row goes
+away when the track ends, fails, or is given up on (`queue_finish_current`,
+which drops the head and returns whatever takes its place). `guild_sessions`
+keeps radio settings and `last_played`, neither of which is ever started on
+its own.
+
+Everything follows from that:
+
+- **`now_playing` mirrors the head.** `GuildState::upcoming_offset()` is `1`
+  while a guild has a current track and `0` when it does not, and every queue
+  action shifts by it: `queue_snapshot` drops the head from `upcoming`,
+  `enqueue_next` inserts at `offset`, `remove`/`move`/`play_queue_track` map a
+  dashboard index to `offset + index`, `clear_queue` truncates to `offset`,
+  `shuffle` shuffles `items[offset..]`, and `arm_next_prefetch` prefetches
+  `queue_upcoming_front` (the row after the head).
+- **A teardown leaves nothing behind but a queue.** `leave`, `leave_if_idle`,
+  a lost connection and the process exiting all drop `GuildState`; the track
+  that was playing stays exactly where it was, and with nothing playing it
+  simply reads as the first upcoming track. There is no resume slot to
+  reconcile, and nothing queued to play that the dashboard does not show.
+- **Coming back starts it again.** `restore_session_if_new` restores the radio
+  settings and `last_played`, then takes the head of the queue as the track to
+  start (`kick_off_if_idle` does the same on any other `join`), so a restart
+  resumes the interrupted track from the beginning, as it always has.
+- **Clearing means clearing.** `clear_queue` keeps the head only when it is
+  a current track; with nothing playing, the whole queue goes, and the next
+  track to play is the next one enqueued.
+
+Rows whose `requested_by` is not a plain snowflake cannot be parsed back into
+a track, so every read filters them out (`usable_row!` in `db/queue.rs`) and
+`queue_finish_current` deletes any that sit ahead of the head, rather than
+letting one wedge a queue.
+
 ## Start failures and early errors
 
 `run_start_sequence` walks the queue past tracks whose stream cannot be
-resolved, but gives up after three consecutive failures: the failed
-candidates are dropped, `now_playing` is cleared, and the rest of the queue
-is left in place. Joining the guild again (any `join`, including one to the
+resolved, but gives up after three consecutive failures: each failed
+candidate is dropped off the head of the queue as it is passed over
+(`promote_next`, then `abandon_start` for the last one), `now_playing` is
+cleared, and the rest of the queue is left in place. Joining the guild again (any `join`, including one to the
 channel it is already in) starts that queue via `kick_off_if_idle`, and so
 does `play_queue_track`; `stop` clears it. A guild with nothing playing or
 loading counts as idle for `leave_if_idle` whether or not such a queue
@@ -152,7 +201,7 @@ off; where it doesn't, a single cell covers both.
 | `stop` | `NothingPlaying`, or clears a queue left behind by an abandoned start | clears `now_playing`/queue, disables radio | stops the handle, clears queue/radio state, bumps `epoch`; the idle timer and persisted session are settled even if the worker does not answer | same as Playing | `NothingPlaying`, or clears a queue left behind |
 | `shuffle` | `NothingToShuffle` (queue has < 2) | same | shuffles the upcoming queue if it has ≥ 2 tracks, restarts the prefetch | same as Playing | `NothingToShuffle` unless a queue survived |
 | `toggle_radio` | flips the flag; refills if turning on with an empty queue | same | same | same | same |
-| `clear_queue` | `QueueEmpty` | `QueueEmpty` unless upcoming tracks exist | drops upcoming, leaves `now_playing` alone; refills if radio is on | same as Playing | `QueueEmpty` |
+| `clear_queue` | `QueueEmpty`, or empties a queue left behind | `QueueEmpty` unless upcoming tracks exist; otherwise drops them, keeping the loading track at the head | drops upcoming, leaves `now_playing` (the head) alone; refills if radio is on | same as Playing | `QueueEmpty`, or empties a queue left behind |
 | `set_volume` | persists the setting; no current track to apply it to | persists; no handle yet | persists and applies to the current handle | same as Playing | persists |
 | `remove_queue_track` | `InvalidQueueIndex` | `InvalidQueueIndex` unless upcoming tracks exist | removes the track at that queue position, leaves `now_playing` alone, restarts the prefetch if the first upcoming track changed | same as Playing | `InvalidQueueIndex` |
 | `move_queue_track` | `InvalidQueueIndex` | `InvalidQueueIndex` unless upcoming tracks exist | moves an upcoming track from one queue position to another, shifting the tracks in between, leaves `now_playing` alone, restarts the prefetch if the first upcoming track changed | same as Playing | `InvalidQueueIndex` |

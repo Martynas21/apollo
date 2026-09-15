@@ -5,12 +5,14 @@ use std::time::Duration;
 
 use crate::model::{QueuedTrack, Track};
 
+/// What a guild keeps besides its queue: its radio settings and the track it
+/// played last. Nothing here is ever started on its own — the queue holds
+/// every track a guild is going to play, the current one included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedSession {
     pub radio_enabled: bool,
     pub radio_requested_by: Option<String>,
     pub radio_history: Vec<String>,
-    pub now_playing: Option<(Track, String)>,
     pub last_played: Option<(Track, String)>,
 }
 
@@ -53,31 +55,21 @@ pub async fn save_guild_session_meta(
     radio_enabled: bool,
     radio_requested_by: Option<&str>,
     radio_history: &[String],
-    now_playing: Option<(&Track, &str)>,
     last_played: Option<(&Track, &str)>,
 ) -> Result<()> {
-    let (np_video_id, np_title, np_channel, np_duration_secs, np_requested_by) =
-        session_track_columns(now_playing);
     let (lp_video_id, lp_title, lp_channel, lp_duration_secs, lp_requested_by) =
         session_track_columns(last_played);
 
     sqlx::query(
         "INSERT INTO guild_sessions \
          (guild_id, radio_enabled, radio_requested_by, radio_history, \
-          now_playing_video_id, now_playing_title, now_playing_channel, \
-          now_playing_duration_secs, now_playing_requested_by, \
           last_played_video_id, last_played_title, last_played_channel, \
           last_played_duration_secs, last_played_requested_by) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(guild_id) DO UPDATE SET
              radio_enabled = excluded.radio_enabled,
              radio_requested_by = excluded.radio_requested_by,
              radio_history = excluded.radio_history,
-             now_playing_video_id = excluded.now_playing_video_id,
-             now_playing_title = excluded.now_playing_title,
-             now_playing_channel = excluded.now_playing_channel,
-             now_playing_duration_secs = excluded.now_playing_duration_secs,
-             now_playing_requested_by = excluded.now_playing_requested_by,
              last_played_video_id = excluded.last_played_video_id,
              last_played_title = excluded.last_played_title,
              last_played_channel = excluded.last_played_channel,
@@ -88,11 +80,6 @@ pub async fn save_guild_session_meta(
     .bind(radio_enabled)
     .bind(radio_requested_by)
     .bind(encode_radio_history(radio_history))
-    .bind(np_video_id)
-    .bind(np_title)
-    .bind(np_channel)
-    .bind(np_duration_secs)
-    .bind(np_requested_by)
     .bind(lp_video_id)
     .bind(lp_title)
     .bind(lp_channel)
@@ -136,11 +123,6 @@ type GuildSessionRow = (
     Option<String>,
     Option<i64>,
     Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<String>,
 );
 
 async fn fetch_guild_session_row(
@@ -149,8 +131,6 @@ async fn fetch_guild_session_row(
 ) -> Result<Option<GuildSessionRow>> {
     sqlx::query_as(
         "SELECT radio_enabled, radio_requested_by, radio_history, \
-                now_playing_video_id, now_playing_title, now_playing_channel, \
-                now_playing_duration_secs, now_playing_requested_by, \
                 last_played_video_id, last_played_title, last_played_channel, \
                 last_played_duration_secs, last_played_requested_by \
          FROM guild_sessions WHERE guild_id = ?1",
@@ -169,11 +149,6 @@ pub async fn load_guild_session(
         radio_enabled,
         radio_requested_by,
         radio_history,
-        np_video_id,
-        np_title,
-        np_channel,
-        np_duration_secs,
-        np_requested_by,
         lp_video_id,
         lp_title,
         lp_channel,
@@ -184,13 +159,6 @@ pub async fn load_guild_session(
         return Ok(None);
     };
 
-    let now_playing = track_from_columns(
-        np_video_id,
-        np_title,
-        np_channel,
-        np_duration_secs,
-        np_requested_by,
-    );
     let last_played = track_from_columns(
         lp_video_id,
         lp_title,
@@ -203,9 +171,31 @@ pub async fn load_guild_session(
         radio_enabled,
         radio_requested_by,
         radio_history: decode_radio_history(&radio_history),
-        now_playing,
         last_played,
     }))
+}
+
+/// Writes just the radio flag, leaving the rest of the session — its radio
+/// seed, history and last-played track — as it stands. What the dashboard
+/// reads back is what the next join restores, whether or not a guild had a
+/// live session to persist at the time.
+pub async fn set_guild_radio_enabled(
+    pool: &SqlitePool,
+    guild_id: &str,
+    enabled: bool,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO guild_sessions (guild_id, radio_enabled, radio_requested_by, radio_history) \
+         VALUES (?1, ?2, NULL, '') \
+         ON CONFLICT(guild_id) DO UPDATE SET radio_enabled = excluded.radio_enabled",
+    )
+    .bind(guild_id)
+    .bind(enabled)
+    .execute(pool)
+    .await
+    .context("failed to save the radio setting")?;
+
+    Ok(())
 }
 
 pub async fn clear_guild_session(pool: &SqlitePool, guild_id: &str) -> Result<()> {
@@ -243,19 +233,11 @@ mod tests {
     use crate::db::testing::{sample_queued, sample_track};
     use crate::db::{queue_all, queue_push_back};
 
-    fn sample_session(now_playing: Option<(Track, &str)>) -> PersistedSession {
-        sample_session_with_last_played(now_playing, None)
-    }
-
-    fn sample_session_with_last_played(
-        now_playing: Option<(Track, &str)>,
-        last_played: Option<(Track, &str)>,
-    ) -> PersistedSession {
+    fn sample_session(last_played: Option<(Track, &str)>) -> PersistedSession {
         PersistedSession {
             radio_enabled: true,
             radio_requested_by: Some("42".to_string()),
             radio_history: vec!["a".to_string(), "b".to_string()],
-            now_playing: now_playing.map(|(track, requested_by)| (track, requested_by.to_string())),
             last_played: last_played.map(|(track, requested_by)| (track, requested_by.to_string())),
         }
     }
@@ -271,10 +253,6 @@ mod tests {
             session.radio_enabled,
             session.radio_requested_by.as_deref(),
             &session.radio_history,
-            session
-                .now_playing
-                .as_ref()
-                .map(|(track, requested_by)| (track, requested_by.as_str())),
             session
                 .last_played
                 .as_ref()
@@ -307,24 +285,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guild_session_persists_last_played_independently_of_now_playing() -> Result<()> {
+    async fn guild_session_keeps_its_radio_settings_without_a_last_played() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
-        let session = sample_session_with_last_played(
-            None,
-            Some((sample_track("a", Some(Duration::from_secs(30))), "42")),
-        );
 
-        save_session(&pool, "1", &session).await?;
+        save_session(&pool, "1", &sample_session(None)).await?;
 
         let loaded = load_guild_session(&pool, "1").await?.expect("row exists");
-        assert_eq!(loaded.now_playing, None);
-        assert_eq!(
-            loaded.last_played,
-            Some((
-                sample_track("a", Some(Duration::from_secs(30))),
-                "42".to_string()
-            ))
-        );
+        assert_eq!(loaded.last_played, None);
+        assert!(loaded.radio_enabled);
+        assert_eq!(loaded.radio_history, vec!["a".to_string(), "b".to_string()]);
 
         Ok(())
     }
@@ -348,22 +317,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saving_meta_with_no_now_playing_leaves_existing_queue_rows_alone() -> Result<()> {
+    async fn saving_meta_leaves_the_queue_alone() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
+        queue_push_back(&pool, "1", &sample_queued("b", None, 42)).await?;
+
         save_session(
             &pool,
             "1",
             &sample_session(Some((sample_track("a", None), "42"))),
         )
         .await?;
-        queue_push_back(&pool, "1", &sample_queued("b", None, 42)).await?;
 
-        save_session(&pool, "1", &sample_session(None)).await?;
-
-        let session = load_guild_session(&pool, "1")
-            .await?
-            .expect("row still exists");
-        assert_eq!(session.now_playing, None);
         assert_eq!(
             queue_all(&pool, "1")
                 .await?

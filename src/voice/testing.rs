@@ -499,3 +499,33 @@ pub(super) fn upcoming_ids(snapshot: &QueueSnapshot) -> Vec<String> {
         .map(|t| t.track.video_id.clone())
         .collect()
 }
+
+/// Seeds what a guild left behind: the persisted queue it is restored from,
+/// its current track first, then the tracks behind it.
+pub(super) async fn persist_queue(registry: &PlayerRegistry, guild_id: GuildId, ids: &[&str]) {
+    for id in ids {
+        db::queue_push_back(&registry.db, &guild_id.to_string(), &queued(id))
+            .await
+            .expect("in-memory queue push");
+    }
+}
+
+/// Seeds the radio settings a guild left behind, alongside `persist_queue`.
+pub(super) async fn persist_radio(
+    registry: &PlayerRegistry,
+    guild_id: GuildId,
+    requested_by: Option<&str>,
+    history: &[&str],
+) {
+    let history: Vec<String> = history.iter().map(|id| (*id).to_string()).collect();
+    db::save_guild_session_meta(
+        &registry.db,
+        &guild_id.to_string(),
+        requested_by.is_some(),
+        requested_by,
+        &history,
+        None,
+    )
+    .await
+    .expect("in-memory session save");
+}

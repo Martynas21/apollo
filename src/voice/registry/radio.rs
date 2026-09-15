@@ -36,15 +36,23 @@ impl PlayerRegistry {
     pub async fn toggle_radio(&self, guild_id: GuildId) -> bool {
         let (enabled, needs_refill) = {
             let mut guilds = self.guilds.lock().await;
+            // Flip what the dashboard was showing: for a guild with no live
+            // state that is the persisted setting, not a fresh default.
+            let was_enabled = match guilds.get(&guild_id) {
+                Some(state) => state.radio_enabled,
+                None => self.persisted_radio_enabled(guild_id).await,
+            };
             let state = guilds.entry(guild_id).or_default();
-            state.radio_enabled = !state.radio_enabled;
+            state.radio_enabled = !was_enabled;
             state.radio_exhausted = false;
             let enabled = state.radio_enabled;
             let needs_refill = if enabled {
-                db::queue_len(&self.db, &guild_id.to_string())
+                let queued = db::queue_len(&self.db, &guild_id.to_string())
                     .await
-                    .unwrap_or(0)
-                    == 0
+                    .unwrap_or(0);
+                // The current track sits at the head of the same queue, so
+                // "nothing upcoming" is one row, not none.
+                queued <= state.upcoming_offset()
             } else {
                 false
             };
@@ -56,22 +64,40 @@ impl PlayerRegistry {
         }
 
         if self.is_connected(guild_id) {
-            // Persisting here while disconnected would upsert a blank
-            // `now_playing`/`last_played` over whatever session is actually
-            // persisted for this guild, before the next real `join()` gets a
-            // chance to restore it (see `restore_session_if_new`). The
-            // toggle simply doesn't stick across a disconnect; restoring
-            // still picks up the DB's last real radio setting.
             self.persist_session(guild_id).await;
+        } else if let Err(err) =
+            db::set_guild_radio_enabled(&self.db, &guild_id.to_string(), enabled).await
+        {
+            // Only the flag: persisting the whole session from a guild with
+            // no live state would put a blank `last_played` and an empty
+            // history over the real ones, which the next join restores.
+            tracing::warn!(%guild_id, %err, "failed to persist the radio setting");
         }
         enabled
     }
 
+    /// A guild with no live state still has a radio setting: the one its
+    /// session carries and the next join restores. Reading through to it
+    /// keeps the dashboard's toggle showing what will actually happen,
+    /// exactly as the queue shows what will actually play.
     pub async fn is_radio_enabled(&self, guild_id: GuildId) -> bool {
-        let guilds = self.guilds.lock().await;
-        guilds
-            .get(&guild_id)
-            .is_some_and(|state| state.radio_enabled)
+        {
+            let guilds = self.guilds.lock().await;
+            if let Some(state) = guilds.get(&guild_id) {
+                return state.radio_enabled;
+            }
+        }
+        self.persisted_radio_enabled(guild_id).await
+    }
+
+    async fn persisted_radio_enabled(&self, guild_id: GuildId) -> bool {
+        match db::load_guild_session(&self.db, &guild_id.to_string()).await {
+            Ok(session) => session.is_some_and(|session| session.radio_enabled),
+            Err(err) => {
+                tracing::warn!(%guild_id, %err, "failed to load the persisted radio setting");
+                false
+            }
+        }
     }
 
     pub(super) fn maybe_spawn_radio_refill(&self, guild_id: GuildId) {
@@ -281,12 +307,12 @@ impl PlayerRegistry {
         if state.now_playing.is_some() {
             return AdvanceFill::AlreadyStarted;
         }
-        let next = match db::queue_pop_front(&self.db, &guild_id.to_string()).await {
+        let next = match db::queue_current(&self.db, &guild_id.to_string()).await {
             Ok(next) => next,
             Err(err) => {
                 tracing::warn!(
                     %guild_id, %err,
-                    "failed to pop the next queued track after radio refill wait"
+                    "failed to read the queue after the radio refill wait"
                 );
                 None
             }
@@ -305,7 +331,8 @@ mod tests {
 
     use super::*;
     use crate::voice::testing::{
-        current_track_id, joined_registry, new_registry, queued, upcoming_ids,
+        current_track_id, joined_registry, new_registry, persist_queue, persist_radio, queued,
+        upcoming_ids,
     };
 
     #[test]
@@ -392,19 +419,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn radio_reads_the_persisted_setting_when_a_guild_has_no_live_state() {
+        let (registry, _backend, guild_id) = new_registry().await;
+        persist_radio(&registry, guild_id, Some("1"), &["a"]).await;
+
+        assert!(registry.is_radio_enabled(guild_id).await);
+    }
+
+    #[tokio::test]
+    async fn radio_reads_as_off_for_a_guild_with_nothing_persisted() {
+        let (registry, _backend, guild_id) = new_registry().await;
+
+        assert!(!registry.is_radio_enabled(guild_id).await);
+    }
+
+    #[tokio::test]
+    async fn toggling_radio_while_disconnected_flips_the_persisted_setting() {
+        let (registry, _backend, guild_id) = new_registry().await;
+        persist_radio(&registry, guild_id, Some("1"), &["a"]).await;
+
+        assert!(!registry.toggle_radio(guild_id).await);
+
+        assert!(!registry.is_radio_enabled(guild_id).await);
+        let session = db::load_guild_session(&registry.db, &guild_id.to_string())
+            .await
+            .unwrap()
+            .expect("the session should still be there");
+        assert!(!session.radio_enabled);
+        assert_eq!(
+            session.radio_requested_by,
+            Some("1".to_string()),
+            "the radio seed and history are none of the toggle's business"
+        );
+        assert_eq!(session.radio_history, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_radio_toggle_made_while_disconnected_survives_the_next_join() {
+        let (registry, _backend, guild_id) = new_registry().await;
+        persist_radio(&registry, guild_id, Some("1"), &["a"]).await;
+
+        registry.toggle_radio(guild_id).await;
+        registry.join(guild_id, ChannelId::new(2)).await.unwrap();
+
+        assert!(!registry.is_radio_enabled(guild_id).await);
+    }
+
+    #[tokio::test]
     async fn toggling_radio_while_disconnected_does_not_block_a_later_session_restore() {
         let (registry, backend, guild_id) = new_registry().await;
-        db::save_guild_session_meta(
-            &registry.db,
-            &guild_id.to_string(),
-            true,
-            Some("1"),
-            &["a".to_string()],
-            Some((&queued("a").track, "1")),
-            None,
-        )
-        .await
-        .unwrap();
+        persist_queue(&registry, guild_id, &["a"]).await;
+        persist_radio(&registry, guild_id, Some("1"), &["a"]).await;
 
         // `toggle_radio` creates a `GuildState` map entry with no connection
         // precondition; that must not block the later real `join()` from
