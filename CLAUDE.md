@@ -118,6 +118,10 @@ Key points:
 - `src/youtube/api.rs` — the `yt-dlp` subprocess client (search,
   single-video metadata, playlist listing — all via `yt-dlp -j`) plus
   `extract_video_id` for pulling a video ID out of a YouTube URL.
+- `src/voice/presence.rs` — counts listeners in the bot's voice channel from
+  the serenity cache; `main.rs`'s `voice_state_update` leaves voice when
+  there have been none for 30 s (the last one left, or the bot joined an
+  empty channel).
 - `src/voice/resolve.rs` — resolves a track to a direct streamable URL
   (metadata-only `yt-dlp -j`, no download). `src/voice/mod.rs` does the
   `yt-dlp` startup dependency check.

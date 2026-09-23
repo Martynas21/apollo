@@ -138,7 +138,8 @@ Everything follows from that:
   `shuffle` shuffles `items[offset..]`, and `arm_next_prefetch` prefetches
   `queue_upcoming_front` (the row after the head).
 - **A teardown leaves nothing behind but a queue.** `leave`, `leave_if_idle`,
-  a lost connection and the process exiting all drop `GuildState`; the track
+  a lost connection, the bot being left alone in its voice channel (see
+  `voice::presence`) and the process exiting all drop `GuildState`; the track
   that was playing stays exactly where it was, and with nothing playing it
   simply reads as the first upcoming track. There is no resume slot to
   reconcile, and nothing queued to play that the dashboard does not show.
@@ -207,7 +208,7 @@ off; where it doesn't, a single cell covers both.
 | `move_queue_track` | `InvalidQueueIndex` | `InvalidQueueIndex` unless upcoming tracks exist | moves an upcoming track from one queue position to another, shifting the tracks in between, leaves `now_playing` alone, restarts the prefetch if the first upcoming track changed | same as Playing | `InvalidQueueIndex` |
 | `play_queue_track` | `InvalidQueueIndex`, or starts the chosen track of a queue left behind | `InvalidQueueIndex` unless upcoming tracks exist | pulls the chosen upcoming track out of the queue, stops the current handle without requeuing it, and starts the chosen track immediately; every other upcoming track keeps its relative order | same as Playing | same as Empty |
 
-All of these are reached only through `src/web/api.rs`'s HTTP handlers — there
+All of these are reached only through the HTTP handlers in `src/web/routes/` — there
 is no longer a Discord-side command or panel driving them.
 
 In every case, the action either succeeds, silently no-ops, or returns a

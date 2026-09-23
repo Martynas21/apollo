@@ -8,6 +8,7 @@
 pub mod backend;
 pub mod error;
 pub mod ipc_backend;
+pub mod presence;
 pub mod radio;
 mod registry;
 pub mod resolve;

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serenity::all::{GuildId, UserId};
+use serenity::all::{ChannelId, GuildId, UserId};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -129,6 +129,10 @@ impl PlayerRegistry {
 
     pub fn is_connected(&self, guild_id: GuildId) -> bool {
         self.voice.call(guild_id).is_some()
+    }
+
+    pub async fn current_channel(&self, guild_id: GuildId) -> Option<ChannelId> {
+        self.voice.current_channel(guild_id).await
     }
 
     async fn cached_input(&self, queued: &QueuedTrack) -> Result<AudioSource, PlaybackError> {

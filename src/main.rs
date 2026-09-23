@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+use std::time::Duration;
+
 use anyhow::Context;
 use apollo::voice::PlayerRegistry;
 use apollo::voice::ipc_backend::IpcBackend;
@@ -50,7 +52,9 @@ async fn main() -> anyhow::Result<()> {
     let intents = serenity::GatewayIntents::GUILDS | serenity::GatewayIntents::GUILD_VOICE_STATES;
     let mut client = serenity::ClientBuilder::new(config.discord_token.clone(), intents)
         .application_id(serenity::ApplicationId::new(application_id))
-        .event_handler(Handler)
+        .event_handler(Handler {
+            player: player.clone(),
+        })
         .register_songbird_with(songbird)
         .await?;
 
@@ -69,7 +73,14 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-struct Handler;
+/// How long the bot stays in a channel with no listeners before leaving,
+/// so someone who drops out briefly, or joined the bot from the dashboard and
+/// has yet to follow, doesn't lose it.
+const ALONE_GRACE: Duration = Duration::from_secs(30);
+
+struct Handler {
+    player: PlayerRegistry,
+}
 
 #[async_trait::async_trait]
 impl serenity::EventHandler for Handler {
@@ -79,6 +90,63 @@ impl serenity::EventHandler for Handler {
 
     async fn resume(&self, _ctx: serenity::Context, _: serenity::ResumedEvent) {
         tracing::info!("resumed");
+    }
+
+    /// Leaves voice once the bot's channel has had no listeners for
+    /// `ALONE_GRACE`, whether the last one left or the bot itself arrived in
+    /// an empty channel.
+    async fn voice_state_update(
+        &self,
+        ctx: serenity::Context,
+        old: Option<serenity::VoiceState>,
+        new: serenity::VoiceState,
+    ) {
+        let Some(guild_id) = new.guild_id else {
+            return;
+        };
+
+        // The bot's own event can arrive before songbird records the new
+        // channel, so the grace task reads the channel only once it fires.
+        if new.user_id == ctx.cache.current_user().id {
+            if let Some(joined) = new.channel_id
+                && voice::presence::is_alone(&ctx.cache, guild_id, joined)
+            {
+                spawn_alone_grace(self.player.clone(), ctx.cache.clone(), guild_id);
+            }
+            return;
+        }
+
+        let Some(channel) = self.player.current_channel(guild_id).await else {
+            return;
+        };
+        if old.and_then(|state| state.channel_id) == Some(channel)
+            && voice::presence::is_alone(&ctx.cache, guild_id, channel)
+        {
+            spawn_alone_grace(self.player.clone(), ctx.cache.clone(), guild_id);
+        }
+    }
+}
+
+fn spawn_alone_grace(
+    player: PlayerRegistry,
+    cache: std::sync::Arc<serenity::Cache>,
+    guild_id: serenity::GuildId,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(ALONE_GRACE).await;
+        let Some(channel) = player.current_channel(guild_id).await else {
+            return;
+        };
+        if voice::presence::is_alone(&cache, guild_id, channel) {
+            leave_alone_channel(&player, guild_id).await;
+        }
+    });
+}
+
+async fn leave_alone_channel(player: &PlayerRegistry, guild_id: serenity::GuildId) {
+    tracing::info!(%guild_id, "left voice: channel empty");
+    if let Err(err) = player.leave(guild_id).await {
+        tracing::warn!(%guild_id, %err, "failed to leave an empty voice channel");
     }
 }
 
