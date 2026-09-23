@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Runs worker, apollo and tailscale funnel as windows in the current tmux
-# session, so they live as long as the session does. A window whose process
-# exits stays open (remain-on-exit) so its last output can be read.
+# Runs worker, apollo and tailscale funnel as windows in the apollo_stack
+# tmux session, creating it detached if it doesn't exist, so the script works
+# from inside or outside tmux. A window whose process exits stays open
+# (remain-on-exit) so its last output can be read.
 #
 #   ./run-native.sh [start]   build, then open the three windows
 #   ./run-native.sh stop      Ctrl-C each process, then close its window
@@ -10,10 +11,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-if [ -z "${TMUX:-}" ]; then
-    echo "run this from inside a tmux session" >&2
-    exit 1
-fi
+session=apollo_stack
 
 # Both binaries load .env themselves; the script only needs the addresses to
 # wait for the worker and to point the funnel at the dashboard.
@@ -39,25 +37,34 @@ worker_port="${worker_socket##*:}"
 dashboard_addr="$(require_env_value DASHBOARD_BIND_ADDR)"
 dashboard_port="${dashboard_addr##*:}"
 
+session_exists() {
+    tmux has-session -t "=$session" 2>/dev/null
+}
+
 window_exists() {
-    tmux list-windows -F '#{window_name}' | grep -qx "$1"
+    session_exists || return 1
+    tmux list-windows -t "=$session" -F '#{window_name}' | grep -qx "$1"
+}
+
+ensure_session() {
+    session_exists || tmux new-session -d -s "$session" -c "$PWD"
 }
 
 open_window() {
     local name="$1" cmd="$2"
-    tmux new-window -d -a -t ':{end}' -n "$name" -c "$PWD" "$cmd" \; \
-        set-window-option -t ":=$name" remain-on-exit on >/dev/null
+    tmux new-window -d -a -t "=$session:{end}" -n "$name" -c "$PWD" "$cmd" \; \
+        set-window-option -t "=$session:=$name" remain-on-exit on >/dev/null
 }
 
 close_window() {
     local name="$1"
     window_exists "$name" || return 0
-    tmux send-keys -t ":=$name" C-c
+    tmux send-keys -t "=$session:=$name" C-c
     for _ in $(seq 1 50); do
-        [ "$(tmux display-message -p -t ":=$name" '#{pane_dead}')" = 1 ] && break
+        [ "$(tmux display-message -p -t "=$session:=$name" '#{pane_dead}')" = 1 ] && break
         sleep 0.1
     done
-    tmux kill-window -t ":=$name"
+    tmux kill-window -t "=$session:=$name"
 }
 
 start() {
@@ -66,6 +73,7 @@ start() {
         close_window "$name"
     done
 
+    ensure_session
     open_window worker ./target/release/apollo-audio-worker
     for _ in $(seq 1 50); do
         (exec 3<>"/dev/tcp/$worker_host/$worker_port") 2>/dev/null && break
@@ -74,7 +82,8 @@ start() {
 
     open_window apollo ./target/release/apollo
     open_window funnel "tailscale funnel $dashboard_port"
-    echo "started windows: worker, apollo, funnel"
+    echo "started windows in tmux session $session: worker, apollo, funnel"
+    [ -n "${TMUX:-}" ] || echo "attach with: tmux attach -t $session"
 }
 
 stop() {
