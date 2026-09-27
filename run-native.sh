@@ -7,6 +7,7 @@
 #   ./run-native.sh [start]   build, then open the three windows
 #   ./run-native.sh stop      Ctrl-C each process, then close its window
 #   ./run-native.sh restart   build, then stop and start
+#   ./run-native.sh build     build only
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -67,8 +68,14 @@ close_window() {
     tmux kill-window -t "=$session:=$name"
 }
 
+# Built and run on the same machine, so the binaries can use every
+# instruction this CPU has.
+build() {
+    RUSTFLAGS="-C target-cpu=native ${RUSTFLAGS:-}" cargo build --release --workspace
+}
+
 start() {
-    cargo build --release --workspace
+    build
     for name in worker apollo funnel; do
         close_window "$name"
     done
@@ -96,9 +103,10 @@ stop() {
 case "${1:-start}" in
     start) start ;;
     stop) stop ;;
-    restart) cargo build --release --workspace && stop && start ;;
+    build) build ;;
+    restart) build && stop && start ;;
     *)
-        echo "usage: $0 [start|stop|restart]" >&2
+        echo "usage: $0 [start|stop|restart|build]" >&2
         exit 1
         ;;
 esac
