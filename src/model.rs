@@ -16,6 +16,7 @@ pub struct Track {
 
 pub struct PlaylistListing {
     pub title: Option<String>,
+    pub author: Option<String>,
     pub tracks: Vec<Track>,
 }
 
@@ -24,6 +25,7 @@ pub struct PlaylistListing {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaylistPreview {
     pub title: Option<String>,
+    pub author: Option<String>,
     pub track_count: Option<usize>,
     pub thumbnail_video_id: Option<String>,
 }

@@ -178,10 +178,19 @@ mod tests {
             "1",
             "Chill Mix",
             "https://example.com/list=abc",
+            None,
             "42",
         )
         .await?;
-        save_guild_playlist(&pool, "1", "Workout", "https://example.com/list=def", "42").await?;
+        save_guild_playlist(
+            &pool,
+            "1",
+            "Workout",
+            "https://example.com/list=def",
+            None,
+            "42",
+        )
+        .await?;
 
         assert_eq!(top_played_playlists(&pool, "1", 10).await?, Vec::new());
 

@@ -1674,10 +1674,20 @@
       name.textContent = playlist.name;
       chip.appendChild(name);
 
-      const count = document.createElement('div');
-      count.className = 'playlist-count text-sm text-secondary truncate';
+      const meta = document.createElement('div');
+      meta.className = 'flex items-center justify-between gap-2 min-w-0 text-sm text-secondary';
+      const count = document.createElement('span');
+      count.className = 'playlist-count shrink-0';
       count.textContent = `${playlist.track_count} track${playlist.track_count === 1 ? '' : 's'}`;
-      chip.appendChild(count);
+      meta.appendChild(count);
+      if (playlist.author) {
+        const author = document.createElement('span');
+        author.className = 'playlist-author truncate';
+        author.textContent = playlist.author;
+        author.title = playlist.author;
+        meta.appendChild(author);
+      }
+      chip.appendChild(meta);
 
       const actions = document.createElement('div');
       actions.className = 'playlist-actions flex items-center justify-end gap-1';

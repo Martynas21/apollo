@@ -41,6 +41,7 @@ pub fn routes() -> Router<WebState> {
 struct PlaylistJson {
     id: i64,
     name: String,
+    author: Option<String>,
     track_count: usize,
     thumbnail_video_id: Option<String>,
 }
@@ -77,6 +78,7 @@ async fn list_playlists(State(state): State<WebState>, Path(guild_id): Path<Stri
         playlists_json.push(PlaylistJson {
             id: playlist.id,
             name: playlist.name,
+            author: playlist.author,
             track_count: tracks.len(),
             thumbnail_video_id,
         });
@@ -151,6 +153,7 @@ async fn import_playlist(
         &guild_id.to_string(),
         &name,
         &body.url,
+        listing.author.as_deref(),
         &added_by,
     )
     .await
@@ -170,6 +173,7 @@ async fn import_playlist(
     Json(PlaylistJson {
         id,
         name,
+        author: listing.author,
         track_count: listing.tracks.len(),
         thumbnail_video_id,
     })
@@ -207,10 +211,21 @@ async fn refresh_playlist(
         );
     }
 
+    let author = match db::set_playlist_author(&state.db, playlist.id, listing.author.as_deref())
+        .await
+    {
+        Ok(()) => listing.author,
+        Err(err) => {
+            tracing::warn!(%err, playlist_id, "dashboard failed to update refreshed playlist author");
+            playlist.author
+        }
+    };
+
     let thumbnail_video_id = listing.tracks.first().map(|track| track.video_id.clone());
     Json(PlaylistJson {
         id: playlist.id,
         name: playlist.name,
+        author,
         track_count: listing.tracks.len(),
         thumbnail_video_id,
     })

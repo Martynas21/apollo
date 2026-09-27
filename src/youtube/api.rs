@@ -100,6 +100,17 @@ struct YtDlpEntry {
     playlist_title: Option<String>,
     #[serde(default)]
     playlist_count: Option<u64>,
+    #[serde(default)]
+    playlist_channel: Option<String>,
+    #[serde(default)]
+    playlist_uploader: Option<String>,
+}
+
+fn playlist_author(entry: YtDlpEntry) -> Option<String> {
+    entry
+        .playlist_channel
+        .or(entry.playlist_uploader)
+        .filter(|author| !author.is_empty())
 }
 
 fn track_from_entry(entry: YtDlpEntry) -> Option<Track> {
@@ -132,17 +143,23 @@ fn parse_tracks(stdout: &str) -> Vec<Track> {
         .collect()
 }
 
+// Every entry of a flat listing repeats the playlist-level fields, so the
+// first entry that carries one is as good as any.
+fn first_playlist_field(
+    stdout: &str,
+    field: impl Fn(YtDlpEntry) -> Option<String>,
+) -> Option<String> {
+    parse_entries(stdout).find_map(&field)
+}
+
 fn first_playlist_title(stdout: &str) -> Option<String> {
-    stdout.lines().find_map(|line| {
-        let line = line.trim();
-        if line.is_empty() {
-            return None;
-        }
-        serde_json::from_str::<YtDlpEntry>(line)
-            .ok()
-            .and_then(|entry| entry.playlist_title)
-            .filter(|title| !title.is_empty())
+    first_playlist_field(stdout, |entry| {
+        entry.playlist_title.filter(|title| !title.is_empty())
     })
+}
+
+fn first_playlist_author(stdout: &str) -> Option<String> {
+    first_playlist_field(stdout, playlist_author)
 }
 
 // A flat listing cut to its first entry still carries the playlist's title
@@ -151,11 +168,15 @@ fn first_playlist_title(stdout: &str) -> Option<String> {
 fn playlist_preview_from_stdout(stdout: &str) -> Option<PlaylistPreview> {
     let first = parse_entries(stdout).next()?;
     Some(PlaylistPreview {
-        title: first.playlist_title.filter(|title| !title.is_empty()),
+        title: first
+            .playlist_title
+            .clone()
+            .filter(|title| !title.is_empty()),
         track_count: first
             .playlist_count
             .and_then(|count| usize::try_from(count).ok()),
-        thumbnail_video_id: first.id.filter(|id| !id.is_empty()),
+        thumbnail_video_id: first.id.clone().filter(|id| !id.is_empty()),
+        author: playlist_author(first),
     })
 }
 
@@ -284,6 +305,7 @@ impl YouTubeClient {
         tracks.truncate(self.playlist_track_limit);
         Ok(PlaylistListing {
             title: first_playlist_title(&stdout),
+            author: first_playlist_author(&stdout),
             tracks,
         })
     }
@@ -430,6 +452,8 @@ mod tests {
             duration: Some(f64::NAN),
             playlist_title: None,
             playlist_count: None,
+            playlist_channel: None,
+            playlist_uploader: None,
         };
         assert_eq!(track_from_entry(entry).unwrap().duration, None);
     }
@@ -444,6 +468,8 @@ mod tests {
             duration: Some(f64::INFINITY),
             playlist_title: None,
             playlist_count: None,
+            playlist_channel: None,
+            playlist_uploader: None,
         };
         assert_eq!(track_from_entry(entry).unwrap().duration, None);
     }
@@ -458,6 +484,8 @@ mod tests {
             duration: Some(f64::MAX),
             playlist_title: None,
             playlist_count: None,
+            playlist_channel: None,
+            playlist_uploader: None,
         };
         assert_eq!(track_from_entry(entry).unwrap().duration, None);
     }
@@ -545,12 +573,28 @@ mod tests {
     }
 
     #[test]
+    fn first_playlist_author_prefers_channel_then_uploader_skipping_empty() {
+        let stdout = "{\"id\": \"a\", \"playlist_channel\": \"\", \"playlist_uploader\": \"\"}\n\
+             {\"id\": \"b\", \"playlist_uploader\": \"Uploader\"}\n\
+             {\"id\": \"c\", \"playlist_channel\": \"Channel\", \"playlist_uploader\": \"Uploader\"}\n";
+        assert_eq!(first_playlist_author(stdout), Some("Uploader".to_string()));
+        assert_eq!(
+            first_playlist_author(
+                "{\"id\": \"c\", \"playlist_channel\": \"Channel\", \"playlist_uploader\": \"Uploader\"}\n"
+            ),
+            Some("Channel".to_string())
+        );
+        assert_eq!(first_playlist_author("{\"id\": \"a\"}\n"), None);
+    }
+
+    #[test]
     fn playlist_preview_reads_title_count_and_cover_from_first_entry() {
-        let stdout = "{\"id\": \"a\", \"playlist_title\": \"Chill Mix\", \"playlist_count\": 42}\n";
+        let stdout = "{\"id\": \"a\", \"playlist_title\": \"Chill Mix\", \"playlist_count\": 42, \"playlist_channel\": \"Lofi Girl\"}\n";
         assert_eq!(
             playlist_preview_from_stdout(stdout),
             Some(PlaylistPreview {
                 title: Some("Chill Mix".to_string()),
+                author: Some("Lofi Girl".to_string()),
                 track_count: Some(42),
                 thumbnail_video_id: Some("a".to_string()),
             })
@@ -564,6 +608,7 @@ mod tests {
             playlist_preview_from_stdout(stdout),
             Some(PlaylistPreview {
                 title: None,
+                author: None,
                 track_count: None,
                 thumbnail_video_id: None,
             })

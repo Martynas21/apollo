@@ -12,22 +12,26 @@ pub struct SavedPlaylist {
     pub id: i64,
     pub name: String,
     pub url: String,
+    pub author: Option<String>,
     pub cached_at: Option<i64>,
 }
 
-fn playlist_from_row(row: (i64, String, String, Option<i64>)) -> SavedPlaylist {
-    let (id, name, url, cached_at) = row;
+type PlaylistRow = (i64, String, String, Option<String>, Option<i64>);
+
+fn playlist_from_row(row: PlaylistRow) -> SavedPlaylist {
+    let (id, name, url, author, cached_at) = row;
     SavedPlaylist {
         id,
         name,
         url,
+        author,
         cached_at,
     }
 }
 
 pub async fn list_guild_playlists(pool: &SqlitePool, guild_id: &str) -> Result<Vec<SavedPlaylist>> {
-    let rows: Vec<(i64, String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT id, name, url, cached_at FROM playlists WHERE guild_id = ?1 ORDER BY id",
+    let rows: Vec<PlaylistRow> = sqlx::query_as(
+        "SELECT id, name, url, author, cached_at FROM playlists WHERE guild_id = ?1 ORDER BY id",
     )
     .bind(guild_id)
     .fetch_all(pool)
@@ -42,16 +46,18 @@ pub async fn save_guild_playlist(
     guild_id: &str,
     name: &str,
     url: &str,
+    author: Option<&str>,
     added_by: &str,
 ) -> Result<i64> {
     let (id,): (i64,) = sqlx::query_as(
-        "INSERT INTO playlists (guild_id, name, url, added_by) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(guild_id, url) DO UPDATE SET name = excluded.name
+        "INSERT INTO playlists (guild_id, name, url, author, added_by) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(guild_id, url) DO UPDATE SET name = excluded.name, author = excluded.author
          RETURNING id",
     )
     .bind(guild_id)
     .bind(name)
     .bind(url)
+    .bind(author)
     .bind(added_by)
     .fetch_one(pool)
     .await
@@ -65,8 +71,8 @@ pub async fn get_guild_playlist(
     guild_id: &str,
     id: i64,
 ) -> Result<Option<SavedPlaylist>> {
-    let row: Option<(i64, String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT id, name, url, cached_at FROM playlists WHERE guild_id = ?1 AND id = ?2",
+    let row: Option<PlaylistRow> = sqlx::query_as(
+        "SELECT id, name, url, author, cached_at FROM playlists WHERE guild_id = ?1 AND id = ?2",
     )
     .bind(guild_id)
     .bind(id)
@@ -75,6 +81,21 @@ pub async fn get_guild_playlist(
     .context("failed to fetch guild playlist")?;
 
     Ok(row.map(playlist_from_row))
+}
+
+pub async fn set_playlist_author(
+    pool: &SqlitePool,
+    playlist_id: i64,
+    author: Option<&str>,
+) -> Result<()> {
+    sqlx::query("UPDATE playlists SET author = ?2 WHERE id = ?1")
+        .bind(playlist_id)
+        .bind(author)
+        .execute(pool)
+        .await
+        .context("failed to update playlist author")?;
+
+    Ok(())
 }
 
 pub async fn delete_guild_playlist(pool: &SqlitePool, guild_id: &str, id: i64) -> Result<bool> {
@@ -216,10 +237,19 @@ mod tests {
             "1",
             "Chill Mix",
             "https://example.com/list=abc",
+            None,
             "42",
         )
         .await?;
-        save_guild_playlist(&pool, "1", "Workout", "https://example.com/list=def", "42").await?;
+        save_guild_playlist(
+            &pool,
+            "1",
+            "Workout",
+            "https://example.com/list=def",
+            None,
+            "42",
+        )
+        .await?;
 
         let playlists = list_guild_playlists(&pool, "1").await?;
         assert_eq!(playlists.len(), 2);
@@ -235,11 +265,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn playlist_author_is_saved_updated_on_resave_and_settable() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        let id = save_guild_playlist(
+            &pool,
+            "1",
+            "Chill Mix",
+            "https://example.com/list=abc",
+            Some("Lofi Girl"),
+            "42",
+        )
+        .await?;
+        let author = |p: Option<SavedPlaylist>| p.and_then(|p| p.author);
+
+        assert_eq!(
+            author(get_guild_playlist(&pool, "1", id).await?),
+            Some("Lofi Girl".to_string())
+        );
+
+        save_guild_playlist(
+            &pool,
+            "1",
+            "Chill Mix",
+            "https://example.com/list=abc",
+            Some("Renamed Channel"),
+            "42",
+        )
+        .await?;
+        assert_eq!(
+            author(get_guild_playlist(&pool, "1", id).await?),
+            Some("Renamed Channel".to_string())
+        );
+
+        set_playlist_author(&pool, id, None).await?;
+        assert_eq!(author(get_guild_playlist(&pool, "1", id).await?), None);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn saving_same_url_again_updates_name_instead_of_duplicating() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
 
-        save_guild_playlist(&pool, "1", "Old Name", "https://example.com/list=abc", "42").await?;
-        save_guild_playlist(&pool, "1", "New Name", "https://example.com/list=abc", "42").await?;
+        save_guild_playlist(
+            &pool,
+            "1",
+            "Old Name",
+            "https://example.com/list=abc",
+            None,
+            "42",
+        )
+        .await?;
+        save_guild_playlist(
+            &pool,
+            "1",
+            "New Name",
+            "https://example.com/list=abc",
+            None,
+            "42",
+        )
+        .await?;
 
         let playlists = list_guild_playlists(&pool, "1").await?;
         assert_eq!(playlists.len(), 1);
@@ -256,6 +341,7 @@ mod tests {
             "1",
             "Chill Mix",
             "https://example.com/list=abc",
+            None,
             "42",
         )
         .await?;
@@ -275,6 +361,7 @@ mod tests {
             "1",
             "Chill Mix",
             "https://example.com/list=abc",
+            None,
             "42",
         )
         .await?;
@@ -296,6 +383,7 @@ mod tests {
             "1",
             "Chill Mix",
             "https://example.com/list=abc",
+            None,
             "42",
         )
         .await?;
@@ -320,6 +408,7 @@ mod tests {
             "1",
             "Chill Mix",
             "https://example.com/list=abc",
+            None,
             "42",
         )
         .await?;
@@ -343,6 +432,7 @@ mod tests {
             "1",
             "Chill Mix",
             "https://example.com/list=abc",
+            None,
             "42",
         )
         .await?;
@@ -353,9 +443,15 @@ mod tests {
             vec![get_guild_playlist(&pool, "1", id).await?.unwrap()]
         );
 
-        let same_id =
-            save_guild_playlist(&pool, "1", "Renamed", "https://example.com/list=abc", "42")
-                .await?;
+        let same_id = save_guild_playlist(
+            &pool,
+            "1",
+            "Renamed",
+            "https://example.com/list=abc",
+            None,
+            "42",
+        )
+        .await?;
         assert_eq!(same_id, id);
 
         Ok(())
@@ -369,6 +465,7 @@ mod tests {
             "1",
             "Chill Mix",
             "https://example.com/list=abc",
+            None,
             "42",
         )
         .await?;
@@ -388,6 +485,7 @@ mod tests {
             "1",
             "Chill Mix",
             "https://example.com/list=abc",
+            None,
             "42",
         )
         .await?;
@@ -414,6 +512,7 @@ mod tests {
             "1",
             "Chill Mix",
             "https://example.com/list=abc",
+            None,
             "42",
         )
         .await?;
