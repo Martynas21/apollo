@@ -55,8 +55,13 @@ async fn logout(
     State(state): State<WebState>,
     Extension(token): Extension<SessionToken>,
 ) -> Response {
-    state.sessions.revoke_token(&token.0);
-    StatusCode::NO_CONTENT.into_response()
+    match auth::revoke_session(&state.db, &token.0).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => {
+            tracing::warn!(%err, "failed to revoke the calling session");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to log out")
+        }
+    }
 }
 
 async fn list_users(State(state): State<WebState>) -> Response {
@@ -185,10 +190,7 @@ async fn delete_user(
     }
 
     match db::delete_user(&state.db, &username).await {
-        Ok(()) => {
-            state.sessions.revoke_user(&username);
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => {
             tracing::warn!(%err, "failed to delete user");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to delete user")
@@ -243,11 +245,17 @@ async fn set_password(
         }
     };
 
+    // Sessions go first: if they can't be revoked the password stays as it
+    // was, rather than changing under tokens that would keep working.
+    if let Err(err) = auth::revoke_user_sessions(&state.db, &username).await {
+        tracing::warn!(%err, "failed to revoke sessions before changing password");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to change password",
+        );
+    }
     match db::set_user_password(&state.db, &username, &hash).await {
-        Ok(()) => {
-            state.sessions.revoke_user(&username);
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => {
             tracing::warn!(%err, "failed to update password");
             error_response(
@@ -310,10 +318,7 @@ async fn set_username(
     }
 
     match db::rename_user(&state.db, &username, new_username).await {
-        Ok(()) => {
-            state.sessions.rename(&username, new_username);
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => {
             tracing::warn!(%err, "failed to rename user");
             error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to rename user")
@@ -362,11 +367,15 @@ async fn set_guild(
         }
     }
 
+    if let Err(err) = auth::revoke_user_sessions(&state.db, &username).await {
+        tracing::warn!(%err, "failed to revoke sessions before setting the user's guild");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to set the user's guild",
+        );
+    }
     match db::set_user_guild(&state.db, &username, guild_id).await {
-        Ok(()) => {
-            state.sessions.revoke_user(&username);
-            StatusCode::NO_CONTENT.into_response()
-        }
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => {
             tracing::warn!(%err, "failed to set the user's guild");
             error_response(

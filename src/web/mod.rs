@@ -32,7 +32,6 @@ pub struct WebState {
     pub youtube: crate::youtube::api::YouTubeClient,
     pub db: sqlx::SqlitePool,
     pub cache: Arc<serenity::Cache>,
-    pub sessions: auth::SessionStore,
     pub login_throttle: auth::LoginThrottle,
 }
 
@@ -48,7 +47,6 @@ impl WebState {
             youtube,
             db,
             cache,
-            sessions: auth::SessionStore::default(),
             login_throttle: auth::LoginThrottle::default(),
         }
     }

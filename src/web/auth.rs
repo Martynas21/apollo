@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use axum::extract::{Request, State};
@@ -12,11 +12,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::db;
 
-/// Dashboard sessions are opaque bearer tokens with no persistence: they
-/// live only in memory and are gone on restart (every open dashboard tab
-/// just has to log in again), which is fine for a small, self-hosted,
-/// single-operator tool.
-const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+/// Dashboard sessions are opaque bearer tokens stored in the database (the
+/// `sessions` table), so they survive restarts and rebuilds: an open
+/// dashboard only has to log in again once its token has aged out.
+const SESSION_TTL: Duration = Duration::from_secs(72 * 60 * 60);
 
 /// Failed logins allowed for a single username inside [`LOGIN_THROTTLE_WINDOW`]
 /// before further attempts for that username are rejected outright — high
@@ -82,82 +81,69 @@ impl CurrentUser {
 #[derive(Clone)]
 pub struct SessionToken(pub String);
 
-struct SessionInfo {
-    user: CurrentUser,
-    expires_at: Instant,
-}
-
-#[derive(Clone, Default)]
-pub struct SessionStore(Arc<Mutex<HashMap<String, SessionInfo>>>);
-
-impl SessionStore {
-    fn issue(&self, user: CurrentUser) -> String {
-        let mut bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut bytes);
-        let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-
-        let mut sessions = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sessions.retain(|_, info| info.expires_at > Instant::now());
-        sessions.insert(
-            token.clone(),
-            SessionInfo {
-                user,
-                expires_at: Instant::now() + SESSION_TTL,
-            },
-        );
-        token
-    }
-
-    fn get(&self, token: &str) -> Option<CurrentUser> {
-        let sessions = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sessions
-            .get(token)
-            .filter(|info| info.expires_at > Instant::now())
-            .map(|info| info.user.clone())
-    }
-
-    /// Keeps any already-issued session(s) for this account pointing at its
-    /// new name, so a rename doesn't strand an active session under a
-    /// username the DB no longer has — without this, that session's own
-    /// self-checks (e.g. in `users::set_password`) would start failing.
-    pub fn rename(&self, old_username: &str, new_username: &str) {
-        let mut sessions = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for info in sessions.values_mut() {
-            if info.user.username == old_username {
-                info.user.username = new_username.to_string();
-            }
+impl From<db::UserSummary> for CurrentUser {
+    fn from(user: db::UserSummary) -> Self {
+        Self {
+            username: user.username,
+            is_admin: user.is_admin,
+            is_root: user.is_root,
+            guild_id: user.guild_id,
         }
     }
+}
 
-    /// Drops every session belonging to this account, so a deleted user or
-    /// one whose password was just reset can't keep authenticating on a
-    /// token issued before that change.
-    pub fn revoke_user(&self, username: &str) {
-        let mut sessions = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sessions.retain(|_, info| info.user.username != username);
-    }
+/// Seconds since the unix epoch, the clock every `sessions.expires_at` is
+/// compared against. A clock set before 1970 reads as the epoch itself.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        })
+}
 
-    /// Drops a single session by its token, for signing out of just the
-    /// browser tab that asked.
-    pub fn revoke_token(&self, token: &str) {
-        let mut sessions = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sessions.remove(token);
-    }
+fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Mints a fresh session for `username`, sweeping any expired rows first so
+/// the table only ever grows by as many logins as are still live.
+pub async fn issue_session(db: &sqlx::SqlitePool, username: &str) -> anyhow::Result<String> {
+    let now = unix_now();
+    db::delete_expired_sessions(db, now).await?;
+    let token = random_token();
+    let expires_at = now.saturating_add(i64::try_from(SESSION_TTL.as_secs()).unwrap_or(i64::MAX));
+    db::insert_session(db, &token, username, expires_at).await?;
+    Ok(token)
+}
+
+/// The account behind `token`, or `None` if it's unknown or expired. Read
+/// live from `users`, so an account's current privileges and guild pin
+/// apply to every session it holds without any per-session bookkeeping;
+/// a rename carries its sessions along and a deletion drops them (both
+/// cascades on the `sessions` table).
+pub async fn session_user(
+    db: &sqlx::SqlitePool,
+    token: &str,
+) -> anyhow::Result<Option<CurrentUser>> {
+    Ok(db::session_user(db, token, unix_now())
+        .await?
+        .map(CurrentUser::from))
+}
+
+/// Drops a single session by its token, for signing out of just the
+/// browser tab that asked.
+pub async fn revoke_session(db: &sqlx::SqlitePool, token: &str) -> anyhow::Result<()> {
+    db::delete_session(db, token).await
+}
+
+/// Drops every session belonging to this account, so one whose password
+/// was just reset can't keep authenticating on a token issued before that
+/// change.
+pub async fn revoke_user_sessions(db: &sqlx::SqlitePool, username: &str) -> anyhow::Result<()> {
+    db::delete_user_sessions(db, username).await
 }
 
 struct LoginAttempts {
@@ -318,10 +304,6 @@ pub async fn verify_login(
     )
 }
 
-pub fn issue_session(sessions: &SessionStore, user: CurrentUser) -> String {
-    sessions.issue(user)
-}
-
 fn bearer_token(request: &Request) -> Option<String> {
     let header = request.headers().get(axum::http::header::AUTHORIZATION)?;
     let header = header.to_str().ok()?;
@@ -351,8 +333,13 @@ pub async fn require_session(
     let Some(token) = bearer_token(&request).or_else(|| query_token(&request)) else {
         return Err(StatusCode::UNAUTHORIZED);
     };
-    let Some(user) = state.sessions.get(&token) else {
-        return Err(StatusCode::UNAUTHORIZED);
+    let user = match session_user(&state.db, &token).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return Err(StatusCode::UNAUTHORIZED),
+        Err(err) => {
+            tracing::warn!(%err, "failed to look up a dashboard session");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
     };
     request.extensions_mut().insert(user);
     request.extensions_mut().insert(SessionToken(token));
@@ -419,128 +406,105 @@ mod tests {
         assert!(!verify_password("hunter2", "not-a-real-phc-hash"));
     }
 
-    #[test]
-    fn a_freshly_issued_session_is_valid() {
-        let sessions = SessionStore::default();
-        let token = sessions.issue(CurrentUser {
-            username: "admin".to_string(),
-            is_admin: true,
-            is_root: true,
-            guild_id: None,
-        });
-        let user = sessions.get(&token).expect("session should be valid");
+    async fn pool_with_user(username: &str, is_admin: bool) -> anyhow::Result<sqlx::SqlitePool> {
+        let pool = db::connect("sqlite::memory:").await?;
+        db::insert_user(&pool, username, "some-hash", is_admin, is_admin, None).await?;
+        Ok(pool)
+    }
+
+    #[tokio::test]
+    async fn a_freshly_issued_session_is_valid() -> anyhow::Result<()> {
+        let pool = pool_with_user("admin", true).await?;
+
+        let token = issue_session(&pool, "admin").await?;
+
+        let user = session_user(&pool, &token)
+            .await?
+            .expect("session should be valid");
         assert_eq!(user.username, "admin");
         assert!(user.is_admin);
         assert!(user.is_root);
+        Ok(())
     }
 
-    #[test]
-    fn an_unknown_token_is_never_valid() {
-        let sessions = SessionStore::default();
-        assert!(sessions.get("not-a-real-token").is_none());
+    #[tokio::test]
+    async fn an_unknown_token_is_never_valid() -> anyhow::Result<()> {
+        let pool = db::connect("sqlite::memory:").await?;
+        assert!(session_user(&pool, "not-a-real-token").await?.is_none());
+        Ok(())
     }
 
-    #[test]
-    fn renaming_a_session_updates_its_username_in_place() {
-        let sessions = SessionStore::default();
-        let token = sessions.issue(CurrentUser {
-            username: "old-name".to_string(),
-            is_admin: true,
-            is_root: false,
-            guild_id: None,
-        });
+    #[tokio::test]
+    async fn an_expired_session_is_not_valid() -> anyhow::Result<()> {
+        let pool = pool_with_user("admin", true).await?;
+        db::insert_session(&pool, "stale", "admin", unix_now() - 1).await?;
 
-        sessions.rename("old-name", "new-name");
+        assert!(session_user(&pool, "stale").await?.is_none());
+        Ok(())
+    }
 
-        let user = sessions.get(&token).expect("session should still be valid");
+    #[tokio::test]
+    async fn issuing_a_session_sweeps_expired_ones() -> anyhow::Result<()> {
+        let pool = pool_with_user("admin", true).await?;
+        db::insert_session(&pool, "stale", "admin", unix_now() - 1).await?;
+
+        issue_session(&pool, "admin").await?;
+
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sessions WHERE token = 'stale'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_session_reflects_the_accounts_current_privileges() -> anyhow::Result<()> {
+        let pool = pool_with_user("old-name", false).await?;
+        let token = issue_session(&pool, "old-name").await?;
+
+        db::rename_user(&pool, "old-name", "new-name").await?;
+        db::set_user_guild(&pool, "new-name", Some("42")).await?;
+
+        let user = session_user(&pool, &token)
+            .await?
+            .expect("session should survive the rename");
         assert_eq!(user.username, "new-name");
-        assert!(user.is_admin);
+        assert_eq!(user.guild_id.as_deref(), Some("42"));
+        Ok(())
     }
 
-    #[test]
-    fn renaming_leaves_sessions_for_other_usernames_untouched() {
-        let sessions = SessionStore::default();
-        let token = sessions.issue(CurrentUser {
-            username: "someone-else".to_string(),
-            is_admin: false,
-            is_root: false,
-            guild_id: None,
-        });
+    #[tokio::test]
+    async fn revoking_a_user_invalidates_only_that_users_sessions() -> anyhow::Result<()> {
+        let pool = pool_with_user("alice", false).await?;
+        db::insert_user(&pool, "bob", "some-hash", false, false, None).await?;
+        let alice_token = issue_session(&pool, "alice").await?;
+        let bob_token = issue_session(&pool, "bob").await?;
 
-        sessions.rename("old-name", "new-name");
+        revoke_user_sessions(&pool, "alice").await?;
 
+        assert!(session_user(&pool, &alice_token).await?.is_none());
         assert_eq!(
-            sessions
-                .get(&token)
-                .expect("session should still be valid")
-                .username,
-            "someone-else"
-        );
-    }
-
-    #[test]
-    fn revoking_a_user_invalidates_that_users_session() {
-        let sessions = SessionStore::default();
-        let token = sessions.issue(CurrentUser {
-            username: "alice".to_string(),
-            is_admin: false,
-            is_root: false,
-            guild_id: None,
-        });
-
-        sessions.revoke_user("alice");
-
-        assert!(sessions.get(&token).is_none());
-    }
-
-    #[test]
-    fn revoking_a_user_leaves_other_users_sessions_valid() {
-        let sessions = SessionStore::default();
-        let alice_token = sessions.issue(CurrentUser {
-            username: "alice".to_string(),
-            is_admin: false,
-            is_root: false,
-            guild_id: None,
-        });
-        let bob_token = sessions.issue(CurrentUser {
-            username: "bob".to_string(),
-            is_admin: false,
-            is_root: false,
-            guild_id: None,
-        });
-
-        sessions.revoke_user("alice");
-
-        assert!(sessions.get(&alice_token).is_none());
-        assert_eq!(
-            sessions
-                .get(&bob_token)
+            session_user(&pool, &bob_token)
+                .await?
                 .expect("bob's session should still be valid")
                 .username,
             "bob"
         );
+        Ok(())
     }
 
-    #[test]
-    fn revoking_a_token_invalidates_only_that_token() {
-        let sessions = SessionStore::default();
-        let first_token = sessions.issue(CurrentUser {
-            username: "alice".to_string(),
-            is_admin: false,
-            is_root: false,
-            guild_id: None,
-        });
-        let second_token = sessions.issue(CurrentUser {
-            username: "alice".to_string(),
-            is_admin: false,
-            is_root: false,
-            guild_id: None,
-        });
+    #[tokio::test]
+    async fn revoking_a_token_invalidates_only_that_token() -> anyhow::Result<()> {
+        let pool = pool_with_user("alice", false).await?;
+        let first_token = issue_session(&pool, "alice").await?;
+        let second_token = issue_session(&pool, "alice").await?;
 
-        sessions.revoke_token(&first_token);
+        revoke_session(&pool, &first_token).await?;
 
-        assert!(sessions.get(&first_token).is_none());
-        assert!(sessions.get(&second_token).is_some());
+        assert!(session_user(&pool, &first_token).await?.is_none());
+        assert!(session_user(&pool, &second_token).await?.is_some());
+        Ok(())
     }
 
     #[tokio::test]

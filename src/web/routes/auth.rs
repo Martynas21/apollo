@@ -48,8 +48,13 @@ async fn login(State(state): State<WebState>, Json(body): Json<LoginRequest>) ->
     match auth::verify_login(&state.db, &body.username, &body.password).await {
         Ok(Some(user)) => {
             state.login_throttle.record_success(&body.username);
-            let token = auth::issue_session(&state.sessions, user);
-            Json(LoginResponse { token }).into_response()
+            match auth::issue_session(&state.db, &user.username).await {
+                Ok(token) => Json(LoginResponse { token }).into_response(),
+                Err(err) => {
+                    tracing::warn!(%err, "dashboard login failed to store the session");
+                    error_response(StatusCode::INTERNAL_SERVER_ERROR, "login failed")
+                }
+            }
         }
         Ok(None) => {
             state.login_throttle.record_failure(&body.username);

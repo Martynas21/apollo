@@ -8,6 +8,7 @@ use std::time::Duration;
 mod playlists;
 mod queue;
 mod session;
+mod sessions;
 mod settings;
 mod stats;
 mod users;
@@ -25,6 +26,9 @@ pub use queue::{
 pub use session::{
     PersistedSession, clear_guild_session, load_guild_session, save_guild_session_meta,
     set_guild_radio_enabled,
+};
+pub use sessions::{
+    delete_expired_sessions, delete_session, delete_user_sessions, insert_session, session_user,
 };
 pub use settings::{DEFAULT_VOLUME, get_guild_volume, set_guild_volume};
 pub use stats::{

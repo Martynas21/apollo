@@ -5,7 +5,7 @@
   function lastChannelKey(guildId) {
     return LAST_CHANNEL_KEY_PREFIX + guildId;
   }
-  let token = sessionStorage.getItem(TOKEN_KEY);
+  let token = localStorage.getItem(TOKEN_KEY);
   let currentGuildId = null;
   let guilds = [];
   let socket = null;
@@ -73,7 +73,7 @@
 
   function showLogin(message) {
     token = null;
-    sessionStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(TOKEN_KEY);
     closeSocket();
     setTabIcon(false);
     loginScreen.style.display = 'block';
@@ -113,7 +113,7 @@
       }
       const body = await response.json();
       token = body.token;
-      sessionStorage.setItem(TOKEN_KEY, token);
+      localStorage.setItem(TOKEN_KEY, token);
       showDashboard();
     } catch (err) {
       loginError.textContent = 'Could not reach the server.';

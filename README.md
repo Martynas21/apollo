@@ -176,7 +176,8 @@ before the first run to create the first account, which is both an
 **admin** and the sole **root** account; they're only read while no account
 exists yet, so changing them later has no effect. Leave both unset to
 disable the dashboard's login entirely — it still comes up, but rejects
-every sign-in.
+every sign-in. A successful sign-in lasts 72 hours and is stored in the
+database, so restarting or rebuilding the bot doesn't sign anyone out.
 
 Admins get a "Users" entry in the sidebar, where they can create further
 accounts (optionally as admins themselves) and remove them; there's no
@@ -236,7 +237,7 @@ setup, and premature before this has even been run live once.
   `QueuedTrack`) shared across the database, player and dashboard.
 - `src/db/` — SQLite persistence (`sqlx`), split by table group:
   `settings.rs`, `playlists.rs`, `session.rs`, `queue.rs`, `stats.rs`,
-  `users.rs`, with `mod.rs` owning connect/migrate.
+  `users.rs`, `sessions.rs`, with `mod.rs` owning connect/migrate.
 - `src/youtube/` — `api.rs` (search/single-video/playlist client) and
   `ytdlp.rs` (the `yt-dlp` subprocess runner every call goes through).
 - `src/voice/` — `registry/` (the per-guild queue engine, split into
@@ -246,7 +247,7 @@ setup, and premature before this has even been run live once.
   mode), `ipc_backend.rs` (the `VoiceBackend` that talks to
   `apollo-audio-worker`). See [docs/player-states.md](docs/player-states.md).
 - `src/web/` — the web dashboard (`axum`): `api.rs` (HTTP/WebSocket
-  handlers), `auth.rs` (password hashing + in-memory session tokens). See
+  handlers), `auth.rs` (password hashing + database-backed session tokens). See
   [Web dashboard](#web-dashboard).
 - `assets/` — the single-page dashboard frontend (`dashboard.html`,
   `dashboard.css`, `dashboard.js`), served as-is and embedded into the

@@ -112,7 +112,7 @@ Key points:
   `routes/` (one file per surface — `guilds.rs`, `playback.rs`, `queue.rs`,
   `search.rs`, `playlists.rs`, `favourites.rs`, `users.rs`, `auth.rs` — each
   owning its handlers and its own `routes()`), `auth.rs` (password hashing +
-  in-memory session tokens — middleware, not a route module). The
+  database-backed session tokens — middleware, not a route module). The
   single-page frontend it serves lives in `assets/` (`dashboard.html`,
   `dashboard.css`, `dashboard.js`), each embedded at compile time via
   `include_str!`. `dashboard.css` follows the Tailwind model without the
@@ -137,8 +137,9 @@ Key points:
 - `src/db/` — sqlx/SQLite, split by table group: `settings.rs` (per-guild
   volume), `playlists.rs` (saved playlists + cached tracks), `session.rs`
   (guild session persistence), `queue.rs` (the persisted play queue),
-  `stats.rs` (play counts), `users.rs` (dashboard accounts). `mod.rs` holds
-  `connect` and re-exports everything else under `crate::db::*`. Migrations
+  `stats.rs` (play counts), `users.rs` (dashboard accounts), `sessions.rs`
+  (dashboard login sessions). `mod.rs` holds `connect` and re-exports
+  everything else under `crate::db::*`. Migrations
   in `migrations/` are embedded into the binary at compile time (sqlx
   `migrate!`).
 
