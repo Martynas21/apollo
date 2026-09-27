@@ -56,6 +56,10 @@ pub trait VoiceBackend: Send + Sync + 'static {
     async fn current_channel(&self, guild_id: GuildId) -> Option<ChannelId>;
 
     async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError>;
+
+    /// Asks yt-dlp whether `video_id` is playable at all, to name the reason
+    /// a start failed when `buffered_source` could only say "it failed".
+    async fn preflight(&self, video_id: &str) -> Result<(), PlaybackError>;
 }
 
 #[async_trait::async_trait]

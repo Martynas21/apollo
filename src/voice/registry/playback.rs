@@ -8,7 +8,7 @@ use crate::model::QueuedTrack;
 use crate::voice::backend::{AudioSource, VoiceCall, VoiceTrack};
 use crate::voice::error::PlayerError;
 use crate::voice::registry::{PlayerRegistry, Prefetch, discard_prefetch};
-use crate::voice::resolve::{self, PlaybackError};
+use crate::voice::resolve::PlaybackError;
 use crate::voice::state::{AdvanceFill, GuildState, StartOutcome, TrackOutcome};
 
 const MAX_VOLUME: u8 = 100;
@@ -63,9 +63,7 @@ impl PlayerRegistry {
             return PlayerError::Playback(err.to_string());
         }
 
-        let preflight = resolve::preflight_check(video_id, self.cookies_file.as_deref())
-            .await
-            .err();
+        let preflight = self.voice.preflight(video_id).await.err();
         PlayerError::Playback(better_playback_error(err, preflight).to_string())
     }
 

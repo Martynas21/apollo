@@ -57,6 +57,9 @@ impl VoiceBackend for NullVoiceBackend {
             "voice backend unavailable in tests".to_string(),
         ))
     }
+    async fn preflight(&self, _video_id: &str) -> Result<(), PlaybackError> {
+        Ok(())
+    }
 }
 
 const ADMIN_USERNAME: &str = "admin";

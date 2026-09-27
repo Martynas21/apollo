@@ -445,6 +445,10 @@ impl VoiceBackend for FakeBackend {
             None => Ok(empty_source(&track.video_id)),
         }
     }
+
+    async fn preflight(&self, _video_id: &str) -> Result<(), PlaybackError> {
+        Ok(())
+    }
 }
 
 pub(super) async fn wait_until(mut predicate: impl FnMut() -> bool) {

@@ -496,6 +496,10 @@ impl VoiceBackend for IpcBackend {
         Some(ChannelId::new(channel.0.get()))
     }
 
+    async fn preflight(&self, video_id: &str) -> Result<(), PlaybackError> {
+        resolve::preflight_check(video_id, self.cookies_file.as_deref()).await
+    }
+
     async fn buffered_source(&self, track: &Track) -> Result<AudioSource, PlaybackError> {
         let resolved = resolve::resolve_stream(
             &track.video_id,
