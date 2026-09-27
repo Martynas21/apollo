@@ -23,6 +23,8 @@ use serenity::all as serenity;
 pub use auth::bootstrap_user_if_needed;
 
 const DASHBOARD_HTML: &str = include_str!("../../assets/dashboard.html");
+const DASHBOARD_CSS: &str = include_str!("../../assets/dashboard.css");
+const DASHBOARD_JS: &str = include_str!("../../assets/dashboard.js");
 
 #[derive(Clone)]
 pub struct WebState {
@@ -78,9 +80,24 @@ pub fn router(state: WebState) -> Router {
 
     let public = Router::new()
         .route("/", get(|| async { axum::response::Html(DASHBOARD_HTML) }))
+        .route(
+            "/dashboard.css",
+            get(|| async { static_asset("text/css; charset=utf-8", DASHBOARD_CSS) }),
+        )
+        .route(
+            "/dashboard.js",
+            get(|| async { static_asset("text/javascript; charset=utf-8", DASHBOARD_JS) }),
+        )
         .merge(routes::auth::routes());
 
     public.merge(protected).with_state(state)
+}
+
+fn static_asset(
+    content_type: &'static str,
+    body: &'static str,
+) -> impl axum::response::IntoResponse {
+    ([(axum::http::header::CONTENT_TYPE, content_type)], body)
 }
 
 pub async fn serve(bind_addr: &str, state: WebState) -> anyhow::Result<()> {

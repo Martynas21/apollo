@@ -178,7 +178,7 @@ exists yet, so changing them later has no effect. Leave both unset to
 disable the dashboard's login entirely — it still comes up, but rejects
 every sign-in.
 
-Admins get a "Users" tab in the top nav, where they can create further
+Admins get a "Users" entry in the sidebar, where they can create further
 accounts (optionally as admins themselves) and remove them; there's no
 self-service signup, so account creation is entirely admin-driven from that
 page. Every account can rename itself and change its own password from that
@@ -248,8 +248,9 @@ setup, and premature before this has even been run live once.
 - `src/web/` — the web dashboard (`axum`): `api.rs` (HTTP/WebSocket
   handlers), `auth.rs` (password hashing + in-memory session tokens). See
   [Web dashboard](#web-dashboard).
-- `assets/dashboard.html` — the single-page dashboard frontend, served
-  as-is and embedded into the binary at compile time.
+- `assets/` — the single-page dashboard frontend (`dashboard.html`,
+  `dashboard.css`, `dashboard.js`), served as-is and embedded into the
+  binary at compile time.
 - `ipc/` — shared wire protocol/DTOs between `apollo` and
   `apollo-audio-worker` (a separate workspace crate, `apollo-ipc`).
 - `audio-worker/` — `apollo-audio-worker`: the standalone process holding

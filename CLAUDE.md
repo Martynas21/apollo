@@ -113,8 +113,17 @@ Key points:
   `search.rs`, `playlists.rs`, `favourites.rs`, `users.rs`, `auth.rs` — each
   owning its handlers and its own `routes()`), `auth.rs` (password hashing +
   in-memory session tokens — middleware, not a route module). The
-  single-page frontend it serves lives at `assets/dashboard.html`, embedded
-  at compile time via `include_str!`.
+  single-page frontend it serves lives in `assets/` (`dashboard.html`,
+  `dashboard.css`, `dashboard.js`), each embedded at compile time via
+  `include_str!`. `dashboard.css` follows the Tailwind model without the
+  toolchain: a token block, a base layer, a components layer for pieces
+  that carry state/animations/media queries (`.compact-row`, `.np-*`,
+  `.sidebar`, ...), then a hand-written utility layer (`flex`, `gap-2`,
+  `md:hidden`, ...) that the markup and the JS row builders compose.
+  Utilities come last so they win at equal specificity; add one only when
+  the markup uses it, and keep stateful rules in the components layer.
+  Classes the JS queries but never styles (`.compact-title`, `.admin-badge`)
+  stay on the elements as hooks.
 - `src/youtube/api.rs` — the `yt-dlp` subprocess client (search,
   single-video metadata, playlist listing — all via `yt-dlp -j`) plus
   `extract_video_id` for pulling a video ID out of a YouTube URL.

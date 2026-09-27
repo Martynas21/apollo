@@ -4,655 +4,189 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Apollo</title>
-<meta name="theme-color" content="#15130f">
-<!-- Painted by setTabIcon() below so the icon shares this page's palette and
-     can dim itself while nothing is playing. -->
+<meta name="theme-color" content="#030303">
+<!-- Painted by setTabIcon() in dashboard.js so the icon shares this page's
+     palette and can dim itself while nothing is playing. -->
 <link rel="icon" id="favicon" href="data:,">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spectral:wght@500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap">
-<style>
-  :root {
-    --bg: #15130f;
-    --bg-elevated: #201c16;
-    --bg-hover: #2b261d;
-    --border: #453c2e;
-    --border-soft: #322c22;
-    --text: #f2ece0;
-    --text-muted: #a89f8f;
-    --text-faint: #75695a;
-    --accent: #e3a53f;
-    --accent-2: #d9784a;
-    --danger: #d9534f;
-
-    /* ---- Spacing scale (padding/margin/gap) ---- */
-    --space-0-5: 2px;
-    --space-1: 4px;
-    --space-1-5: 6px;
-    --space-2: 8px;
-    --space-2-5: 10px;
-    --space-3: 12px;
-    --space-3-5: 14px;
-    --space-4: 16px;
-    --space-5: 20px;
-    --space-6: 24px;
-    --space-7: 28px;
-    --space-8: 32px;
-    --space-10: 40px;
-
-    /* ---- Shell rhythm ----
-       Outer padding and inter-card gaps scale with the viewport so a phone
-       doesn't lose a fifth of its width to the same padding a desktop uses. */
-    --shell-pad-x: clamp(var(--space-4), 3vw, var(--space-10));
-    --shell-pad-y: clamp(var(--space-4), 2vw, var(--space-8));
-    --gap: clamp(var(--space-4), 1.6vw, var(--space-6));
-  }
-  @media (prefers-reduced-motion: reduce) {
-    *, *::before, *::after {
-      transition-duration: 0.001ms !important;
-      animation-duration: 0.001ms !important;
-      animation-iteration-count: 1 !important;
-    }
-  }
-  * { box-sizing: border-box; }
-  * { scrollbar-width: auto; scrollbar-color: var(--border) transparent; }
-  ::-webkit-scrollbar { width: 18px; height: 18px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb {
-    background-color: var(--border); background-clip: padding-box;
-    border: 4px solid transparent; border-radius: 999px;
-  }
-  ::-webkit-scrollbar-thumb:hover { background-color: var(--accent); }
-  body {
-    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
-    font-family: 'Manrope', system-ui, sans-serif;
-    display: flex; align-items: center; justify-content: center;
-  }
-  a { color: var(--accent); text-decoration: none; }
-  a:hover { color: var(--accent-2); }
-  button { font-family: inherit; cursor: pointer; }
-  button:disabled { cursor: not-allowed; opacity: .35; }
-  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  input { font-family: inherit; }
-
-  .brand { display: flex; align-items: center; gap: var(--space-2-5); }
-  .brand-word { font-weight: 800; letter-spacing: .18em; font-size: 15px; }
-  .brand-mark { color: var(--accent); }
-
-  /* ---- Login screen ---- */
-  #login-screen { width: 320px; }
-  #login-screen .brand { justify-content: center; margin-bottom: var(--space-7); }
-  .field { display: flex; flex-direction: column; gap: var(--space-1-5); margin-bottom: var(--space-3-5); }
-  .field label { font-size: 12px; color: var(--text-muted); }
-  .field input, .field select {
-    background: var(--bg-elevated); border: 1px solid var(--border-soft); border-radius: 10px;
-    padding: var(--space-3) var(--space-3-5); color: var(--text); font-size: 14px; outline: none;
-  }
-  .field input:focus, .field select:focus { border-color: var(--accent); }
-  .field select { cursor: pointer; }
-  .form-error { color: var(--danger); font-size: 13px; min-height: 18px; margin-bottom: var(--space-2); }
-  .checkbox-field { display: flex; align-items: center; gap: var(--space-2); font-size: 13px; color: var(--text-muted); margin-bottom: var(--space-3-5); cursor: pointer; }
-  .checkbox-field input { width: 15px; height: 15px; accent-color: var(--accent); }
-  .primary-btn {
-    width: 100%; background: var(--accent); color: var(--bg); border: none;
-    padding: var(--space-3); border-radius: 10px; font-size: 14px; font-weight: 700;
-  }
-  .primary-btn:hover:not(:disabled) { filter: brightness(1.1); }
-  .primary-btn.small { width: auto; padding: var(--space-1-5) var(--space-3); font-size: 12px; font-weight: 700; border-radius: 7px; align-self: flex-start; }
-
-  /* ---- Shared button tactile feedback ---- */
-  .icon-btn, .play-btn, .chip-btn, .ghost-btn, .outline-btn, .primary-btn,
-  .mini-icon-btn, .server-btn, .logout-link {
-    transition: transform .12s ease, background-color .15s ease, border-color .15s ease, color .15s ease;
-  }
-  .icon-btn:active:not(:disabled), .play-btn:active:not(:disabled), .chip-btn:active:not(:disabled),
-  .ghost-btn:active:not(:disabled), .outline-btn:active:not(:disabled), .primary-btn:active:not(:disabled),
-  .mini-icon-btn:active:not(:disabled), .server-btn:active:not(:disabled), .logout-link:active:not(:disabled) {
-    transform: scale(0.93);
-  }
-
-  /* Shared busy state: hides a button's label/icon in favor of a centered
-     spinner while the action it triggered is still in flight. */
-  .btn-busy { color: transparent !important; position: relative; }
-  .btn-busy::after {
-    content: ''; position: absolute; top: 50%; left: 50%; width: 12px; height: 12px;
-    margin: -6px 0 0 -6px; border-radius: 50%;
-    border: 2px solid var(--border-soft); border-top-color: var(--accent);
-    animation: search-spin .6s linear infinite;
-  }
-
-  /* ---- Dashboard ---- */
-  /* A fixed height, not a minimum: the shell owns the viewport and the
-     scrolling happens inside it, so the queue can run full-height. */
-  #dashboard {
-    display: none; width: 100%; height: 100dvh;
-    background: var(--bg); color: var(--text); flex-direction: column;
-  }
-
-  .topbar {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: var(--space-5) var(--space-10); border-bottom: 1px solid var(--border-soft); flex-shrink: 0;
-  }
-  .topbar-right { display: flex; align-items: center; gap: var(--space-4); }
-  .logout-link { font-size: 12.5px; color: var(--text-faint); background: none; border: none; }
-  .logout-link:hover { color: var(--text-muted); }
-
-  .topbar-nav { display: flex; align-items: center; gap: var(--space-0-5); background: var(--bg-elevated); border: 1px solid var(--border-soft); border-radius: 999px; padding: var(--space-0-5); flex-shrink: 0; }
-  .topbar-nav-btn { background: none; border: none; color: var(--text-muted); font-size: 13px; font-weight: 600; padding: var(--space-1-5) var(--space-4); border-radius: 999px; }
-  .topbar-nav-btn:hover { color: var(--text); }
-  .topbar-nav-btn.active { background: var(--accent); color: var(--bg); }
-
-  .server-switcher { position: relative; }
-  .server-btn {
-    display: flex; align-items: center; gap: var(--space-2-5);
-    background: var(--bg-elevated); border: 1px solid var(--border-soft);
-    padding: var(--space-2) var(--space-3-5) var(--space-2) var(--space-2); border-radius: 999px; color: var(--text);
-  }
-  .server-btn:hover { border-color: var(--border); }
-  .server-avatar {
-    width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 12px; font-weight: 700; color: var(--bg);
-  }
-  .server-avatar.small { width: 24px; height: 24px; font-size: 11px; }
-  .server-name { font-size: 13.5px; font-weight: 600; }
-  .server-menu {
-    position: absolute; top: calc(100% + 8px); right: 0; width: 220px;
-    background: var(--bg-elevated); border: 1px solid var(--border-soft);
-    border-radius: 12px; padding: var(--space-1-5); box-shadow: 0 12px 28px rgba(0,0,0,.4);
-    z-index: 20; display: flex; flex-direction: column; gap: var(--space-0-5);
-    max-height: 320px; overflow-y: auto;
-    opacity: 0; transform: translateY(-6px); pointer-events: none;
-    transition: opacity .15s ease-out, transform .15s ease-out;
-  }
-  .server-menu.open { opacity: 1; transform: translateY(0); pointer-events: auto; }
-  .server-row {
-    display: flex; align-items: center; gap: var(--space-2-5); width: 100%;
-    padding: var(--space-2) var(--space-2-5); border-radius: 8px; background: none; border: none;
-    text-align: left; font-size: 13.5px; color: var(--text-muted);
-  }
-  .server-row:hover { background: var(--bg-hover); color: var(--text); }
-  .server-row.active { color: var(--accent); background: color-mix(in oklch, var(--accent) 12%, transparent); }
-
-  .topbar-search { position: relative; flex: 1; max-width: 480px; margin: 0 var(--space-7); }
-  .search-dropdown {
-    position: absolute; top: calc(100% + 8px); left: 0; right: 0;
-    background: var(--bg-elevated); border: 1px solid var(--border-soft);
-    border-radius: 12px; padding: var(--space-2-5); box-shadow: 0 12px 28px rgba(0,0,0,.4);
-    z-index: 20;
-    opacity: 0; transform: translateY(-6px); pointer-events: none;
-    transition: opacity .15s ease-out, transform .15s ease-out;
-  }
-  .search-dropdown.open { opacity: 1; transform: translateY(0); pointer-events: auto; }
-  .search-dropdown .scroll-list { max-height: 320px; }
-
-  .dashboard-body {
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: var(--gap);
-    padding: var(--shell-pad-y) var(--shell-pad-x);
-  }
-
-  /* Player, queue and library in one grid. The queue spans both rows, so it
-     runs the full height of the shell and scrolls internally — flexbox has
-     no way to size an item against a sibling's natural height, which is why
-     this used to need a ResizeObserver. */
-  .dashboard-grid {
-    flex: 1;
-    min-height: 0;
-    display: grid;
-    gap: var(--gap);
-    grid-template-columns: minmax(0, 1fr) minmax(320px, 480px);
-    grid-template-rows: auto minmax(0, 1fr);
-    grid-template-areas:
-      "player  queue"
-      "library queue";
-  }
-  .player-card { grid-area: player; }
-  .library-area {
-    grid-area: library; min-height: 0;
-    display: grid; gap: var(--gap);
-    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  }
-  .card {
-    background: var(--bg-elevated); border: 1px solid var(--border-soft);
-    border-radius: 18px; padding: var(--space-7); display: flex; flex-direction: column;
-  }
-  .card-title {
-    font-family: 'Spectral', serif; font-size: 15px; font-weight: 600; margin: 0 0 var(--space-4);
-    display: flex; align-items: center;
-  }
-  .section-label {
-    font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
-    color: var(--text-faint); margin: 0 0 var(--space-2);
-  }
-  .count-badge { margin-left: var(--space-2); font-size: 11.5px; font-weight: 600; font-family: 'Manrope'; background: var(--bg); color: var(--text-muted); padding: var(--space-0-5) var(--space-2); border-radius: 999px; }
-  .card-header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-4); }
-  .card-header-row .card-title { margin-bottom: 0; }
-  .header-actions { display: flex; gap: var(--space-2); }
-
-  /* Now Playing card */
-  .np-hero { display: flex; gap: var(--space-7); align-items: center; }
-  .np-art {
-    width: 148px; height: 148px; border-radius: 18px; flex-shrink: 0;
-    background: linear-gradient(135deg, var(--accent), var(--accent-2));
-    box-shadow: 0 0 50px 6px color-mix(in oklch, var(--accent) 40%, transparent);
-    display: flex; align-items: center; justify-content: center;
-    position: relative; overflow: hidden;
-  }
-  .np-art img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-  @keyframes np-glow-pulse {
-    0% { box-shadow: 0 0 50px 6px color-mix(in oklch, var(--accent) 40%, transparent); }
-    35% { box-shadow: 0 0 70px 14px color-mix(in oklch, var(--accent) 65%, transparent); }
-    100% { box-shadow: 0 0 50px 6px color-mix(in oklch, var(--accent) 40%, transparent); }
-  }
-  .np-art.np-pulse { animation: np-glow-pulse .6s ease-out; }
-  .np-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: var(--space-1-5); transition: opacity .15s ease; }
-  .np-info.np-fade-out { opacity: 0; }
-  .eyebrow { font-size: 11.5px; font-weight: 700; letter-spacing: .12em; color: var(--accent); text-transform: uppercase; }
-  /* The snapshot feed has gone quiet: say so on the eyebrow and dim the
-     frozen progress fill so the card reads as "last known", not live. */
-  .snapshot-stale #np-eyebrow::after { content: ' · no updates'; color: var(--text-faint); animation: stale-blink 1.6s ease-in-out infinite; }
-  .snapshot-stale .np-progress-fill { opacity: .45; }
-  @keyframes stale-blink { 50% { opacity: .35; } }
-  .np-title { font-family: 'Spectral', serif; font-size: 25px; font-weight: 600; margin: 0; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .np-channel { font-size: 14px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .np-duration { font-size: 12px; color: var(--text-faint); }
-  .np-progress { display: none; flex-direction: column; gap: var(--space-1-5); margin-top: var(--space-0-5); }
-  .np-progress-track {
-    position: relative; height: 4px; border-radius: 2px;
-    background: var(--bg); overflow: hidden;
-  }
-  .np-progress-fill {
-    position: absolute; inset: 0 auto 0 0; width: 0%;
-    border-radius: 2px; background: var(--accent);
-  }
-  .np-progress-elapsed { font-size: 11px; color: var(--text-faint); }
-
-  .np-empty { display: none; flex-direction: column; align-items: center; text-align: center; gap: var(--space-2-5); padding: var(--space-7) var(--space-2-5); color: var(--text-muted); }
-  .np-empty svg { color: var(--text-faint); }
-  .np-empty h3 { font-family: 'Spectral', serif; font-size: 17px; color: var(--text); margin: var(--space-1) 0 0; font-weight: 600; }
-  .np-empty p { font-size: 13px; margin: 0; max-width: 320px; }
-
-  .now-controls { margin-top: var(--space-6); padding-top: var(--space-5); border-top: 1px solid var(--border-soft); display: flex; flex-direction: column; gap: var(--space-3); }
-  .control-row { display: flex; align-items: center; gap: var(--space-2-5); }
-  .icon-btn {
-    width: 40px; height: 40px; border-radius: 11px; flex-shrink: 0;
-    background: var(--bg); border: 1px solid var(--border-soft); color: var(--text);
-    display: flex; align-items: center; justify-content: center;
-  }
-  .icon-btn:hover:not(:disabled) { background: var(--bg-hover); }
-  .icon-btn.danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
-  .play-btn {
-    position: relative;
-    width: 50px; height: 50px; border-radius: 50%; flex-shrink: 0;
-    background: var(--accent); border: none; color: var(--bg);
-    display: flex; align-items: center; justify-content: center;
-  }
-  .play-btn:hover:not(:disabled) { filter: brightness(1.1); }
-  .play-btn svg {
-    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-    opacity: 0; transition: opacity .12s ease;
-  }
-  .play-btn svg.visible { opacity: 1; }
-  .chip-btn {
-    display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2-5) var(--space-3-5); border-radius: 999px;
-    background: var(--bg); border: 1px solid var(--border-soft); color: var(--text-muted);
-    font-size: 13px; font-weight: 600;
-  }
-  .chip-btn:hover { border-color: var(--border); color: var(--text); }
-  .chip-btn.active { background: color-mix(in oklch, var(--accent) 20%, var(--bg-elevated)); border-color: var(--accent); color: var(--accent); }
-  .volume-popover-wrap { position: relative; }
-  #volume-btn.active { background: color-mix(in oklch, var(--accent) 20%, var(--bg-elevated)); border-color: var(--accent); color: var(--accent); }
-  .volume-popover {
-    position: absolute; bottom: calc(100% + 10px); left: 50%;
-    transform: translateX(-50%) translateY(6px) scale(.96);
-    display: flex; flex-direction: column; align-items: center; gap: var(--space-2-5);
-    background: var(--bg-elevated); border: 1px solid var(--border-soft); border-radius: 14px;
-    padding: var(--space-3-5) var(--space-3) var(--space-4); box-shadow: 0 14px 32px rgba(0,0,0,.4);
-    opacity: 0; pointer-events: none;
-    transition: opacity .14s ease, transform .14s ease;
-    z-index: 20;
-  }
-  .volume-popover::after {
-    content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
-    border: 6px solid transparent; border-top-color: var(--bg-elevated);
-  }
-  .volume-popover.open { opacity: 1; pointer-events: auto; transform: translateX(-50%) translateY(0) scale(1); }
-  .volume-popover-label { font-size: 11.5px; font-weight: 600; color: var(--text-muted); }
-  .volume-slider-wrap { position: relative; width: 24px; height: 108px; }
-  .volume-slider-wrap input[type="range"] {
-    position: absolute; top: 50%; left: 50%; width: 108px; height: 4px;
-    transform: translate(-50%, -50%) rotate(-90deg); transform-origin: center center;
-    appearance: none; -webkit-appearance: none;
-    border-radius: 2px; background: var(--bg); outline: none;
-  }
-  .volume-slider-wrap input[type="range"]::-webkit-slider-thumb {
-    appearance: none; -webkit-appearance: none; width: 13px; height: 13px;
-    border-radius: 50%; background: var(--accent); border: 2px solid var(--bg-elevated); cursor: pointer;
-    transition: transform .12s ease;
-  }
-  .volume-slider-wrap input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.15); }
-  .volume-slider-wrap input[type="range"]::-moz-range-thumb {
-    width: 13px; height: 13px; border-radius: 50%; background: var(--accent);
-    border: 2px solid var(--bg-elevated); cursor: pointer; transition: transform .12s ease;
-  }
-  .volume-slider-wrap input[type="range"]:active::-moz-range-thumb { transform: scale(1.15); }
-  .ghost-btn {
-    background: none; border: 1px solid var(--border-soft); color: var(--text-muted);
-    padding: var(--space-2) var(--space-3); border-radius: 8px; font-size: 12.5px; font-weight: 600;
-  }
-  .ghost-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
-  .ghost-btn.danger:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
-
-  /* Queue side card */
-  .queue-card { grid-area: queue; min-width: 0; min-height: 0; overflow: hidden; }
-  .queue-card .scroll-list { flex: 1; min-height: 0; max-height: none; }
-  .search-bar {
-    display: flex; align-items: center; gap: var(--space-2-5); background: var(--bg); border: 1px solid var(--border-soft);
-    border-radius: 10px; padding: var(--space-2-5) var(--space-3-5); color: var(--text-faint);
-  }
-  .search-bar input { flex: 1; background: none; border: none; outline: none; color: var(--text); font-size: 13.5px; }
-  .search-bar input::placeholder { color: var(--text-faint); }
-  .search-icon { flex-shrink: 0; }
-  .search-spinner {
-    display: none; flex-shrink: 0; width: 14px; height: 14px;
-    border: 2px solid var(--border-soft); border-top-color: var(--accent);
-    border-radius: 50%; animation: search-spin .7s linear infinite;
-  }
-  @keyframes search-spin { to { transform: rotate(360deg); } }
-  .search-bar.loading .search-icon { display: none; }
-  .search-bar.loading .search-spinner { display: block; }
-  .search-loading-note { display: flex; align-items: center; gap: var(--space-2); }
-  .scroll-list { display: flex; flex-direction: column; gap: var(--space-1-5); max-height: clamp(160px, 26vh, 280px); overflow-y: auto; overflow-x: hidden; padding-right: var(--space-2-5); }
-  .list-panel {
-    background: var(--bg); border: 1px solid var(--border-soft); border-radius: 12px; padding: var(--space-2);
-  }
-  .list-panel .scroll-list { padding-right: var(--space-1); }
-  .queue-card .list-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-  /* One row shape for the queue, search results, favourites and users. The
-     leading handle/indicator and the trailing badge/actions are optional,
-     which is why this is flex rather than grid: a grid needs a column count
-     per variant, and its empty tracks still cost a gap. Each row is its own
-     container either way, so nothing aligns across rows to lose. */
-  .compact-row {
-    position: relative;
-    display: flex; gap: var(--space-2-5); align-items: center; padding: var(--space-2); border-radius: 9px;
-    background: var(--bg); border: 1px solid var(--border-soft);
-    overflow: hidden;
-    flex-shrink: 0;
-    transition: opacity .18s ease-out, transform .18s ease-out,
-      max-height .16s ease-in, padding-top .16s ease-in, padding-bottom .16s ease-in,
-      margin-top .16s ease-in, margin-bottom .16s ease-in, background-color .12s ease, border-color .12s ease;
-  }
-  .compact-row:hover { background: var(--bg-hover); border-color: var(--border); }
-  .compact-row.kbd-active { background: var(--bg-hover); border-color: var(--accent); }
-  .compact-row.row-enter { opacity: 0; transform: translateY(-6px); }
-  .compact-row.row-exit {
-    opacity: 0; max-height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; margin-bottom: 0;
-    border-width: 0;
-  }
-  .admin-badge { flex: none; font-size: 11px; font-weight: 700; letter-spacing: .02em; color: var(--accent); background: color-mix(in oklch, var(--accent) 16%, transparent); padding: var(--space-0-5) var(--space-2-5); border-radius: 999px; }
-  .compact-row.now-playing-row { background: color-mix(in oklch, var(--accent) 13%, transparent); }
-  .compact-row.now-playing-row:hover { background: color-mix(in oklch, var(--accent) 18%, transparent); }
-  .compact-row.now-playing-row .compact-title { color: var(--accent); }
-  .compact-row.now-playing-row .compact-thumb {
-    box-shadow: 0 0 0 2px var(--accent), 0 0 14px 2px color-mix(in oklch, var(--accent) 50%, transparent);
-  }
-  .now-playing-indicator {
-    width: 18px; height: 34px; flex-shrink: 0; display: flex;
-    align-items: flex-end; justify-content: center; gap: var(--space-0-5);
-  }
-  .now-playing-indicator span {
-    width: 3px; height: 4px; border-radius: 1px; background: var(--accent);
-    animation: now-playing-bar .9s ease-in-out infinite;
-  }
-  .now-playing-indicator span:nth-child(1) { animation-delay: -.6s; }
-  .now-playing-indicator span:nth-child(2) { animation-delay: -.3s; }
-  .now-playing-row.is-paused .now-playing-indicator span { animation-play-state: paused; height: 8px; }
-  @keyframes now-playing-bar { 0%, 100% { height: 4px; } 50% { height: 14px; } }
-  .compact-row.dragging {
-    z-index: 30; transition: none; background: var(--bg-hover); border-color: var(--border);
-    box-shadow: 0 8px 20px rgba(0,0,0,.4);
-  }
-  .drag-handle {
-    width: 18px; height: 34px; flex-shrink: 0; display: flex; align-items: center; justify-content: center;
-    color: var(--text-faint); cursor: grab; touch-action: none;
-  }
-  .drag-handle:hover { color: var(--text-muted); }
-  .drag-handle:active { cursor: grabbing; }
-  .compact-thumb { width: 34px; height: 34px; border-radius: 7px; flex-shrink: 0; position: relative; overflow: hidden; }
-  .compact-thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-  .compact-meta { min-width: 0; flex: 1; }
-  .compact-title-line { display: flex; align-items: center; gap: var(--space-1-5); }
-  .compact-title { font-size: 12.5px; color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .compact-channel { font-size: 11.5px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .compact-duration { flex: none; font-size: 11px; color: var(--text-faint); }
-  .compact-actions { flex: none; display: flex; gap: var(--space-1); }
-  .mini-icon-btn { width: 24px; height: 24px; border-radius: 6px; background: var(--bg); border: 1px solid var(--border-soft); display: flex; align-items: center; justify-content: center; color: var(--text-muted); }
-  .mini-icon-btn:hover:not(:disabled) { color: var(--text); border-color: var(--border); }
-  .mini-icon-btn.danger:hover:not(:disabled) { color: var(--danger); border-color: var(--danger); }
-  .outline-btn {
-    border: 1px solid var(--accent); color: var(--accent); background: none;
-    padding: var(--space-1-5) var(--space-3); border-radius: 7px; font-size: 11.5px; font-weight: 600; flex-shrink: 0;
-  }
-  .outline-btn:hover { background: color-mix(in oklch, var(--accent) 15%, transparent); }
-  .muted-note { font-size: 12.5px; color: var(--text-faint); margin: var(--space-1-5) var(--space-0-5); }
-  /* Favourites cards */
-  /* The users page is a single card, so its list takes the height the page
-     has rather than a fixed cap that leaves the card half empty. */
-  #page-users .card { flex: 1; min-height: 0; }
-  #page-users .list-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-  #users-list { flex: 1; min-height: 0; max-height: none; }
-
-  /* Playlists bottom strip */
-  /* A slimmer scrollbar than the page-wide one: at 18px it dominated a strip
-     only a little taller than the chips it scrolls. */
-  .playlist-row {
-    display: flex; gap: var(--space-4); overflow-x: auto;
-    padding-bottom: var(--space-2); scrollbar-width: thin;
-  }
-  .playlist-row::-webkit-scrollbar { height: 8px; }
-  .playlist-row::-webkit-scrollbar-thumb { border-width: 2px; }
-  .playlist-chip {
-    flex: 0 0 148px; min-width: 0; display: flex; flex-direction: column; gap: var(--space-2);
-    background: var(--bg); border: 1px solid var(--border-soft); border-radius: 14px; padding: var(--space-3);
-    transition: opacity .18s ease-out, transform .18s ease-out,
-      flex-basis .16s ease-in, max-width .16s ease-in, padding .16s ease-in, margin-right .16s ease-in;
-  }
-  .playlist-chip.row-enter { opacity: 0; transform: translateY(-6px); }
-  .playlist-chip.row-exit {
-    opacity: 0; transform: scale(.94); flex-basis: 0; max-width: 0; padding: var(--space-3) 0; margin-right: 0; overflow: hidden;
-  }
-  .playlist-cover {
-    width: 100%; aspect-ratio: 1; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: rgba(255,255,255,.9);
-    position: relative; overflow: hidden;
-  }
-  .playlist-cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-  .playlist-name { font-family: 'Spectral', serif; font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .playlist-count { font-size: 11.5px; color: var(--text-muted); margin-top: calc(-1 * var(--space-1)); }
-  .playlist-actions { display: flex; align-items: center; gap: var(--space-1); }
-  .playlist-actions .primary-btn { flex: 1; min-width: 0; }
-
-  #status-line {
-    min-height: 18px; font-size: 12.5px; color: var(--text-muted); padding: 0 var(--space-10) var(--space-5);
-    opacity: 0; transition: opacity .18s ease;
-  }
-  #status-line.status-visible { opacity: 1; }
-  #status-line.status-error { color: var(--danger); }
-
-  /* ---- Join-a-voice-channel modal ---- */
-  .modal-overlay {
-    position: fixed; inset: 0; z-index: 50;
-    background: rgba(0,0,0,.55);
-    display: flex; align-items: center; justify-content: center;
-    opacity: 0; pointer-events: none;
-    transition: opacity .15s ease-out;
-  }
-  .modal-overlay.open { opacity: 1; pointer-events: auto; }
-  .modal-card {
-    width: 360px; max-width: calc(100vw - 40px);
-    background: var(--bg-elevated); border: 1px solid var(--border-soft);
-    border-radius: 16px; padding: var(--space-6);
-    box-shadow: 0 20px 50px rgba(0,0,0,.5);
-    transform: translateY(-10px) scale(.97);
-    transition: transform .15s ease-out;
-  }
-  .modal-overlay.open .modal-card { transform: translateY(0) scale(1); }
-  .modal-title { font-family: 'Spectral', serif; font-size: 17px; font-weight: 600; margin: 0 0 var(--space-1-5); }
-  .modal-subtext { font-size: 13px; color: var(--text-muted); margin: 0 0 var(--space-4); }
-  .modal-actions { display: flex; justify-content: flex-end; gap: var(--space-2-5); margin-top: var(--space-3-5); }
-  .channel-row {
-    display: flex; align-items: center; gap: var(--space-2-5); width: 100%;
-    padding: var(--space-2-5); border-radius: 9px; background: none; border: none;
-    text-align: left; font-size: 13.5px; color: var(--text);
-  }
-  .channel-row:hover { background: var(--bg-hover); }
-  .channel-row-icon { display: flex; flex-shrink: 0; color: var(--text-faint); }
-  .channel-row:hover .channel-row-icon { color: var(--accent); }
-  .channel-row-icon.last-used {
-    width: 26px; height: 26px; align-items: center; justify-content: center;
-    border-radius: 8px; color: var(--accent);
-    background: color-mix(in oklch, var(--accent) 16%, transparent);
-    box-shadow: 0 0 16px 2px color-mix(in oklch, var(--accent) 45%, transparent);
-  }
-  .channel-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-  /* ---- Breakpoints ----
-     Two columns while there's room for them, one below 900, and a compact
-     phone layout below 600 where the transport detaches to the bottom. */
-  @media (min-width: 1200px) {
-    /* Only the two-column layout has spare vertical space to hand out. The
-       band scrolls rather than growing, so the queue beside it keeps the
-       full height of the shell. */
-    /* Two cards per row rather than three: at three a card is ~270px and the
-       title loses its space fight with the thumbnail, duration and button.
-       The cards keep their natural height and the band scrolls, so a short
-       band never squeezes a card down to one visible row — the queue beside
-       it still gets the full height of the shell. */
-    .library-area { height: 100%; overflow-y: auto; align-content: start; }
-  }
-  /* Below this the two columns can't both breathe: the queue drops under
-     360px, which costs more in truncated titles than the side-by-side
-     arrangement is worth, so it stacks instead. */
-  @media (max-width: 1199px) {
-    .dashboard-grid {
-      /* Stacked, the grid is as tall as its content and `.dashboard-body`
-         scrolls — rather than the grid being capped to the shell height and
-         squeezing its rows. */
-      flex: 0 0 auto;
-      grid-template-columns: minmax(0, 1fr);
-      grid-template-rows: auto auto auto;
-      grid-template-areas:
-        "player"
-        "queue"
-        "library";
-    }
-    /* Stacked, the card sizes to its content, so the list has to take its
-       natural height capped at 46vh rather than flexing into a parent that
-       has no height of its own to share out. */
-    .queue-card .list-panel { flex: none; }
-    .queue-card .scroll-list { flex: none; max-height: 46vh; }
-    .np-art { width: 116px; height: 116px; }
-    .topbar-search { margin: 0 var(--space-4); }
-  }
-  @media (max-width: 600px) {
-    .topbar { flex-wrap: wrap; padding: var(--space-3) var(--shell-pad-x); gap: var(--space-2-5); }
-    /* The search bar takes its own row; the nav stays put, since hiding it
-       leaves no way back from the Users page. */
-    .topbar-search { order: 3; flex-basis: 100%; margin: 0; max-width: none; }
-    .card { padding: var(--space-4); border-radius: 14px; }
-    .np-hero { gap: var(--space-4); }
-    .np-art { width: 88px; height: 88px; }
-    .np-title { font-size: 19px; }
-    /* Pinned to the viewport rather than the card, so play/skip stays
-       reachable however far down the queue you've scrolled. */
-    .now-controls {
-      position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
-      margin: 0; border-top: 1px solid var(--border-soft);
-      padding: var(--space-3) var(--shell-pad-x) calc(var(--space-3) + env(safe-area-inset-bottom));
-      background: color-mix(in oklch, var(--bg-elevated) 94%, transparent);
-      backdrop-filter: blur(10px);
-    }
-    .control-row { justify-content: center; flex-wrap: wrap; }
-    .dashboard-body { padding-bottom: 92px; }
-    .volume-popover { bottom: calc(100% + 10px); }
-  }
-</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="/dashboard.css">
 </head>
 <body>
 
-<div id="login-screen">
-  <div class="brand">
-    <svg class="brand-mark" width="24" height="24" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+<div id="login-screen" class="login-card bg-surface rounded-xl p-8">
+  <div class="flex items-center justify-center gap-2 mb-7">
+    <svg class="text-accent shrink-0" width="28" height="28" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
       <circle cx="14" cy="14" r="5"/>
       <line x1="23" y1="14" x2="26" y2="14"/><line x1="20.4" y1="20.4" x2="22.5" y2="22.5"/>
       <line x1="14" y1="23" x2="14" y2="26"/><line x1="7.6" y1="20.4" x2="5.5" y2="22.5"/>
       <line x1="5" y1="14" x2="2" y2="14"/><line x1="7.6" y1="7.6" x2="5.5" y2="5.5"/>
       <line x1="14" y1="5" x2="14" y2="2"/><line x1="20.4" y1="7.6" x2="22.5" y2="5.5"/>
     </svg>
-    <span class="brand-word">APOLLO</span>
+    <span class="text-xl font-bold">Apollo</span>
   </div>
-  <div class="field">
-    <label for="username">Username</label>
-    <input id="username" type="text" autocomplete="username">
+  <div class="flex flex-col gap-1.5 mb-3.5">
+    <label class="text-xs text-secondary" for="username">Username</label>
+    <input class="input" id="username" type="text" autocomplete="username">
   </div>
-  <div class="field">
-    <label for="password">Password</label>
-    <input id="password" type="password" autocomplete="current-password">
+  <div class="flex flex-col gap-1.5 mb-3.5">
+    <label class="text-xs text-secondary" for="password">Password</label>
+    <input class="input" id="password" type="password" autocomplete="current-password">
   </div>
-  <div class="form-error" id="login-error"></div>
-  <button class="primary-btn" id="login-btn">Sign in</button>
+  <div class="text-danger text-sm min-h-5 mb-2" id="login-error"></div>
+  <button class="primary-btn w-full h-10" id="login-btn">Sign in</button>
 </div>
 
-<div id="dashboard">
-  <header class="topbar">
-    <div class="brand">
-      <svg class="brand-mark" width="24" height="24" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-        <circle cx="14" cy="14" r="5"/>
-        <line x1="23" y1="14" x2="26" y2="14"/><line x1="20.4" y1="20.4" x2="22.5" y2="22.5"/>
-        <line x1="14" y1="23" x2="14" y2="26"/><line x1="7.6" y1="20.4" x2="5.5" y2="22.5"/>
-        <line x1="5" y1="14" x2="2" y2="14"/><line x1="7.6" y1="7.6" x2="5.5" y2="5.5"/>
-        <line x1="14" y1="5" x2="14" y2="2"/><line x1="20.4" y1="7.6" x2="22.5" y2="5.5"/>
-      </svg>
-      <span class="brand-word">APOLLO</span>
+<div id="dashboard" class="dashboard hidden w-full flex-col">
+  <header class="relative z-10 flex flex-wrap items-center gap-4 gap-y-2 px-4 py-3 shrink-0 md:h-16 md:flex-nowrap md:py-0" id="topbar">
+    <div class="flex items-center gap-1 shrink-0">
+      <button class="icon-btn sm:size-10" id="sidebar-toggle-btn" type="button" title="Menu" aria-label="Toggle navigation">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></svg>
+      </button>
+      <div class="flex items-center gap-2">
+        <svg class="text-accent shrink-0" width="26" height="26" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+          <circle cx="14" cy="14" r="5"/>
+          <line x1="23" y1="14" x2="26" y2="14"/><line x1="20.4" y1="20.4" x2="22.5" y2="22.5"/>
+          <line x1="14" y1="23" x2="14" y2="26"/><line x1="7.6" y1="20.4" x2="5.5" y2="22.5"/>
+          <line x1="5" y1="14" x2="2" y2="14"/><line x1="7.6" y1="7.6" x2="5.5" y2="5.5"/>
+          <line x1="14" y1="5" x2="14" y2="2"/><line x1="20.4" y1="7.6" x2="22.5" y2="5.5"/>
+        </svg>
+        <span class="text-xl font-bold">Apollo</span>
+      </div>
     </div>
-    <nav class="topbar-nav" id="topbar-nav">
-      <button class="topbar-nav-btn active" id="nav-dashboard-btn" type="button">Dashboard</button>
-      <button class="topbar-nav-btn" id="nav-users-btn" type="button" style="display:none">Users</button>
-    </nav>
-    <div class="topbar-search" id="topbar-search">
-      <div class="search-bar" id="search-bar">
-        <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+    <div class="relative order-3 basis-full min-w-0 md:order-none md:flex-1 md:basis-auto md:max-w-135 md:mx-auto" id="topbar-search">
+      <div class="search-bar flex items-center gap-3 h-10 px-4 bg-surface border rounded-full text-secondary" id="search-bar">
+        <svg class="search-icon size-5 shrink-0" viewBox="0 0 24 24" fill="currentColor"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
         <div class="search-spinner" aria-hidden="true"></div>
-        <input type="text" id="search-input" placeholder="Search YouTube or paste a URL">
+        <input class="flex-1 min-w-0 bg-transparent border-0 outline-none text-white text-md placeholder:text-secondary" type="text" id="search-input" placeholder="Search YouTube or paste a URL">
       </div>
-      <div class="search-dropdown" id="search-dropdown">
-        <div class="scroll-list" id="search-results"></div>
-        <div class="muted-note search-loading-note" id="search-loading-note" style="display:none"><div class="search-spinner" style="display:block"></div>Searching…</div>
-        <div class="muted-note" id="search-empty-note" style="display:none">No matches — try a different search term.</div>
+      <div class="search-dropdown absolute inset-x-0 z-20 bg-surface rounded-lg p-2 shadow-menu" id="search-dropdown">
+        <div class="flex flex-col max-h-90 overflow-y-auto overflow-x-hidden" id="search-results"></div>
+        <div class="items-center gap-2 text-sm text-secondary my-1 mx-2" id="search-loading-note" style="display:none"><div class="search-spinner" style="display:block"></div>Searching…</div>
+        <div class="text-sm text-secondary my-1 mx-2" id="search-empty-note" style="display:none">No matches — try a different search term.</div>
       </div>
     </div>
-    <div class="topbar-right">
-      <div class="server-switcher" id="server-switcher">
-        <button class="server-btn" id="server-btn" type="button">
-          <span class="server-avatar" id="server-avatar">?</span>
-          <span class="server-name" id="server-name">Select a server</span>
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+    <div class="flex items-center gap-2 shrink-0">
+      <div class="relative" id="server-switcher">
+        <button class="server-btn flex items-center gap-2 h-10 px-1 rounded-full text-white hover:bg-hover md:pl-1 md:pr-2" id="server-btn" type="button" title="Switch server">
+          <span class="flex items-center justify-center size-8 rounded-full shrink-0 text-sm font-bold text-black" id="server-avatar">?</span>
+          <span class="hidden text-base font-medium max-w-40 truncate md:inline" id="server-name">Select a server</span>
+          <svg class="size-5 text-secondary" viewBox="0 0 24 24" fill="currentColor"><path d="M16.59 8.59 12 13.17 7.41 8.59 6 10l6 6 6-6z"/></svg>
         </button>
-        <div class="server-menu" id="server-menu"></div>
+        <div class="server-menu absolute right-0 z-20 w-60 max-h-80 overflow-y-auto flex flex-col gap-0.5 bg-surface rounded-lg p-2 shadow-menu" id="server-menu"></div>
       </div>
-      <button class="logout-link" id="logout-btn">Sign out</button>
+      <button class="logout-link text-sm font-medium text-secondary p-2 rounded whitespace-nowrap hover:text-white hover:bg-hover" id="logout-btn" type="button">Sign out</button>
     </div>
   </header>
 
-  <div class="dashboard-body" id="page-dashboard-body">
-   <div class="dashboard-grid">
-      <section class="card player-card">
-      <div id="np-hero" class="np-hero">
-        <div class="np-art" id="np-art">
-          <svg width="44" height="44" viewBox="0 0 28 28" fill="none" stroke="white" stroke-opacity="0.9" stroke-width="1.5" stroke-linecap="round">
+  <div class="flex flex-1 min-h-0">
+    <nav class="sidebar flex flex-col gap-1 px-3 pt-1 pb-3 overflow-hidden" id="sidebar">
+      <div class="flex items-center gap-1 h-16 -mt-1 mb-1 shrink-0 md:hidden">
+        <button class="icon-btn sm:size-10" id="sidebar-close-btn" type="button" title="Close menu" aria-label="Close navigation">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></svg>
+        </button>
+        <div class="flex items-center gap-2">
+          <svg class="text-accent shrink-0" width="26" height="26" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <circle cx="14" cy="14" r="5"/>
+            <line x1="23" y1="14" x2="26" y2="14"/><line x1="20.4" y1="20.4" x2="22.5" y2="22.5"/>
+            <line x1="14" y1="23" x2="14" y2="26"/><line x1="7.6" y1="20.4" x2="5.5" y2="22.5"/>
+            <line x1="5" y1="14" x2="2" y2="14"/><line x1="7.6" y1="7.6" x2="5.5" y2="5.5"/>
+            <line x1="14" y1="5" x2="14" y2="2"/><line x1="20.4" y1="7.6" x2="22.5" y2="5.5"/>
+          </svg>
+          <span class="text-xl font-bold">Apollo</span>
+        </div>
+      </div>
+      <button class="nav-item active flex items-center gap-4 w-full h-11 px-3 rounded-lg text-white text-base font-medium text-left whitespace-nowrap shrink-0 hover:bg-hover" id="nav-dashboard-btn" type="button" title="Home">
+        <svg class="size-6 shrink-0" viewBox="0 0 24 24" fill="currentColor"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+        <span class="nav-label">Home</span>
+      </button>
+      <button class="nav-item flex items-center gap-4 w-full h-11 px-3 rounded-lg text-white text-base font-medium text-left whitespace-nowrap shrink-0 hover:bg-hover" id="nav-users-btn" type="button" title="Users" style="display:none">
+        <svg class="size-6 shrink-0" viewBox="0 0 24 24" fill="currentColor"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>
+        <span class="nav-label">Users</span>
+      </button>
+      <div class="h-px bg-line my-2 shrink-0"></div>
+      <button class="new-playlist-btn flex items-center gap-2 self-start shrink-0 h-8 pl-2.5 pr-3.5 mb-2 rounded-full bg-hover text-white text-base font-medium whitespace-nowrap hover:bg-active" id="new-playlist-btn" type="button" title="New playlist">
+        <svg class="size-5" viewBox="0 0 24 24" fill="currentColor"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+        <span>New playlist</span>
+      </button>
+      <div class="flex-1 min-h-0 overflow-y-auto flex flex-col gap-0.5" id="sidebar-playlists"></div>
+    </nav>
+
+    <main class="flex-1 min-w-0 overflow-y-auto border border-b-0 rounded-t-xl" id="main">
+      <div class="page flex flex-col min-h-full px-4 pt-2 pb-6 sm:px-6 sm:pb-8" id="page-dashboard-body">
+        <section class="flex flex-col min-w-0">
+          <div class="flex items-end justify-between gap-4 mb-4"><h2 class="text-xl font-bold leading-tight sm:text-2xl">Playlists</h2></div>
+          <div class="flex gap-4 overflow-x-auto px-1 pt-1 pb-3" id="playlist-row"></div>
+        </section>
+
+        <section class="flex flex-col min-w-0 mt-8">
+          <div class="flex items-end justify-between gap-4 mb-4"><h2 class="text-xl font-bold leading-tight sm:text-2xl">Most played</h2></div>
+          <div class="track-grid grid gap-x-6" id="favourite-tracks"></div>
+          <div class="text-sm text-secondary my-1 mx-2" id="favourite-tracks-empty-note" style="display:none">No plays yet — tracks show up here once they have been played.</div>
+        </section>
+
+        <section class="flex flex-col min-w-0 mt-8">
+          <div class="flex items-end justify-between gap-4 mb-4"><h2 class="text-xl font-bold leading-tight sm:text-2xl">Most played playlists</h2></div>
+          <div class="flex gap-4 overflow-x-auto px-1 pt-1 pb-3" id="favourite-playlists"></div>
+          <div class="text-sm text-secondary my-1 mx-2" id="favourite-playlists-empty-note" style="display:none">No playlists played yet.</div>
+        </section>
+      </div>
+
+      <div class="page flex flex-col min-h-full px-4 pt-2 pb-6 sm:px-6 sm:pb-8" id="page-users" style="display:none">
+        <section class="flex flex-col min-w-0">
+          <div class="flex items-end justify-between gap-4 mb-4">
+            <h2 class="text-xl font-bold leading-tight sm:text-2xl">Users</h2>
+            <button class="primary-btn small" id="add-user-btn" type="button">Add user</button>
+          </div>
+          <div class="flex flex-col" id="users-list"></div>
+          <div class="text-sm text-secondary my-1 mx-2" id="users-empty-note" style="display:none">No users yet.</div>
+        </section>
+      </div>
+    </main>
+
+    <aside class="queue-panel flex flex-col min-h-0 shrink-0 bg-black" id="queue-panel">
+      <div class="flex items-center justify-between gap-2 px-4 pt-4 pb-2 shrink-0">
+        <h2 class="flex items-center text-lg font-bold">Up next<span class="ml-2 text-xs font-medium bg-hover text-secondary px-2 py-0.5 rounded-full" id="queue-count-badge">0</span></h2>
+        <div class="flex items-center gap-1">
+          <button class="ghost-btn" id="queue-shuffle-btn" type="button">Shuffle</button>
+          <button class="ghost-btn danger" id="queue-clear-btn" type="button">Clear</button>
+          <button class="icon-btn sm:size-10 lg:hidden" id="queue-close-btn" type="button" title="Close queue" aria-label="Close queue">
+            <svg class="hidden md:block" viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+            <svg class="md:hidden" viewBox="0 0 24 24" fill="currentColor"><path d="M16.59 8.59 12 13.17 7.41 8.59 6 10l6 6 6-6z"/></svg>
+          </button>
+        </div>
+      </div>
+      <!-- The list itself scrolls (the drag code reads its scroll offset), with
+           nothing above the first row so row offsets start at zero. -->
+      <div class="flex-1 min-h-0 overflow-y-auto overflow-x-hidden flex flex-col px-2 pb-2 order-2" id="queue-list"></div>
+      <div class="order-1 text-sm text-secondary my-2 mx-4" id="queue-empty-note" style="display:none">Queue is empty — add something from Search.</div>
+    </aside>
+  </div>
+
+  <footer class="player-bar relative z-10 shrink-0 grid items-center gap-2 px-2 bg-surface md:gap-4 md:px-4" id="player-bar">
+    <div class="np-progress absolute inset-x-0 top-0" id="np-progress">
+      <div class="np-progress-track absolute inset-x-0 top-0"><div class="np-progress-fill" id="np-progress-fill"></div></div>
+    </div>
+
+    <div class="flex items-center gap-0 sm:gap-1">
+      <button class="play-btn sm:size-10" id="toggle-btn" type="button" title="Play/Pause">
+        <svg id="play-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+        <svg id="pause-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+      </button>
+      <button class="icon-btn sm:size-10" id="skip-btn" type="button" title="Skip">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+      </button>
+      <button class="icon-btn danger sm:size-10" id="stop-btn" type="button" title="Stop">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h12v12H6z"/></svg>
+      </button>
+      <div class="player-time items-center gap-1 ml-2 text-sm text-secondary tabular-nums whitespace-nowrap">
+        <span id="np-elapsed"></span><span class="time-sep">/</span><span id="np-duration"></span>
+      </div>
+    </div>
+
+    <div class="flex items-center justify-start min-w-0 md:justify-center">
+      <div class="np-hero items-center gap-3 min-w-0 max-w-full" id="np-hero">
+        <div class="np-art thumb relative flex items-center justify-center size-10 rounded shrink-0 overflow-hidden" id="np-art">
+          <svg viewBox="0 0 28 28" fill="none" stroke="white" stroke-opacity="0.9" stroke-width="1.5" stroke-linecap="round">
             <circle cx="14" cy="14" r="5"/>
             <line x1="23" y1="14" x2="26" y2="14"/><line x1="20.4" y1="20.4" x2="22.5" y2="22.5"/>
             <line x1="14" y1="23" x2="14" y2="26"/><line x1="7.6" y1="20.4" x2="5.5" y2="22.5"/>
@@ -660,2294 +194,144 @@
             <line x1="14" y1="5" x2="14" y2="2"/><line x1="20.4" y1="7.6" x2="22.5" y2="5.5"/>
           </svg>
         </div>
-        <div class="np-info" id="np-info">
-          <div class="eyebrow" id="np-eyebrow">NOTHING PLAYING</div>
-          <div class="np-title" id="np-title">&mdash;</div>
-          <div class="np-channel" id="np-channel"></div>
-          <div class="np-duration" id="np-duration"></div>
-          <div class="np-progress" id="np-progress">
-            <div class="np-progress-track"><div class="np-progress-fill" id="np-progress-fill"></div></div>
-            <div class="np-progress-elapsed" id="np-elapsed"></div>
+        <div class="np-info min-w-0 flex flex-col gap-0.5" id="np-info">
+          <div class="eyebrow text-2xs font-medium tracking-wide uppercase text-secondary" id="np-eyebrow">NOTHING PLAYING</div>
+          <div class="text-base font-medium truncate" id="np-title">&mdash;</div>
+          <div class="text-sm text-secondary truncate" id="np-channel"></div>
+        </div>
+      </div>
+
+      <div class="np-empty items-center gap-3 min-w-0 max-w-full" id="np-empty">
+        <div class="thumb relative flex items-center justify-center size-10 rounded shrink-0 overflow-hidden bg-raised text-faint">
+          <svg class="size-5" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+            <circle cx="14" cy="14" r="5"/>
+            <line x1="23" y1="14" x2="26" y2="14"/><line x1="20.4" y1="20.4" x2="22.5" y2="22.5"/>
+            <line x1="14" y1="23" x2="14" y2="26"/><line x1="7.6" y1="20.4" x2="5.5" y2="22.5"/>
+            <line x1="5" y1="14" x2="2" y2="14"/><line x1="7.6" y1="7.6" x2="5.5" y2="5.5"/>
+            <line x1="14" y1="5" x2="14" y2="2"/><line x1="20.4" y1="7.6" x2="22.5" y2="5.5"/>
+          </svg>
+        </div>
+        <div class="min-w-0 flex flex-col gap-0.5">
+          <h3 class="text-base font-medium text-secondary truncate" id="np-empty-heading">Nothing is playing</h3>
+          <p class="text-sm text-faint truncate" id="np-empty-subtext">Search YouTube above or play a playlist to get started.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex items-center justify-end gap-0 sm:gap-1">
+      <button class="icon-btn hidden sm:size-10 md:flex" id="np-shuffle-btn" type="button" title="Shuffle queue">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M10.59 9.17 5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>
+      </button>
+      <button class="icon-btn text-secondary sm:size-10" id="radio-btn" type="button" title="Radio: keep the queue topped up with related tracks" aria-label="Radio">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 2c0-3.31-2.69-6-6-6s-6 2.69-6 6c0 2.22 1.21 4.15 3 5.19l1-1.74c-1.19-.7-2-1.97-2-3.45 0-2.21 1.79-4 4-4s4 1.79 4 4c0 1.48-.81 2.75-2 3.45l1 1.74c1.79-1.04 3-2.97 3-5.19zM12 2C6.48 2 2 6.48 2 12c0 3.7 2.01 6.92 4.99 8.65l1-1.73C5.61 17.53 4 14.96 4 12c0-4.42 3.58-8 8-8s8 3.58 8 8c0 2.96-1.61 5.53-4 6.92l1 1.73c2.99-1.73 5-4.95 5-8.65 0-5.52-4.48-10-10-10z"/></svg>
+      </button>
+      <div class="volume-popover-wrap relative flex items-center">
+        <button class="icon-btn sm:size-10" id="volume-btn" type="button" title="Volume" aria-expanded="false">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+        </button>
+        <div class="volume-popover flex items-center gap-2" id="volume-popover">
+          <div class="volume-slider-wrap flex items-center shrink-0 px-1.5">
+            <input type="range" id="volume-slider" min="0" max="100" value="0" aria-label="Volume">
           </div>
+          <span class="volume-popover-label text-xs font-medium text-secondary tabular-nums min-w-9 text-right" id="volume-label">0%</span>
         </div>
       </div>
-
-      <div id="np-empty" class="np-empty">
-        <svg width="48" height="48" viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-          <circle cx="14" cy="14" r="5"/>
-          <line x1="23" y1="14" x2="26" y2="14"/><line x1="20.4" y1="20.4" x2="22.5" y2="22.5"/>
-          <line x1="14" y1="23" x2="14" y2="26"/><line x1="7.6" y1="20.4" x2="5.5" y2="22.5"/>
-          <line x1="5" y1="14" x2="2" y2="14"/><line x1="7.6" y1="7.6" x2="5.5" y2="5.5"/>
-          <line x1="14" y1="5" x2="14" y2="2"/><line x1="20.4" y1="7.6" x2="22.5" y2="5.5"/>
-        </svg>
-        <h3 id="np-empty-heading">Nothing is playing</h3>
-        <p id="np-empty-subtext">Queue something up from Discord with <code>/play</code> to get started.</p>
-      </div>
-
-      <div class="now-controls">
-        <div class="control-row">
-          <button class="icon-btn" id="np-shuffle-btn" title="Shuffle">
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg>
-          </button>
-          <button class="play-btn" id="toggle-btn" title="Play/Pause">
-            <svg id="play-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 5l11 7-11 7V5z"/></svg>
-            <svg id="pause-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg>
-          </button>
-          <button class="icon-btn" id="skip-btn" title="Skip">
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M6 5l9 7-9 7V5z"/><line x1="18" y1="5" x2="18" y2="19"/></svg>
-          </button>
-          <button class="icon-btn danger" id="stop-btn" title="Stop">
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-          </button>
-          <div class="volume-popover-wrap">
-            <button class="icon-btn" id="volume-btn" title="Volume" aria-expanded="false">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
-            </button>
-            <div class="volume-popover" id="volume-popover">
-              <span class="volume-popover-label" id="volume-label">0%</span>
-              <div class="volume-slider-wrap">
-                <input type="range" id="volume-slider" min="0" max="100" value="0">
-              </div>
-            </div>
-          </div>
-          <button class="chip-btn" id="radio-btn">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49M7.76 16.24a6 6 0 0 1 0-8.49M19.07 4.93a10 10 0 0 1 0 14.14M4.93 19.07a10 10 0 0 1 0-14.14"/></svg>
-            Radio
-          </button>
-        </div>
-      </div>
-    </section>
-
-   <section class="card queue-card">
-      <div class="card-header-row">
-        <h2 class="card-title">Queue<span class="count-badge" id="queue-count-badge">0</span></h2>
-        <div class="header-actions">
-          <button class="ghost-btn" id="queue-shuffle-btn">Shuffle</button>
-          <button class="ghost-btn danger" id="queue-clear-btn">Clear</button>
-        </div>
-      </div>
-      <div class="list-panel">
-        <div class="scroll-list" id="queue-list"></div>
-        <div class="muted-note" id="queue-empty-note" style="display:none">Queue is empty — add something from Search.</div>
-      </div>
-    </section>
-
-    <div class="library-area">
-      <section class="card">
-        <h2 class="card-title">Most Played Tracks</h2>
-        <div class="list-panel">
-          <div class="scroll-list" id="favourite-tracks"></div>
-          <div class="muted-note" id="favourite-tracks-empty-note" style="display:none">No plays yet — favourites show up once tracks have been played.</div>
-        </div>
-      </section>
-
-      <section class="card">
-        <h2 class="card-title">Most Played Playlists</h2>
-        <div class="playlist-row" id="favourite-playlists"></div>
-        <div class="muted-note" id="favourite-playlists-empty-note" style="display:none">No playlists played yet.</div>
-      </section>
-
-      <section class="card">
-        <h2 class="card-title">Playlists</h2>
-        <div class="playlist-row" id="playlist-row"></div>
-      </section>
+      <button class="icon-btn sm:size-10 lg:hidden" id="queue-toggle-btn" type="button" title="Up next" aria-label="Toggle queue">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z"/></svg>
+      </button>
     </div>
-   </div>
-  </div>
+  </footer>
 
-  <div class="dashboard-body" id="page-users" style="display:none">
-   <section class="card">
-    <div class="card-header-row">
-      <h2 class="card-title">Users</h2>
-      <button class="primary-btn small" id="add-user-btn" type="button">Add user</button>
-    </div>
-    <div class="list-panel">
-      <div class="scroll-list" id="users-list"></div>
-      <div class="muted-note" id="users-empty-note" style="display:none">No users yet.</div>
-    </div>
-   </section>
-  </div>
-
-  <div id="status-line"></div>
+  <div class="scrim hidden fixed inset-0 z-40 bg-black/60" id="scrim"></div>
+  <div class="status-line fixed left-6 z-60 px-4 py-3.5 rounded bg-toast text-toast text-base leading-snug shadow-toast" id="status-line"></div>
 </div>
 
-<div class="modal-overlay" id="add-user-modal-overlay">
-  <div class="modal-card">
-    <h3 class="modal-title">Add a user</h3>
-    <p class="modal-subtext">They'll be able to sign in and control playback from this dashboard.</p>
-    <div class="field">
-      <label for="new-user-username">Username</label>
-      <input id="new-user-username" type="text" autocomplete="off">
+<div class="modal-overlay fixed inset-0 z-70 flex items-center justify-center bg-black/60" id="add-user-modal-overlay">
+  <div class="modal-card bg-surface rounded-xl p-6 shadow-menu">
+    <h3 class="text-xl font-medium mb-1.5">Add a user</h3>
+    <p class="text-base text-secondary mb-4">They'll be able to sign in and control playback from this dashboard.</p>
+    <div class="flex flex-col gap-1.5 mb-3.5">
+      <label class="text-xs text-secondary" for="new-user-username">Username</label>
+      <input class="input" id="new-user-username" type="text" autocomplete="off">
     </div>
-    <div class="field">
-      <label for="new-user-password">Password</label>
-      <input id="new-user-password" type="password" autocomplete="new-password">
+    <div class="flex flex-col gap-1.5 mb-3.5">
+      <label class="text-xs text-secondary" for="new-user-password">Password</label>
+      <input class="input" id="new-user-password" type="password" autocomplete="new-password">
     </div>
-    <div class="field">
-      <label for="new-user-guild">Server access</label>
-      <select id="new-user-guild"></select>
+    <div class="flex flex-col gap-1.5 mb-3.5">
+      <label class="text-xs text-secondary" for="new-user-guild">Server access</label>
+      <select class="input" id="new-user-guild"></select>
     </div>
-    <label class="checkbox-field"><input type="checkbox" id="new-user-is-admin"> Can manage users</label>
-    <div class="form-error" id="add-user-error"></div>
-    <div class="modal-actions">
+    <label class="flex items-center gap-2 text-sm text-secondary mb-3.5 cursor-pointer"><input class="size-4 accent-white" type="checkbox" id="new-user-is-admin"> Can manage users</label>
+    <div class="text-danger text-sm min-h-5 mb-2" id="add-user-error"></div>
+    <div class="flex justify-end gap-2 mt-3.5">
       <button class="ghost-btn" id="add-user-cancel" type="button">Cancel</button>
       <button class="primary-btn small" id="add-user-submit" type="button">Create</button>
     </div>
   </div>
 </div>
 
-<div class="modal-overlay" id="edit-password-modal-overlay">
-  <div class="modal-card">
-    <h3 class="modal-title">Change password</h3>
-    <p class="modal-subtext" id="edit-password-subtext"></p>
-    <div class="field">
-      <label for="edit-password-input">New password</label>
-      <input id="edit-password-input" type="password" autocomplete="new-password">
+<div class="modal-overlay fixed inset-0 z-70 flex items-center justify-center bg-black/60" id="edit-password-modal-overlay">
+  <div class="modal-card bg-surface rounded-xl p-6 shadow-menu">
+    <h3 class="text-xl font-medium mb-1.5">Change password</h3>
+    <p class="text-base text-secondary mb-4" id="edit-password-subtext"></p>
+    <div class="flex flex-col gap-1.5 mb-3.5">
+      <label class="text-xs text-secondary" for="edit-password-input">New password</label>
+      <input class="input" id="edit-password-input" type="password" autocomplete="new-password">
     </div>
-    <div class="form-error" id="edit-password-error"></div>
-    <div class="modal-actions">
+    <div class="text-danger text-sm min-h-5 mb-2" id="edit-password-error"></div>
+    <div class="flex justify-end gap-2 mt-3.5">
       <button class="ghost-btn" id="edit-password-cancel" type="button">Cancel</button>
       <button class="primary-btn small" id="edit-password-submit" type="button">Save</button>
     </div>
   </div>
 </div>
 
-<div class="modal-overlay" id="rename-user-modal-overlay">
-  <div class="modal-card">
-    <h3 class="modal-title">Rename user</h3>
-    <p class="modal-subtext" id="rename-user-subtext"></p>
-    <div class="field">
-      <label for="rename-user-input">New username</label>
-      <input id="rename-user-input" type="text" autocomplete="off">
+<div class="modal-overlay fixed inset-0 z-70 flex items-center justify-center bg-black/60" id="rename-user-modal-overlay">
+  <div class="modal-card bg-surface rounded-xl p-6 shadow-menu">
+    <h3 class="text-xl font-medium mb-1.5">Rename user</h3>
+    <p class="text-base text-secondary mb-4" id="rename-user-subtext"></p>
+    <div class="flex flex-col gap-1.5 mb-3.5">
+      <label class="text-xs text-secondary" for="rename-user-input">New username</label>
+      <input class="input" id="rename-user-input" type="text" autocomplete="off">
     </div>
-    <div class="form-error" id="rename-user-error"></div>
-    <div class="modal-actions">
+    <div class="text-danger text-sm min-h-5 mb-2" id="rename-user-error"></div>
+    <div class="flex justify-end gap-2 mt-3.5">
       <button class="ghost-btn" id="rename-user-cancel" type="button">Cancel</button>
       <button class="primary-btn small" id="rename-user-submit" type="button">Save</button>
     </div>
   </div>
 </div>
 
-<div class="modal-overlay" id="assign-guild-modal-overlay">
-  <div class="modal-card">
-    <h3 class="modal-title">Server access</h3>
-    <p class="modal-subtext" id="assign-guild-subtext"></p>
-    <div class="field">
-      <label for="assign-guild-select">Server</label>
-      <select id="assign-guild-select"></select>
+<div class="modal-overlay fixed inset-0 z-70 flex items-center justify-center bg-black/60" id="assign-guild-modal-overlay">
+  <div class="modal-card bg-surface rounded-xl p-6 shadow-menu">
+    <h3 class="text-xl font-medium mb-1.5">Server access</h3>
+    <p class="text-base text-secondary mb-4" id="assign-guild-subtext"></p>
+    <div class="flex flex-col gap-1.5 mb-3.5">
+      <label class="text-xs text-secondary" for="assign-guild-select">Server</label>
+      <select class="input" id="assign-guild-select"></select>
     </div>
-    <div class="form-error" id="assign-guild-error"></div>
-    <div class="modal-actions">
+    <div class="text-danger text-sm min-h-5 mb-2" id="assign-guild-error"></div>
+    <div class="flex justify-end gap-2 mt-3.5">
       <button class="ghost-btn" id="assign-guild-cancel" type="button">Cancel</button>
       <button class="primary-btn small" id="assign-guild-submit" type="button">Save</button>
     </div>
   </div>
 </div>
 
-<div class="modal-overlay" id="join-modal-overlay">
-  <div class="modal-card">
-    <h3 class="modal-title">Join a voice channel</h3>
-    <p class="modal-subtext">Apollo isn't in a voice channel yet — pick one to continue.</p>
-    <div class="scroll-list" id="join-channel-list"></div>
-    <div class="muted-note search-loading-note" id="join-channel-loading-note" style="display:none"><div class="search-spinner" style="display:block"></div>Loading channels…</div>
-    <div class="muted-note" id="join-channel-empty-note" style="display:none">No voice channels found.</div>
-    <div class="modal-actions">
+<div class="modal-overlay fixed inset-0 z-70 flex items-center justify-center bg-black/60" id="join-modal-overlay">
+  <div class="modal-card bg-surface rounded-xl p-6 shadow-menu">
+    <h3 class="text-xl font-medium mb-1.5">Join a voice channel</h3>
+    <p class="text-base text-secondary mb-4">Apollo isn't in a voice channel yet — pick one to continue.</p>
+    <div class="flex flex-col max-h-90 overflow-y-auto overflow-x-hidden" id="join-channel-list"></div>
+    <div class="items-center gap-2 text-sm text-secondary my-1 mx-2" id="join-channel-loading-note" style="display:none"><div class="search-spinner" style="display:block"></div>Loading channels…</div>
+    <div class="text-sm text-secondary my-1 mx-2" id="join-channel-empty-note" style="display:none">No voice channels found.</div>
+    <div class="flex justify-end gap-2 mt-3.5">
       <button class="ghost-btn" id="join-modal-cancel" type="button">Cancel</button>
     </div>
   </div>
 </div>
 
-<script>
-(() => {
-  const TOKEN_KEY = 'apollo-dashboard-token';
-  const LAST_GUILD_KEY = 'apollo-dashboard-last-guild';
-  const LAST_CHANNEL_KEY_PREFIX = 'apollo-dashboard-last-channel-';
-  function lastChannelKey(guildId) {
-    return LAST_CHANNEL_KEY_PREFIX + guildId;
-  }
-  let token = sessionStorage.getItem(TOKEN_KEY);
-  let currentGuildId = null;
-  let guilds = [];
-  let socket = null;
-  const SOCKET_RETRY_MIN_MS = 1000;
-  const SOCKET_RETRY_MAX_MS = 10000;
-  // Three missed pushes of the 1.5 s snapshot feed.
-  const SNAPSHOT_STALE_MS = 5000;
-  const STALE_STATUS_MESSAGE = 'No update from the bot for a few seconds — waiting for it to answer.';
-  let socketRetryTimer = null;
-  let socketRetryDelay = SOCKET_RETRY_MIN_MS;
-  let staleTimer = null;
-  let progressFrozen = false;
-  let volumeDebounce = null;
-  let searchDebounce = null;
-  let searchSeq = 0;
-  let searchActiveIndex = -1;
-  let lastSeenPlayingVideoId = null;
-  let statusDismissTimeout = null;
-  let npCrossfadeTimeout = null;
-  // True while a queue row is being dragged for reorder — while set,
-  // renderQueue must not let the live snapshot feed reconcile row DOM/order
-  // out from under the user's cursor.
-  let queueDragActive = false;
-
-  const loginScreen = document.getElementById('login-screen');
-  const dashboard = document.getElementById('dashboard');
-  const loginError = document.getElementById('login-error');
-  const statusLine = document.getElementById('status-line');
-
-
-  // Shows a status message. Non-error messages fade in and auto-dismiss after
-  // a few seconds; error messages stay up until the next status change so
-  // they actually get read. Any pending auto-dismiss is cleared whenever a
-  // new message arrives, so rapid actions don't cut each other off mid-fade.
-  function showStatus(message, options = {}) {
-    const isError = !!options.isError;
-    clearTimeout(statusDismissTimeout);
-    statusDismissTimeout = null;
-    statusLine.textContent = message || '';
-    statusLine.classList.toggle('status-error', isError);
-    statusLine.classList.toggle('status-visible', !!message);
-    if (message && !isError) {
-      statusDismissTimeout = setTimeout(() => {
-        statusLine.classList.remove('status-visible');
-        statusDismissTimeout = null;
-      }, 4000);
-    }
-  }
-
-  // Swaps a button's label for a spinner while an action it triggered is
-  // in flight, so a click gets an immediate visual response instead of
-  // nothing happening until the request resolves.
-  function setButtonBusy(btn, busy) {
-    if (!btn) return;
-    btn.disabled = busy;
-    btn.classList.toggle('btn-busy', busy);
-  }
-
-  function showDashboard() {
-    loginScreen.style.display = 'none';
-    dashboard.style.display = 'flex';
-    loadGuilds();
-    loadCurrentUser();
-  }
-
-  function showLogin(message) {
-    token = null;
-    sessionStorage.removeItem(TOKEN_KEY);
-    closeSocket();
-    setTabIcon(false);
-    loginScreen.style.display = 'block';
-    dashboard.style.display = 'none';
-    loginError.textContent = message || '';
-    currentUser = null;
-    navUsersBtn.style.display = 'none';
-    showPage('dashboard');
-  }
-
-  async function api(path, options = {}) {
-    const response = await fetch(path, {
-      ...options,
-      headers: { ...(options.headers || {}), Authorization: `Bearer ${token}` },
-    });
-    if (response.status === 401) {
-      showLogin('Session expired — please sign in again.');
-      throw new Error('unauthorized');
-    }
-    return response;
-  }
-
-  async function attemptLogin() {
-    const username = document.getElementById('username').value.trim();
-    const password = document.getElementById('password').value;
-    loginError.textContent = '';
-    try {
-      const response = await fetch('/api/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      });
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        loginError.textContent = body.error || 'Sign-in failed.';
-        return;
-      }
-      const body = await response.json();
-      token = body.token;
-      sessionStorage.setItem(TOKEN_KEY, token);
-      showDashboard();
-    } catch (err) {
-      loginError.textContent = 'Could not reach the server.';
-    }
-  }
-
-  document.getElementById('login-btn').addEventListener('click', attemptLogin);
-  for (const fieldId of ['username', 'password']) {
-    document.getElementById(fieldId).addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.keyCode === 13) attemptLogin();
-    });
-  }
-
-  document.getElementById('logout-btn').addEventListener('click', () => {
-    fetch('/api/logout', { method: 'POST', headers: { Authorization: `Bearer ${token}` } }).catch(() => {});
-    showLogin();
-  });
-
-  // ---- Deterministic per-id color, used for server avatars, playlist
-  // covers and search/queue thumbnails (the backend has no real artwork). ----
-  function hueFromId(id) {
-    let hash = 0;
-    for (let i = 0; i < id.length; i++) {
-      hash = (hash * 31 + id.charCodeAt(i)) >>> 0;
-    }
-    return hash % 360;
-  }
-
-  function hueGradient(hue) {
-    const hue2 = (hue + 40) % 360;
-    return `linear-gradient(135deg, hsl(${hue}, 65%, 55%), hsl(${hue2}, 70%, 45%))`;
-  }
-
-  // Lays the gradient down first (so it's there instantly and stays as the
-  // fallback), then loads a real YouTube thumbnail over it in the background
-  // — dropping the img on error/no-id leaves the gradient showing through.
-  function applyThumbnail(el, videoId, gradientSeed) {
-    el.style.background = hueGradient(hueFromId(gradientSeed));
-    el.innerHTML = '';
-    if (!videoId) return;
-    const img = document.createElement('img');
-    img.src = `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
-    img.alt = '';
-    img.loading = 'lazy';
-    img.addEventListener('error', () => img.remove());
-    el.appendChild(img);
-  }
-
-  // ---- Server switcher ----
-  const serverSwitcher = document.getElementById('server-switcher');
-  const serverMenu = document.getElementById('server-menu');
-  const serverBtn = document.getElementById('server-btn');
-  const serverAvatar = document.getElementById('server-avatar');
-  const serverName = document.getElementById('server-name');
-
-  function closeServerMenu() {
-    serverMenu.classList.remove('open');
-  }
-
-  serverBtn.addEventListener('click', (event) => {
-    event.stopPropagation();
-    serverMenu.classList.toggle('open');
-  });
-
-  document.addEventListener('click', (event) => {
-    if (!serverSwitcher.contains(event.target)) closeServerMenu();
-    if (!topbarSearch.contains(event.target)) closeSearchDropdown();
-  });
-
-  function renderServerMenu() {
-    serverMenu.innerHTML = '';
-    for (const guild of guilds) {
-      const row = document.createElement('button');
-      row.type = 'button';
-      row.className = 'server-row' + (guild.id === currentGuildId ? ' active' : '');
-
-      const avatar = document.createElement('span');
-      avatar.className = 'server-avatar small';
-      avatar.style.background = hueGradient(hueFromId(guild.id));
-      avatar.textContent = guild.name.charAt(0).toUpperCase();
-      row.appendChild(avatar);
-
-      const name = document.createElement('span');
-      name.textContent = guild.name;
-      row.appendChild(name);
-
-      row.addEventListener('click', () => {
-        selectGuild(guild.id);
-        closeServerMenu();
-      });
-      serverMenu.appendChild(row);
-    }
-  }
-
-  function updateServerButton(guild) {
-    serverAvatar.style.background = hueGradient(hueFromId(guild.id));
-    serverAvatar.textContent = guild.name.charAt(0).toUpperCase();
-    serverName.textContent = guild.name;
-  }
-
-  async function loadGuilds() {
-    const response = await api('/api/guilds');
-    guilds = await response.json();
-    if (guilds.length > 0) {
-      renderServerMenu();
-      const lastGuildId = localStorage.getItem(LAST_GUILD_KEY);
-      const stillPresent = lastGuildId && guilds.some((g) => g.id === lastGuildId);
-      selectGuild(stillPresent ? lastGuildId : guilds[0].id);
-    } else {
-      showStatus('Apollo is not in any servers yet.');
-    }
-  }
-
-  function selectGuild(guildId) {
-    currentGuildId = guildId;
-    localStorage.setItem(LAST_GUILD_KEY, guildId);
-    const guild = guilds.find((g) => g.id === guildId);
-    if (guild) updateServerButton(guild);
-    renderServerMenu();
-    closeSocket();
-    connectSocket(guildId);
-    clearSearch();
-    closeJoinModal();
-    loadPlaylists(guildId);
-    loadFavourites(guildId);
-  }
-
-  // Tears the feed down completely: the socket, any pending reconnect and
-  // the stale-feed timer, so nothing fires again until the next connect.
-  function closeSocket() {
-    clearTimeout(socketRetryTimer);
-    socketRetryTimer = null;
-    clearTimeout(staleTimer);
-    staleTimer = null;
-    if (socket) { socket.close(); socket = null; }
-    setSnapshotStale(false);
-  }
-
-  // Replaces the socket only: the stale-feed timer keeps running across
-  // reconnect attempts, so an outage is flagged even while the feed is
-  // still trying to come back.
-  function connectSocket(guildId) {
-    clearTimeout(socketRetryTimer);
-    socketRetryTimer = null;
-    if (socket) { socket.close(); socket = null; }
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${location.host}/api/guilds/${guildId}/ws?token=${encodeURIComponent(token)}`);
-    socket = ws;
-    let opened = false;
-    ws.addEventListener('open', () => { opened = true; socketRetryDelay = SOCKET_RETRY_MIN_MS; });
-    ws.addEventListener('message', (event) => {
-      try {
-        renderSnapshot(JSON.parse(event.data));
-      } catch (err) { /* ignore malformed frame */ }
-    });
-    // A feed that drops (bot restart, network blip) comes back on its own
-    // with a growing delay, unless this socket was already replaced or the
-    // user signed out in the meantime.
-    ws.addEventListener('close', () => {
-      if (socket !== ws) return;
-      socket = null;
-      if (!token || currentGuildId !== guildId) return;
-      if (!staleTimer) staleTimer = setTimeout(() => setSnapshotStale(true), SNAPSHOT_STALE_MS);
-      socketRetryTimer = setTimeout(() => retrySocket(guildId, opened), socketRetryDelay);
-      socketRetryDelay = Math.min(socketRetryDelay * 2, SOCKET_RETRY_MAX_MS);
-    });
-  }
-
-  // A handshake the server refuses only shows up as a close, so a socket
-  // that never opened is preceded by a plain request: a revoked session
-  // lands on the sign-in screen there instead of retrying forever, while
-  // a bot that is merely down keeps the retries going.
-  async function retrySocket(guildId, hadOpened) {
-    socketRetryTimer = null;
-    if (!hadOpened) {
-      try {
-        await api('/api/guilds');
-      } catch (err) {
-        if (err.message === 'unauthorized') return;
-      }
-    }
-    if (!token || currentGuildId !== guildId || socket) return;
-    connectSocket(guildId);
-  }
-
-  // Flags the now-playing card as running on stale data once the snapshot
-  // feed goes quiet, and pins the progress bar where it is so it stops
-  // sailing on to 100% with nothing behind it.
-  function setSnapshotStale(stale) {
-    if (stale === dashboard.classList.contains('snapshot-stale')) return;
-    dashboard.classList.toggle('snapshot-stale', stale);
-    if (stale) {
-      freezeProgress();
-      // The feed has stopped saying anything about playback, so the tab
-      // icon stops claiming it.
-      setTabIcon(false);
-      showStatus(STALE_STATUS_MESSAGE, { isError: true });
-    } else if (statusLine.textContent === STALE_STATUS_MESSAGE) {
-      showStatus('');
-    }
-  }
-
-  // Reading the computed width forces a layout, so the bar is only pinned
-  // once per outage; the next real position unfreezes it.
-  function freezeProgress() {
-    if (progressFrozen) return;
-    progressFrozen = true;
-    const fill = document.getElementById('np-progress-fill');
-    const width = getComputedStyle(fill).width;
-    fill.style.transition = 'none';
-    fill.style.width = width;
-  }
-
-  const STATE_LABELS = {
-    playing: 'NOW PLAYING',
-    paused: 'PAUSED',
-    buffering: 'BUFFERING…',
-    queue_finished: 'QUEUE FINISHED',
-    empty: 'NOTHING PLAYING',
-  };
-
-  function formatDuration(totalSeconds) {
-    if (totalSeconds == null) return '';
-    const m = Math.floor(totalSeconds / 60);
-    const s = Math.floor(totalSeconds % 60);
-    return `${m}:${String(s).padStart(2, '0')}`;
-  }
-
-  const HERO_STATES = new Set(['playing', 'paused', 'buffering']);
-
-  function renderHeroOrEmpty(snapshot) {
-    const showHero = HERO_STATES.has(snapshot.state);
-    document.getElementById('np-hero').style.display = showHero ? 'flex' : 'none';
-    document.getElementById('np-empty').style.display = showHero ? 'none' : 'flex';
-    if (showHero) return;
-
-    if (snapshot.state === 'queue_finished' && snapshot.track) {
-      document.getElementById('np-empty-heading').textContent = 'Queue finished';
-      document.getElementById('np-empty-subtext').textContent =
-        `"${snapshot.track.title}" was the last track. Queue something up from Discord with /play to keep going.`;
-    } else {
-      document.getElementById('np-empty-heading').textContent = 'Nothing is playing';
-      document.getElementById('np-empty-subtext').textContent =
-        'Queue something up from Discord with /play to get started.';
-    }
-  }
-
-  // ---- Keyed list reconciliation ----
-  // Diffs `items` against the container's current children (matched by
-  // dataset.key) instead of wiping and rebuilding the list. Persisting rows
-  // are reused in place (so hover/focus state and CSS transitions survive),
-  // new rows are created and enter-animated, and rows no longer present are
-  // exit-animated before being removed. Duplicate keys are matched in order
-  // via a Map<key, Element[]> so two same-keyed items don't collapse onto a
-  // single DOM node.
-  function animateEnter(el) {
-    el.classList.add('row-enter');
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        el.classList.remove('row-enter');
-      });
-    });
-  }
-
-  function animateExit(el, onDone) {
-    let done = false;
-    let fallback = null;
-    function finish() {
-      if (done) return;
-      done = true;
-      clearTimeout(fallback);
-      el.removeEventListener('transitionend', onTransitionEnd);
-      onDone();
-    }
-    function onTransitionEnd(event) {
-      if (event.target !== el) return;
-      finish();
-    }
-    el.addEventListener('transitionend', onTransitionEnd);
-    fallback = setTimeout(finish, 250);
-    // The exit transition shrinks max-height to 0, which needs an explicit
-    // starting px value to animate from (CSS can't interpolate from the
-    // resting `none`) — measure the row's actual rendered height rather than
-    // guessing a constant, so rows taller than an assumed height never get
-    // clipped in the resting (non-exiting) state. The inline value is only
-    // there to seed that starting point for one committed frame: it's
-    // cleared in the same breath `row-exit` is added so the class's own
-    // `max-height: 0` (not an inline style that would outrank it) drives the
-    // actual animated transition.
-    el.style.maxHeight = `${el.scrollHeight}px`;
-    void el.offsetHeight;
-    el.classList.add('row-exit');
-    el.style.maxHeight = '';
-  }
-
-  function reconcileList(container, items, keyOf, createRow, updateRow) {
-    const existingByKey = new Map();
-    for (const el of Array.from(container.children)) {
-      if (el.dataset.exiting === 'true') continue;
-      const key = el.dataset.key;
-      if (key == null) continue;
-      let bucket = existingByKey.get(key);
-      if (!bucket) { bucket = []; existingByKey.set(key, bucket); }
-      bucket.push(el);
-    }
-
-    const usedElements = new Set();
-    let prevSibling = null;
-
-    items.forEach((item, index) => {
-      const key = String(keyOf(item));
-      const bucket = existingByKey.get(key);
-      let el = bucket && bucket.length ? bucket.shift() : null;
-
-      if (el) {
-        updateRow(el, item, index, items);
-        if (prevSibling === null) {
-          if (container.firstChild !== el) container.insertBefore(el, container.firstChild);
-        } else if (prevSibling.nextSibling !== el) {
-          container.insertBefore(el, prevSibling.nextSibling);
-        }
-      } else {
-        el = createRow(item, index, items);
-        el.dataset.key = key;
-        if (prevSibling === null) {
-          container.insertBefore(el, container.firstChild);
-        } else {
-          container.insertBefore(el, prevSibling.nextSibling);
-        }
-        animateEnter(el);
-      }
-      usedElements.add(el);
-      prevSibling = el;
-    });
-
-    for (const el of Array.from(container.children)) {
-      if (usedElements.has(el) || el.dataset.exiting === 'true') continue;
-      el.dataset.exiting = 'true';
-      animateExit(el, () => {
-        if (el.parentNode === container) container.removeChild(el);
-      });
-    }
-  }
-
-  // A cheap fingerprint of the fields updateTrackRowContent writes to the
-  // DOM, so a reconcile can tell whether a persisting row's content actually
-  // needs touching — most snapshot ticks change only playback position/state,
-  // not the queue's track list, so this turns the common case into a string
-  // comparison instead of 3 querySelector + 3 textContent writes per row.
-  function trackContentSig(track) {
-    return `${track.title} ${track.channel} ${track.duration_secs}`;
-  }
-
-  // Builds the shared thumb + title/channel + duration layout used by both
-  // the search results list and the queue list; callers append their own
-  // trailing action button(s).
-  function createTrackRow(track) {
-    const row = document.createElement('div');
-    row.className = 'compact-row';
-
-    const thumb = document.createElement('div');
-    thumb.className = 'compact-thumb';
-    applyThumbnail(thumb, track.video_id, track.video_id);
-    row.appendChild(thumb);
-
-    const meta = document.createElement('div');
-    meta.className = 'compact-meta';
-    const titleLine = document.createElement('div');
-    titleLine.className = 'compact-title-line';
-    const titleSpan = document.createElement('span');
-    titleSpan.className = 'compact-title';
-    titleSpan.textContent = track.title;
-    titleLine.appendChild(titleSpan);
-    meta.appendChild(titleLine);
-    const channel = document.createElement('div');
-    channel.className = 'compact-channel';
-    channel.textContent = track.channel;
-    meta.appendChild(channel);
-    row.appendChild(meta);
-
-    const duration = document.createElement('span');
-    duration.className = 'compact-duration';
-    duration.textContent = formatDuration(track.duration_secs);
-    row.appendChild(duration);
-
-    row.dataset.contentSig = trackContentSig(track);
-    return row;
-  }
-
-  // Mutates an existing row's title/channel/duration in place, without
-  // recreating the element — used by every list's updateRow so persisting
-  // rows keep their identity across reconciles. The thumbnail is deliberately
-  // left untouched: reconcileList only reuses a row when the item's key
-  // (video_id) matches, so a reused row's thumbnail is already correct —
-  // reapplying it would tear down and recreate the <img> (forcing a reload)
-  // on every reconcile, which gets very expensive with large lists like a
-  // multi-thousand-track queue. Same reasoning for the contentSig guard below:
-  // with a large queue, most reconciles change no track's title/channel/
-  // duration at all (only playback position/state), so skipping the DOM
-  // writes entirely when the fingerprint matches avoids thousands of
-  // pointless querySelector/textContent calls every snapshot tick.
-  function updateTrackRowContent(row, track) {
-    const sig = trackContentSig(track);
-    if (row.dataset.contentSig === sig) return;
-    row.dataset.contentSig = sig;
-    row.querySelector('.compact-title').textContent = track.title;
-    row.querySelector('.compact-channel').textContent = track.channel;
-    row.querySelector('.compact-duration').textContent = formatDuration(track.duration_secs);
-  }
-
-  const REMOVE_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
-  const PLAY_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,3 21,12 6,21"/></svg>';
-  const GRIP_ICON = '<svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="2.5" cy="2.5" r="1.5"/><circle cx="7.5" cy="2.5" r="1.5"/><circle cx="2.5" cy="8" r="1.5"/><circle cx="7.5" cy="8" r="1.5"/><circle cx="2.5" cy="13.5" r="1.5"/><circle cx="7.5" cy="13.5" r="1.5"/></svg>';
-  const REFRESH_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>';
-  const EDIT_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
-  const USER_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
-  const SERVER_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg>';
-
-  function makeMiniIconBtn(iconSvg, title, disabled, danger) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = danger ? 'mini-icon-btn danger' : 'mini-icon-btn';
-    btn.title = title;
-    btn.disabled = !!disabled;
-    btn.innerHTML = iconSvg;
-    return btn;
-  }
-
-  // ---- Queue drag-to-reorder ----
-  // Pointer-events-based drag (not native HTML5 DnD, whose default ghost
-  // image feels clunky). The dragged row stays in normal flow and is offset
-  // with an inline `transform: translateY(...)`; siblings that get displaced
-  // by a reorder mid-drag are animated into their new slot with a FLIP
-  // transition (capture old position, move, capture new position, animate
-  // the difference away).
-  const queueList = document.getElementById('queue-list');
-  let dragState = null;
-
-  function getQueueRows() {
-    return Array.from(queueList.children).filter((el) => el.dataset.exiting !== 'true');
-  }
-
-  // FLIP-animates `el` from its previous position (expressed as `deltaY`, the
-  // signed distance from where it used to be to where it now is) into its
-  // current position. Cancels and replaces any FLIP transition already in
-  // flight on the same element so rapid successive reorders within one drag
-  // don't leave a stale transitionend/timeout pair clobbering a newer one.
-  function flipTransition(el, deltaY) {
-    if (el._flipCleanup) el._flipCleanup();
-    el.style.transition = 'none';
-    el.style.transform = `translateY(${deltaY}px)`;
-    void el.offsetHeight; // force reflow before re-enabling the transition
-    el.style.transition = 'transform 150ms ease';
-    el.style.transform = '';
-    let done = false;
-    let fallback = null;
-    function finish() {
-      if (done) return;
-      done = true;
-      clearTimeout(fallback);
-      el.removeEventListener('transitionend', onTransitionEnd);
-      el.style.transition = '';
-      if (el._flipCleanup === finish) el._flipCleanup = null;
-    }
-    function onTransitionEnd(event) {
-      if (event.target !== el) return;
-      finish();
-    }
-    el.addEventListener('transitionend', onTransitionEnd);
-    fallback = setTimeout(finish, 250);
-    el._flipCleanup = finish;
-  }
-
-  // Moves the dragged row to sit before `others[newIndex]` (or at the end),
-  // FLIP-animating every other row whose layout position changes as a
-  // result, and updates `state.layoutTopDelta` so the caller can keep the
-  // dragged row's rendered position under the cursor with no visual jump.
-  function reorderDom(state, others, newIndex) {
-    const { row, startRect } = state;
-    const rows = getQueueRows();
-    const beforeRects = new Map();
-    for (const r of rows) {
-      if (r === row) continue;
-      beforeRects.set(r, r.getBoundingClientRect());
-    }
-
-    const refRow = others[newIndex] || null;
-    row.style.transform = ''; // measure true layout position, ignoring the drag offset
-    if (refRow) {
-      queueList.insertBefore(row, refRow);
-    } else {
-      queueList.appendChild(row);
-    }
-    const layoutTop = row.getBoundingClientRect().top;
-    state.layoutTopDelta = layoutTop - startRect.top;
-
-    for (const r of rows) {
-      if (r === row) continue;
-      const before = beforeRects.get(r);
-      const after = r.getBoundingClientRect();
-      const diff = before.top - after.top;
-      if (diff !== 0) flipTransition(r, diff);
-    }
-  }
-
-  function onDragPointerMove(event) {
-    if (!dragState || event.pointerId !== dragState.pointerId) return;
-    const { row, startRect, startClientY } = dragState;
-    const deltaY = event.clientY - startClientY;
-
-    const rows = getQueueRows();
-    const others = rows.filter((r) => r !== row);
-    // The now-playing track (if any) is pinned as the first row but isn't
-    // part of the movable queue — its lack of a drag handle already stops it
-    // from being dragged itself, but without this floor a dragged row could
-    // still be spliced in ahead of it, implying a reorder that can't happen.
-    const minIndex = others[0] && others[0].classList.contains('now-playing-row') ? 1 : 0;
-    const draggedCenter = startRect.top + deltaY + startRect.height / 2;
-
-    // Walk rows in DOM order summing offsetHeight (a pure layout dimension,
-    // never affected by a transform or an in-flight transition on one) to
-    // find each sibling's settled position. getBoundingClientRect() would be
-    // wrong here: a sibling displaced by the last reorderDom is still mid
-    // FLIP-transition (see flipTransition), so its rect lags behind where
-    // it's actually headed — if the pointer moves fast enough to sample again
-    // before that 150ms transition finishes, the threshold check below would
-    // compare against the stale, still-animating position and the dragged
-    // row would stop advancing, i.e. appear to "stick" mid-drag.
-    const gap = parseFloat(getComputedStyle(queueList).rowGap) || 0;
-    let top = queueList.getBoundingClientRect().top - queueList.scrollTop;
-    let newIndex = others.length;
-    let otherIndex = 0;
-    for (const r of rows) {
-      const height = r.offsetHeight;
-      if (r !== row) {
-        const mid = top + height / 2;
-        if (draggedCenter < mid) { newIndex = otherIndex; break; }
-        otherIndex++;
-      }
-      top += height + gap;
-    }
-    if (newIndex < minIndex) newIndex = minIndex;
-
-    if (newIndex !== dragState.tentativeIndex) {
-      reorderDom(dragState, others, newIndex);
-      dragState.tentativeIndex = newIndex;
-    }
-
-    row.style.transform = `translateY(${deltaY - dragState.layoutTopDelta}px) scale(1.02)`;
-  }
-
-  function onDragPointerEnd(event) {
-    if (!dragState || event.pointerId !== dragState.pointerId) return;
-    const { row, handle, pointerId, startIndex, tentativeIndex, queueIndexOffset, moveHandler, upHandler, cancelHandler } = dragState;
-
-    try { handle.releasePointerCapture(pointerId); } catch (err) { /* already released */ }
-    document.removeEventListener('pointermove', moveHandler);
-    document.removeEventListener('pointerup', upHandler);
-    document.removeEventListener('pointercancel', cancelHandler);
-
-    row.classList.remove('dragging');
-    row.style.transform = '';
-    document.body.style.userSelect = '';
-    queueDragActive = false;
-    dragState = null;
-
-    if (tentativeIndex !== startIndex) {
-      moveQueueTrack(startIndex - queueIndexOffset, tentativeIndex - queueIndexOffset);
-    }
-  }
-
-  function onDragPointerDown(event, row, handle) {
-    if (dragState || event.button !== 0) return;
-    event.preventDefault();
-    // setPointerCapture keeps the initial press pinned to `handle` even if
-    // the cursor slips off it before the first move. It doesn't survive the
-    // rest of the drag, though: reorderDom moves `row` (and thus `handle`)
-    // to a new spot in the list via insertBefore/appendChild, and that DOM
-    // reparenting silently drops capture. Once dropped, move/up would only
-    // reach `handle` while the cursor happens to still be exactly over its
-    // 18px width -- reliable when dragging slowly, but a fast drag easily
-    // outruns the row's per-frame transform compensation and slips off,
-    // silently killing the rest of the drag (dragState never clears,
-    // queueDragActive stays stuck true, freezing all further queue
-    // reconciliation). Listening on `document` instead means move/up keep
-    // arriving regardless of where the cursor actually is or whether
-    // capture survived.
-    handle.setPointerCapture(event.pointerId);
-
-    const rows = getQueueRows();
-    const startIndex = rows.indexOf(row);
-    if (startIndex === -1) return;
-    // startIndex/tentativeIndex live in DOM-row space, which includes the
-    // pinned now-playing row when present; the server's queue indices don't
-    // include it, so this offset is subtracted before calling moveQueueTrack.
-    const queueIndexOffset = rows[0] && rows[0].classList.contains('now-playing-row') ? 1 : 0;
-
-    dragState = {
-      pointerId: event.pointerId,
-      row,
-      handle,
-      startIndex,
-      tentativeIndex: startIndex,
-      queueIndexOffset,
-      startRect: row.getBoundingClientRect(),
-      startClientY: event.clientY,
-      layoutTopDelta: 0,
-      moveHandler: null,
-      upHandler: null,
-      cancelHandler: null,
-    };
-    dragState.moveHandler = (e) => onDragPointerMove(e);
-    dragState.upHandler = (e) => onDragPointerEnd(e);
-    dragState.cancelHandler = (e) => onDragPointerEnd(e);
-
-    row.classList.add('dragging');
-    document.body.style.userSelect = 'none';
-    queueDragActive = true;
-
-    document.addEventListener('pointermove', dragState.moveHandler);
-    document.addEventListener('pointerup', dragState.upHandler);
-    document.addEventListener('pointercancel', dragState.cancelHandler);
-  }
-
-  function makeDragHandle(row) {
-    const handle = document.createElement('div');
-    handle.className = 'drag-handle';
-    handle.title = 'Drag to reorder';
-    handle.innerHTML = GRIP_ICON;
-    handle.addEventListener('pointerdown', (event) => onDragPointerDown(event, row, handle));
-    return handle;
-  }
-
-  function makeNowPlayingIndicator() {
-    const el = document.createElement('div');
-    el.className = 'now-playing-indicator';
-    el.innerHTML = '<span></span><span></span><span></span>';
-    return el;
-  }
-
-  // The queue's remove button acts on the row's position, which can change
-  // across renders even when the row itself persists (e.g. a track at
-  // position 2 moves to position 1). The row's current index is stashed on
-  // `dataset.index` by updateQueueRow on every reconcile, and the click
-  // handler reads it at click-time instead of closing over a stale index
-  // captured when the row was first created.
-  function createQueueRow(track, index, items) {
-    const row = createTrackRow(track);
-    row.classList.add('queue-row');
-
-    if (track.__nowPlaying) {
-      row.insertBefore(makeNowPlayingIndicator(), row.firstChild);
-      updateQueueRow(row, track, index, items);
-      return row;
-    }
-
-    row.insertBefore(makeDragHandle(row), row.firstChild);
-
-    const actions = document.createElement('div');
-    actions.className = 'compact-actions';
-
-    const playBtn = makeMiniIconBtn(PLAY_ICON, 'Play now', false, false);
-    playBtn.addEventListener('click', () => playQueueTrack(Number(row.dataset.index)));
-    actions.appendChild(playBtn);
-
-    const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Remove', false, true);
-    removeBtn.addEventListener('click', () => removeQueueTrack(Number(row.dataset.index)));
-    actions.appendChild(removeBtn);
-
-    row.appendChild(actions);
-    updateQueueRow(row, track, index, items);
-    return row;
-  }
-
-  // `items[0]` is the pinned now-playing entry (see renderQueue) when
-  // present, so a real queue row's index is offset by one from its position
-  // in the combined array.
-  function updateQueueRow(row, track, index, items) {
-    updateTrackRowContent(row, track);
-    if (track.__nowPlaying) {
-      row.classList.add('now-playing-row');
-      row.classList.toggle('is-paused', !!track.__paused);
-      return;
-    }
-    const offset = items && items[0] && items[0].__nowPlaying ? 1 : 0;
-    const newIndex = String(index - offset);
-    if (row.dataset.index !== newIndex) row.dataset.index = newIndex;
-  }
-
-  function renderQueue(snapshot) {
-    const upcoming = snapshot.upcoming;
-    document.getElementById('queue-count-badge').textContent = upcoming.length;
-    document.getElementById('queue-shuffle-btn').disabled = upcoming.length < 2;
-    document.getElementById('queue-clear-btn').disabled = upcoming.length === 0;
-    document.getElementById('np-shuffle-btn').disabled = upcoming.length < 2;
-
-    // A live snapshot (WebSocket push, ~every 1.5s, or an action response)
-    // reflects server-confirmed state, which is stale mid-drag since the
-    // move hasn't been sent yet — reconciling now would yank the dragged row
-    // back out from under the cursor. Skip touching row DOM/order entirely
-    // until the drag ends; normal reconciliation resumes on the next
-    // snapshot after that.
-    if (queueDragActive) return;
-
-    const list = document.getElementById('queue-list');
-    const emptyNote = document.getElementById('queue-empty-note');
-
-    // Pin the currently playing/buffering track to the top of the queue
-    // list, highlighted, instead of just letting it vanish from view now
-    // that it's no longer in `upcoming`. Keyed separately from a plain
-    // queue entry so a track playing twice back-to-back doesn't collide
-    // with itself mid-reconcile.
-    const nowPlaying = HERO_STATES.has(snapshot.state) && snapshot.track
-      ? { ...snapshot.track, __nowPlaying: true, __paused: snapshot.state === 'paused' }
-      : null;
-    emptyNote.style.display = upcoming.length === 0 && !nowPlaying ? 'block' : 'none';
-
-    const items = nowPlaying ? [nowPlaying, ...upcoming] : upcoming;
-    reconcileList(
-      list,
-      items,
-      (track) => (track.__nowPlaying ? `now-playing:${track.video_id}` : track.video_id),
-      createQueueRow,
-      updateQueueRow,
-    );
-  }
-
-  // Fades `.np-info` out, swaps its text, then lets the same transition fade
-  // it back in. Any pending swap from a previous rapid track change is
-  // cleared first so overlapping calls don't cut each other's fade short.
-  function crossfadeNowPlaying(applyContent) {
-    const npInfo = document.getElementById('np-info');
-    clearTimeout(npCrossfadeTimeout);
-    npInfo.classList.add('np-fade-out');
-    npCrossfadeTimeout = setTimeout(() => {
-      applyContent();
-      npInfo.classList.remove('np-fade-out');
-      npCrossfadeTimeout = null;
-    }, 150);
-  }
-
-  // Animates the progress fill with a single CSS transition to 100% timed
-  // to the track's remaining length, rather than polling every tick — the
-  // bar then advances smoothly between snapshots with no JS interval.
-  function updateProgress(snapshot) {
-    const wrap = document.getElementById('np-progress');
-    const fill = document.getElementById('np-progress-fill');
-    const elapsedEl = document.getElementById('np-elapsed');
-    const duration = snapshot.track ? snapshot.track.duration_secs : null;
-    const hasBar = !!snapshot.track && duration != null;
-    const live = snapshot.state === 'playing' || snapshot.state === 'paused';
-    if (hasBar && live && snapshot.position_ms == null) {
-      // The bot has a track but couldn't say where it is (the audio worker
-      // didn't answer in time): keep the bar up and hold it in place.
-      freezeProgress();
-      return;
-    }
-    const showProgress = hasBar && snapshot.position_ms != null;
-    wrap.style.display = showProgress ? 'flex' : 'none';
-    if (!showProgress) return;
-
-    const positionSecs = Math.min(snapshot.position_ms / 1000, duration);
-    elapsedEl.textContent = formatDuration(positionSecs);
-    progressFrozen = false;
-    fill.style.transition = 'none';
-    fill.style.width = `${duration > 0 ? (positionSecs / duration) * 100 : 0}%`;
-    if (snapshot.state === 'playing') {
-      void fill.offsetWidth; // flush so the transition below starts from the width just set
-      const remaining = Math.max(duration - positionSecs, 0);
-      fill.style.transition = `width ${remaining}s linear`;
-      fill.style.width = '100%';
-    }
-  }
-
-  // One-shot glow pulse on the art tile when a new track starts.
-  function pulseNowPlayingArt() {
-    const npArt = document.getElementById('np-art');
-    npArt.classList.remove('np-pulse');
-    void npArt.offsetWidth; // restart the animation if one is already mid-flight
-    npArt.classList.add('np-pulse');
-    npArt.addEventListener('animationend', () => npArt.classList.remove('np-pulse'), { once: true });
-  }
-
-  // The tab icon: the header's sun, drawn to hold together on a 16px tab
-  // strip — a solid disc and eight rays with a clear gap between them,
-  // filling the icon rather than sitting on a tile. Lit while audio is
-  // running and dimmed when it is not, so a background tab shows at a
-  // glance whether the bot is playing.
-  const TAB_ICON_LIT = { from: '#f6c76a', mid: '#e3a53f', to: '#d9784a' };
-  const TAB_ICON_DIM = { from: '#b99a63', mid: '#977a44', to: '#7f5a3e' };
-
-  function tabIconSvg(tone) {
-    let rays = '';
-    for (let i = 0; i < 8; i++) {
-      rays += `<line x1='16' y1='6' x2='16' y2='2' transform='rotate(${i * 45} 16 16)'/>`;
-    }
-    // A stroke has no width of its own to hang a gradient on, so the sun's
-    // runs in user space and covers disc and rays alike.
-    return `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs>` +
-      `<linearGradient id='s' gradientUnits='userSpaceOnUse' x1='5' y1='3' x2='27' y2='29'>` +
-        `<stop offset='0' stop-color='${tone.from}'/><stop offset='.48' stop-color='${tone.mid}'/>` +
-        `<stop offset='1' stop-color='${tone.to}'/></linearGradient></defs>` +
-      `<circle cx='16' cy='16' r='6.2' fill='url(#s)'/>` +
-      `<g stroke='url(#s)' stroke-width='3.6' stroke-linecap='round'>${rays}</g>` +
-      `</svg>`;
-  }
-
-  let tabIconTone = null;
-  function setTabIcon(playing) {
-    const tone = playing ? TAB_ICON_LIT : TAB_ICON_DIM;
-    if (tone === tabIconTone) return;
-    tabIconTone = tone;
-    document.getElementById('favicon').href = `data:image/svg+xml,${encodeURIComponent(tabIconSvg(tone))}`;
-  }
-
-  function renderSnapshot(snapshot) {
-    setSnapshotStale(false);
-    clearTimeout(staleTimer);
-    staleTimer = setTimeout(() => setSnapshotStale(true), SNAPSHOT_STALE_MS);
-    const playingVideoId = snapshot.track ? snapshot.track.video_id : null;
-    const trackChanged = playingVideoId !== lastSeenPlayingVideoId;
-    if (snapshot.state === 'playing' && trackChanged) {
-      loadFavourites(currentGuildId);
-    }
-    // Only crossfade on an actual track-to-track switch — not on initial
-    // load or on stopping, where there's no "before" text worth fading out.
-    const shouldCrossfade = trackChanged && lastSeenPlayingVideoId !== null && playingVideoId !== null;
-    lastSeenPlayingVideoId = playingVideoId;
-
-    function applyNowPlayingContent() {
-      document.getElementById('np-eyebrow').textContent = STATE_LABELS[snapshot.state] || snapshot.state;
-      const hasTrack = !!snapshot.track;
-      document.getElementById('np-title').textContent = hasTrack ? snapshot.track.title : '';
-      document.getElementById('np-channel').textContent = hasTrack ? snapshot.track.channel : '';
-      document.getElementById('np-duration').textContent = hasTrack ? formatDuration(snapshot.track.duration_secs) : '';
-      if (hasTrack) applyThumbnail(document.getElementById('np-art'), snapshot.track.video_id, snapshot.track.video_id);
-      updateProgress(snapshot);
-    }
-
-    if (shouldCrossfade) {
-      crossfadeNowPlaying(applyNowPlayingContent);
-      pulseNowPlayingArt();
-    } else {
-      applyNowPlayingContent();
-    }
-
-    renderHeroOrEmpty(snapshot);
-    renderQueue(snapshot);
-
-    const transportDisabled = snapshot.state !== 'playing' && snapshot.state !== 'paused';
-    // A restart clears in-memory playback state but the queue is reloaded
-    // straight from the DB (queue_snapshot), so `upcoming` can be non-empty
-    // while `state` is still 'empty' — that's a resumable queue, not
-    // nothing to do, so keep Play clickable (see togglePauseOrResume).
-    document.getElementById('toggle-btn').disabled = transportDisabled && snapshot.upcoming.length === 0;
-    document.getElementById('skip-btn').disabled = transportDisabled;
-    document.getElementById('stop-btn').disabled = transportDisabled;
-
-    setTabIcon(snapshot.state === 'playing');
-    document.getElementById('play-icon').classList.toggle('visible', snapshot.state !== 'playing');
-    document.getElementById('pause-icon').classList.toggle('visible', snapshot.state === 'playing');
-
-    const radioBtn = document.getElementById('radio-btn');
-    radioBtn.classList.toggle('active', !!snapshot.radio_enabled);
-
-    if (document.activeElement !== document.getElementById('volume-slider')) {
-      document.getElementById('volume-slider').value = snapshot.volume;
-    }
-    document.getElementById('volume-label').textContent = `${snapshot.volume}%`;
-  }
-
-  async function sendAction(path, options) {
-    try {
-      const response = await api(`/api/guilds/${currentGuildId}/${path}`, options);
-      const body = await response.json();
-      if (!response.ok) {
-        showStatus(body.error || 'Something went wrong.', { isError: true });
-        return;
-      }
-      showStatus('');
-      renderSnapshot(body);
-    } catch (err) { /* showLogin already handled unauthorized */ }
-  }
-
-  document.getElementById('toggle-btn').addEventListener('click', () => togglePauseOrResume());
-  document.getElementById('skip-btn').addEventListener('click', () => sendAction('skip', { method: 'POST' }));
-  document.getElementById('stop-btn').addEventListener('click', () => sendAction('stop', { method: 'POST' }));
-  document.getElementById('np-shuffle-btn').addEventListener('click', () => sendAction('shuffle', { method: 'POST' }));
-  document.getElementById('queue-shuffle-btn').addEventListener('click', () => sendAction('shuffle', { method: 'POST' }));
-  document.getElementById('radio-btn').addEventListener('click', () => sendAction('toggle-radio', { method: 'POST' }));
-  document.getElementById('queue-clear-btn').addEventListener('click', () => sendAction('queue/clear', { method: 'POST' }));
-
-  function moveQueueTrack(from, to) {
-    sendAction(`queue/${from}/move`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ to }),
-    });
-  }
-
-  function removeQueueTrack(index) {
-    sendAction(`queue/${index}/remove`, { method: 'POST' });
-  }
-
-  async function playQueueTrack(index) {
-    try {
-      const response = await api(`/api/guilds/${currentGuildId}/queue/${index}/play`, { method: 'POST' });
-      const body = await response.json();
-      if (!response.ok) {
-        if (body.error === NOT_CONNECTED_ERROR) {
-          openJoinModal(() => playQueueTrack(index));
-          return;
-        }
-        showStatus(body.error || 'Something went wrong.', { isError: true });
-        return;
-      }
-      showStatus('');
-      renderSnapshot(body);
-    } catch (err) { /* showLogin already handled unauthorized */ }
-  }
-
-  const volumeBtn = document.getElementById('volume-btn');
-  const volumePopover = document.getElementById('volume-popover');
-
-  function closeVolumePopover() {
-    volumePopover.classList.remove('open');
-    volumeBtn.classList.remove('active');
-    volumeBtn.setAttribute('aria-expanded', 'false');
-  }
-
-  volumeBtn.addEventListener('click', (event) => {
-    event.stopPropagation();
-    const opening = !volumePopover.classList.contains('open');
-    volumePopover.classList.toggle('open', opening);
-    volumeBtn.classList.toggle('active', opening);
-    volumeBtn.setAttribute('aria-expanded', String(opening));
-  });
-  document.addEventListener('click', (event) => {
-    if (!volumePopover.classList.contains('open')) return;
-    if (volumeBtn.contains(event.target) || volumePopover.contains(event.target)) return;
-    closeVolumePopover();
-  });
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && volumePopover.classList.contains('open')) closeVolumePopover();
-  });
-
-  document.getElementById('volume-slider').addEventListener('input', (event) => {
-    document.getElementById('volume-label').textContent = `${event.target.value}%`;
-    clearTimeout(volumeDebounce);
-    const level = Number(event.target.value);
-    volumeDebounce = setTimeout(() => {
-      sendAction('volume', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ level }),
-      });
-    }, 250);
-  });
-
-  // ---- Join-a-voice-channel modal ----
-  // Surfaced reactively: a queue/playlist action fails with PlayerError::
-  // NotConnected (see src/voice/player.rs) whenever the bot has no active
-  // voice connection in this guild, since nothing upstream of that point
-  // knows which channel to join. Rather than just showing the error, offer
-  // a channel picker and — once the user picks one and the join succeeds —
-  // replay whatever action triggered the modal.
-  const NOT_CONNECTED_ERROR = 'not connected to a voice channel';
-  const NOTHING_PLAYING_ERROR = 'nothing is playing';
-  const VOICE_ICON = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>';
-
-  const joinModalOverlay = document.getElementById('join-modal-overlay');
-  const joinChannelList = document.getElementById('join-channel-list');
-  const joinChannelEmptyNote = document.getElementById('join-channel-empty-note');
-  const joinChannelLoadingNote = document.getElementById('join-channel-loading-note');
-  let pendingRetryAction = null;
-
-  function closeJoinModal() {
-    joinModalOverlay.classList.remove('open');
-    pendingRetryAction = null;
-  }
-
-  function createChannelRow(channel, isLastUsed) {
-    const row = document.createElement('button');
-    row.type = 'button';
-    row.className = 'channel-row';
-
-    const icon = document.createElement('span');
-    icon.className = 'channel-row-icon' + (isLastUsed ? ' last-used' : '');
-    icon.innerHTML = VOICE_ICON;
-    row.appendChild(icon);
-
-    const name = document.createElement('span');
-    name.className = 'channel-row-name';
-    name.textContent = channel.name;
-    row.appendChild(name);
-
-    row.addEventListener('click', () => joinChannel(channel.id, channel.name));
-    return row;
-  }
-
-  async function openJoinModal(retryAction) {
-    pendingRetryAction = retryAction || null;
-    joinModalOverlay.classList.add('open');
-    joinChannelList.innerHTML = '';
-    joinChannelEmptyNote.style.display = 'none';
-    joinChannelLoadingNote.style.display = 'flex';
-    try {
-      const response = await api(`/api/guilds/${currentGuildId}/voice-channels`);
-      if (!response.ok) return;
-      const channels = await response.json();
-      if (channels.length === 0) {
-        joinChannelEmptyNote.style.display = 'block';
-        return;
-      }
-      const lastChannelId = localStorage.getItem(lastChannelKey(currentGuildId));
-      const lastIndex = channels.findIndex((c) => c.id === lastChannelId);
-      if (lastIndex > 0) channels.unshift(channels.splice(lastIndex, 1)[0]);
-      for (const channel of channels) {
-        joinChannelList.appendChild(createChannelRow(channel, channel.id === lastChannelId));
-      }
-    } catch (err) { /* showLogin already handled unauthorized */
-    } finally {
-      joinChannelLoadingNote.style.display = 'none';
-    }
-  }
-
-  async function joinChannel(channelId, channelName) {
-    try {
-      const response = await api(`/api/guilds/${currentGuildId}/join`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channel_id: channelId }),
-      });
-      const body = await response.json();
-      if (!response.ok) {
-        showStatus(body.error || 'Could not join that channel.', { isError: true });
-        return;
-      }
-      localStorage.setItem(lastChannelKey(currentGuildId), channelId);
-      renderSnapshot(body);
-      showStatus(`Joined "${channelName}".`);
-      const retry = pendingRetryAction;
-      closeJoinModal();
-      if (retry) retry();
-    } catch (err) { /* showLogin already handled unauthorized */ }
-  }
-
-  // The toggle button doubles as "resume a persisted queue" after a
-  // restart: the process reloads `upcoming` straight from the DB (see
-  // queue_snapshot in src/voice/player.rs) so it's non-empty even though
-  // nothing is playing yet, but pause()/resume() only ever look at the
-  // in-memory current-track handle and fail with "nothing is playing"
-  // until the bot rejoins a voice channel. Joining is what actually starts
-  // the persisted queue (restore_session_if_new), so surface the same
-  // channel picker used for queueing/playlists instead of leaving the
-  // button inert.
-  async function togglePauseOrResume() {
-    try {
-      const response = await api(`/api/guilds/${currentGuildId}/toggle-pause`, { method: 'POST' });
-      const body = await response.json();
-      if (!response.ok) {
-        const upcomingCount = Number(document.getElementById('queue-count-badge').textContent) || 0;
-        if (body.error === NOTHING_PLAYING_ERROR && upcomingCount > 0) {
-          openJoinModal(null);
-          return;
-        }
-        showStatus(body.error || 'Something went wrong.', { isError: true });
-        return;
-      }
-      showStatus('');
-      renderSnapshot(body);
-    } catch (err) { /* showLogin already handled unauthorized */ }
-  }
-
-  document.getElementById('join-modal-cancel').addEventListener('click', closeJoinModal);
-  joinModalOverlay.addEventListener('click', (event) => {
-    if (event.target === joinModalOverlay) closeJoinModal();
-  });
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && joinModalOverlay.classList.contains('open')) closeJoinModal();
-  });
-
-  // ---- Search ----
-  // Faithful mirror of the backend's extract_video_id (src/commands/playback.rs)
-  // so "is this a link" is decided identically client-side and server-side.
-  function extractVideoId(input) {
-    let url;
-    try { url = new URL(input); } catch { return null; }
-    const host = url.hostname;
-    if (host === 'youtu.be') {
-      const seg = url.pathname.split('/').filter(Boolean)[0];
-      return seg || null;
-    }
-    if (host === 'youtube.com' || host.endsWith('.youtube.com')) {
-      if (url.pathname === '/watch') {
-        return url.searchParams.get('v');
-      }
-      if (url.pathname.startsWith('/shorts/')) {
-        const rest = url.pathname.slice('/shorts/'.length);
-        const id = rest.split('/')[0];
-        return id || null;
-      }
-      return null;
-    }
-    return null;
-  }
-
-  // Faithful mirror of the backend's looks_like_playlist_url
-  // (src/commands/playback.rs) so "is this a playlist link" is decided
-  // identically client-side and server-side.
-  function looksLikePlaylistUrl(input) {
-    let url;
-    try { url = new URL(input); } catch { return false; }
-    const host = url.hostname;
-    const recognizedHost = host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com');
-    return recognizedHost && url.searchParams.has('list');
-  }
-
-  const topbarSearch = document.getElementById('topbar-search');
-  const searchDropdown = document.getElementById('search-dropdown');
-  const searchInput = document.getElementById('search-input');
-  const searchResults = document.getElementById('search-results');
-  const searchEmptyNote = document.getElementById('search-empty-note');
-  const searchLoadingNote = document.getElementById('search-loading-note');
-
-  function openSearchDropdown() {
-    searchDropdown.classList.add('open');
-  }
-
-  function closeSearchDropdown() {
-    searchDropdown.classList.remove('open');
-  }
-
-  function clearSearch() {
-    searchInput.value = '';
-    searchResults.innerHTML = '';
-    searchEmptyNote.style.display = 'none';
-    searchLoadingNote.style.display = 'none';
-    searchActiveIndex = -1;
-    closeSearchDropdown();
-  }
-
-  function createSearchRow(track) {
-    const row = createTrackRow(track);
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'outline-btn';
-    addBtn.textContent = 'Add';
-    addBtn.addEventListener('click', () => {
-      addToQueue(row._videoId, row._title);
-      closeSearchDropdown();
-    });
-    row.appendChild(addBtn);
-    row._videoId = track.video_id;
-    row._title = track.title;
-    return row;
-  }
-
-  function updateSearchRow(row, track) {
-    updateTrackRowContent(row, track);
-    row._videoId = track.video_id;
-    row._title = track.title;
-  }
-
-  function renderSearchResults(tracks) {
-    searchEmptyNote.style.display = tracks.length === 0 ? 'block' : 'none';
-    reconcileList(searchResults, tracks, (track) => track.video_id, createSearchRow, updateSearchRow);
-    openSearchDropdown();
-    setSearchActiveIndex(-1);
-  }
-
-  function setSearchActiveIndex(index) {
-    const rows = Array.from(searchResults.children);
-    if (rows.length === 0) index = -1;
-    else if (index >= rows.length) index = -1;
-    else if (index < -1) index = rows.length - 1;
-    rows.forEach((row, i) => row.classList.toggle('kbd-active', i === index));
-    if (index !== -1) rows[index].scrollIntoView({ block: 'nearest' });
-    searchActiveIndex = index;
-  }
-
-  function setSearchBarLoading(loading) {
-    document.getElementById('search-bar').classList.toggle('loading', loading);
-  }
-
-  async function runSearch(query, isLink) {
-    const seq = ++searchSeq;
-    setSearchBarLoading(true);
-    if (!isLink) {
-      searchLoadingNote.style.display = 'flex';
-      searchEmptyNote.style.display = 'none';
-      openSearchDropdown();
-    }
-    try {
-      const response = await api(`/api/guilds/${currentGuildId}/search?q=${encodeURIComponent(query)}`);
-      const body = await response.json();
-      if (seq !== searchSeq) return; // a newer search superseded this one
-      searchLoadingNote.style.display = 'none';
-      if (!response.ok) {
-        showStatus(body.error || 'Search failed.', { isError: true });
-        searchResults.innerHTML = '';
-        searchEmptyNote.style.display = 'none';
-        closeSearchDropdown();
-        return;
-      }
-      showStatus('');
-      if (isLink && Array.isArray(body) && body.length > 0) {
-        // Nothing to disambiguate for a recognized link — add it straight away.
-        searchInput.value = '';
-        searchResults.innerHTML = '';
-        searchEmptyNote.style.display = 'none';
-        closeSearchDropdown();
-        addToQueue(body[0].video_id, body[0].title);
-        return;
-      }
-      renderSearchResults(body);
-    } catch (err) {
-      if (seq === searchSeq) searchLoadingNote.style.display = 'none';
-    } finally {
-      if (seq === searchSeq) setSearchBarLoading(false);
-    }
-  }
-
-  searchInput.addEventListener('input', () => {
-    clearTimeout(searchDebounce);
-    const query = searchInput.value.trim();
-    if (!query) {
-      searchResults.innerHTML = '';
-      searchEmptyNote.style.display = 'none';
-      searchLoadingNote.style.display = 'none';
-      closeSearchDropdown();
-      searchActiveIndex = -1;
-      return;
-    }
-    const isLink = extractVideoId(query) !== null;
-    const isPlaylistLink = !isLink && looksLikePlaylistUrl(query);
-    if (isLink || isPlaylistLink) {
-      // There's nothing meaningful to show while a link resolves — clear any
-      // stale result list immediately instead of leaving it visible mid-flight.
-      searchResults.innerHTML = '';
-      searchEmptyNote.style.display = 'none';
-      closeSearchDropdown();
-      searchActiveIndex = -1;
-    }
-    if (isPlaylistLink) {
-      searchDebounce = setTimeout(() => importPlaylistFromSearch(query), 300);
-      return;
-    }
-    searchDebounce = setTimeout(() => runSearch(query, isLink), 300);
-  });
-
-  searchInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') { closeSearchDropdown(); return; }
-    if (!searchDropdown.classList.contains('open') || searchResults.children.length === 0) return;
-    if (event.key === 'ArrowDown') {
-      event.preventDefault();
-      setSearchActiveIndex(searchActiveIndex + 1);
-    } else if (event.key === 'ArrowUp') {
-      event.preventDefault();
-      setSearchActiveIndex(searchActiveIndex - 1);
-    } else if (event.key === 'Enter') {
-      const row = searchResults.children[searchActiveIndex === -1 ? 0 : searchActiveIndex];
-      if (row) {
-        event.preventDefault();
-        addToQueue(row._videoId, row._title);
-        closeSearchDropdown();
-      }
-    }
-  });
-
-  async function addToQueue(videoId, title, btn) {
-    setButtonBusy(btn, true);
-    try {
-      const response = await api(`/api/guilds/${currentGuildId}/queue/add`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ video_id: videoId }),
-      });
-      const body = await response.json();
-      if (!response.ok) {
-        if (body.error === NOT_CONNECTED_ERROR) {
-          openJoinModal(() => addToQueue(videoId, title));
-          return;
-        }
-        showStatus(body.error || 'Could not add that track.', { isError: true });
-        return;
-      }
-      renderSnapshot(body);
-      showStatus(`Added "${title}" to the queue.`);
-      loadFavourites(currentGuildId);
-      clearSearch();
-    } catch (err) { /* showLogin already handled unauthorized */
-    } finally {
-      setButtonBusy(btn, false);
-    }
-  }
-
-  async function importPlaylistFromSearch(url) {
-    setSearchBarLoading(true);
-    try {
-      const response = await api(`/api/guilds/${currentGuildId}/playlists/import`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url }),
-      });
-      const body = await response.json();
-      if (!response.ok) {
-        showStatus(body.error || 'Could not import that playlist.', { isError: true });
-        return;
-      }
-      searchInput.value = '';
-      showStatus(`Imported "${body.name}" (${body.track_count} track${body.track_count === 1 ? '' : 's'}).`);
-      loadPlaylists(currentGuildId);
-    } catch (err) { /* showLogin already handled unauthorized */
-    } finally {
-      setSearchBarLoading(false);
-    }
-  }
-
-  // ---- Playlists ----
-  const playlistRow = document.getElementById('playlist-row');
-
-  function applyPlaylistCover(cover, playlist) {
-    applyThumbnail(cover, playlist.thumbnail_video_id, String(playlist.id));
-  }
-
-  function renderPlaylists(playlists) {
-    playlistRow.innerHTML = '';
-    for (const playlist of playlists) {
-      const chip = document.createElement('div');
-      chip.className = 'playlist-chip';
-
-      const cover = document.createElement('div');
-      cover.className = 'playlist-cover';
-      applyPlaylistCover(cover, playlist);
-      chip.appendChild(cover);
-
-      const name = document.createElement('div');
-      name.className = 'playlist-name';
-      name.textContent = playlist.name;
-      chip.appendChild(name);
-
-      const count = document.createElement('div');
-      count.className = 'playlist-count';
-      count.textContent = `${playlist.track_count} track${playlist.track_count === 1 ? '' : 's'}`;
-      chip.appendChild(count);
-
-      const actions = document.createElement('div');
-      actions.className = 'playlist-actions';
-
-      const playBtn = document.createElement('button');
-      playBtn.type = 'button';
-      playBtn.className = 'primary-btn small';
-      playBtn.textContent = 'Play';
-      playBtn.addEventListener('click', () => playPlaylist(playlist.id, playlist.name, playBtn));
-      actions.appendChild(playBtn);
-
-      const refreshBtn = makeMiniIconBtn(REFRESH_ICON, 'Refresh from YouTube', false, false);
-      refreshBtn.addEventListener('click', () => refreshPlaylist(playlist.id, playlist.name));
-      actions.appendChild(refreshBtn);
-
-      const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Remove playlist', false, true);
-      removeBtn.addEventListener('click', () => removePlaylist(playlist.id, playlist.name));
-      actions.appendChild(removeBtn);
-
-      chip.appendChild(actions);
-
-      playlistRow.appendChild(chip);
-    }
-  }
-
-  async function loadPlaylists(guildId) {
-    try {
-      const response = await api(`/api/guilds/${guildId}/playlists`);
-      if (!response.ok) {
-        renderPlaylists([]);
-        return;
-      }
-      renderPlaylists(await response.json());
-    } catch (err) { /* showLogin already handled unauthorized */ }
-  }
-
-  async function playPlaylist(id, name, btn) {
-    setButtonBusy(btn, true);
-    try {
-      const response = await api(`/api/guilds/${currentGuildId}/playlists/${id}/play`, { method: 'POST' });
-      const body = await response.json();
-      if (!response.ok) {
-        if (body.error === NOT_CONNECTED_ERROR) {
-          openJoinModal(() => playPlaylist(id, name));
-          return;
-        }
-        showStatus(body.error || 'Could not start that playlist.', { isError: true });
-        return;
-      }
-      renderSnapshot(body);
-      showStatus(`Playing "${name}".`);
-      loadFavourites(currentGuildId);
-    } catch (err) { /* showLogin already handled unauthorized */
-    } finally {
-      setButtonBusy(btn, false);
-    }
-  }
-
-  async function refreshPlaylist(id, name) {
-    try {
-      const response = await api(`/api/guilds/${currentGuildId}/playlists/${id}/refresh`, { method: 'POST' });
-      const body = await response.json();
-      if (!response.ok) {
-        showStatus(body.error || 'Could not refresh that playlist.', { isError: true });
-        return;
-      }
-      showStatus(`Refreshed "${name}" (${body.track_count} track${body.track_count === 1 ? '' : 's'}).`);
-      loadPlaylists(currentGuildId);
-    } catch (err) { /* showLogin already handled unauthorized */ }
-  }
-
-  async function removePlaylist(id, name) {
-    if (!window.confirm(`Remove "${name}"? You can re-import it later from its URL.`)) return;
-    try {
-      const response = await api(`/api/guilds/${currentGuildId}/playlists/${id}/remove`, { method: 'POST' });
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        showStatus(body.error || 'Could not remove that playlist.', { isError: true });
-        return;
-      }
-      showStatus(`Removed "${name}".`);
-      loadPlaylists(currentGuildId);
-      loadFavourites(currentGuildId);
-    } catch (err) { /* showLogin already handled unauthorized */ }
-  }
-
-  // ---- Favourites ----
-  const favouriteTracksList = document.getElementById('favourite-tracks');
-  const favouriteTracksEmptyNote = document.getElementById('favourite-tracks-empty-note');
-  const favouritePlaylistsRow = document.getElementById('favourite-playlists');
-  const favouritePlaylistsEmptyNote = document.getElementById('favourite-playlists-empty-note');
-
-  // The play count rides in the row's sub-line next to the channel rather
-  // than in the duration slot: these cards are narrow, and a combined
-  // "4:14 · played 40×" there takes the width from the title, which matters
-  // more than either.
-  function applyFavouritePlayCount(row, track) {
-    const channelEl = row.querySelector('.compact-channel');
-    const playCountText = `played ${track.play_count}×`;
-    channelEl.textContent = track.channel
-      ? `${track.channel} · ${playCountText}`
-      : playCountText;
-  }
-
-  function createFavouriteTrackRow(track) {
-    const row = createTrackRow(track);
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'outline-btn';
-    addBtn.textContent = 'Add';
-    addBtn.addEventListener('click', () => addToQueue(row._videoId, row._title, addBtn));
-    row.appendChild(addBtn);
-    updateFavouriteTrackRow(row, track);
-    return row;
-  }
-
-  function updateFavouriteTrackRow(row, track) {
-    updateTrackRowContent(row, track);
-    applyFavouritePlayCount(row, track);
-    row._videoId = track.video_id;
-    row._title = track.title;
-  }
-
-  function renderFavouriteTracks(tracks) {
-    favouriteTracksEmptyNote.style.display = tracks.length === 0 ? 'block' : 'none';
-    reconcileList(favouriteTracksList, tracks, (track) => track.video_id, createFavouriteTrackRow, updateFavouriteTrackRow);
-  }
-
-  function createFavPlaylistChip(playlist) {
-    const chip = document.createElement('div');
-    chip.className = 'playlist-chip';
-
-    const cover = document.createElement('div');
-    cover.className = 'playlist-cover';
-    chip.appendChild(cover);
-
-    const name = document.createElement('div');
-    name.className = 'playlist-name';
-    chip.appendChild(name);
-
-    const count = document.createElement('div');
-    count.className = 'playlist-count';
-    chip.appendChild(count);
-
-    const playBtn = document.createElement('button');
-    playBtn.type = 'button';
-    playBtn.className = 'primary-btn small';
-    playBtn.textContent = 'Play';
-    playBtn.addEventListener('click', () => playPlaylist(chip._playlistId, chip._playlistName, playBtn));
-    chip.appendChild(playBtn);
-
-    updateFavPlaylistChip(chip, playlist);
-    return chip;
-  }
-
-  function updateFavPlaylistChip(chip, playlist) {
-    applyPlaylistCover(chip.querySelector('.playlist-cover'), playlist);
-    chip.querySelector('.playlist-name').textContent = playlist.name;
-    chip.querySelector('.playlist-count').textContent =
-      `Played ${playlist.play_count} time${playlist.play_count === 1 ? '' : 's'}`;
-    chip._playlistId = playlist.id;
-    chip._playlistName = playlist.name;
-  }
-
-  function renderFavouritePlaylists(playlists) {
-    favouritePlaylistsEmptyNote.style.display = playlists.length === 0 ? 'block' : 'none';
-    reconcileList(favouritePlaylistsRow, playlists, (playlist) => String(playlist.id), createFavPlaylistChip, updateFavPlaylistChip);
-  }
-
-  async function loadFavourites(guildId) {
-    try {
-      const response = await api(`/api/guilds/${guildId}/favourites`);
-      if (!response.ok) {
-        renderFavouriteTracks([]);
-        renderFavouritePlaylists([]);
-        return;
-      }
-      const body = await response.json();
-      renderFavouriteTracks(body.tracks);
-      renderFavouritePlaylists(body.playlists);
-    } catch (err) { /* showLogin already handled unauthorized */ }
-  }
-
-  // ---- Users (admin only) ----
-  const navDashboardBtn = document.getElementById('nav-dashboard-btn');
-  const navUsersBtn = document.getElementById('nav-users-btn');
-  const pageDashboardBody = document.getElementById('page-dashboard-body');
-  const pageUsers = document.getElementById('page-users');
-  const usersList = document.getElementById('users-list');
-  const usersEmptyNote = document.getElementById('users-empty-note');
-  let currentUser = null;
-
-  // The nav itself is hidden from non-admins (see loadCurrentUser), but
-  // showPage stays reachable either way so showLogin can always reset back
-  // to the Dashboard page.
-  function showPage(name) {
-    const onUsers = name === 'users';
-    pageDashboardBody.style.display = onUsers ? 'none' : 'flex';
-    pageUsers.style.display = onUsers ? 'flex' : 'none';
-    topbarSearch.style.display = onUsers ? 'none' : '';
-    navDashboardBtn.classList.toggle('active', !onUsers);
-    navUsersBtn.classList.toggle('active', onUsers);
-    if (onUsers) loadUsers();
-  }
-
-  navDashboardBtn.addEventListener('click', () => showPage('dashboard'));
-  navUsersBtn.addEventListener('click', () => showPage('users'));
-
-  async function loadCurrentUser() {
-    try {
-      const response = await api('/api/me');
-      if (!response.ok) return;
-      currentUser = await response.json();
-      navUsersBtn.style.display = currentUser.is_admin ? '' : 'none';
-    } catch (err) { /* showLogin already handled unauthorized */ }
-  }
-
-  function createUserRow(user) {
-    const row = document.createElement('div');
-    row.className = 'compact-row user-row';
-
-    const meta = document.createElement('div');
-    meta.className = 'compact-meta';
-    const title = document.createElement('div');
-    title.className = 'compact-title';
-    meta.appendChild(title);
-    const scope = document.createElement('div');
-    scope.className = 'compact-channel user-scope';
-    meta.appendChild(scope);
-    row.appendChild(meta);
-
-    const badge = document.createElement('div');
-    badge.className = 'admin-badge';
-    row.appendChild(badge);
-
-    const guildBtn = makeMiniIconBtn(SERVER_ICON, 'Server access', false, false);
-    guildBtn.classList.add('user-guild-btn');
-    guildBtn.addEventListener('click', () => openAssignGuildModal(row._username, row._guildId));
-    row.appendChild(guildBtn);
-
-    const renameBtn = makeMiniIconBtn(USER_ICON, 'Rename user', false, false);
-    renameBtn.classList.add('rename-user-btn');
-    renameBtn.addEventListener('click', () => openRenameUserModal(row._username));
-    row.appendChild(renameBtn);
-
-    const editBtn = makeMiniIconBtn(EDIT_ICON, 'Change password', false, false);
-    editBtn.classList.add('edit-user-btn');
-    editBtn.addEventListener('click', () => openEditPasswordModal(row._username));
-    row.appendChild(editBtn);
-
-    const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Delete user', false, true);
-    removeBtn.addEventListener('click', () => deleteUser(row._username));
-    row.appendChild(removeBtn);
-
-    updateUserRow(row, user);
-    return row;
-  }
-
-  // The admin badge uses visibility (not display) when hidden so every row
-  // keeps the same 5-column grid — otherwise a plain-user row would lose a
-  // track and its buttons would drift out of alignment.
-  function updateUserRow(row, user) {
-    row.querySelector('.compact-title').textContent = user.username;
-    const badge = row.querySelector('.admin-badge');
-    badge.textContent = user.is_root ? 'Root' : 'Admin';
-    badge.style.visibility = user.is_admin ? 'visible' : 'hidden';
-
-    const isSelf = !!currentUser && user.username === currentUser.username;
-
-    // Everyone can rename/reset their own account; only root can do either
-    // to someone else — see the matching checks in web::users::set_username
-    // and web::users::set_password.
-    const canEditSelfOrRoot = isSelf || (!!currentUser && currentUser.is_root);
-
-    const renameBtn = row.querySelector('.rename-user-btn');
-    renameBtn.disabled = !canEditSelfOrRoot;
-    renameBtn.title = canEditSelfOrRoot
-      ? 'Rename user'
-      : "Only the root admin can rename another user";
-
-    const editBtn = row.querySelector('.edit-user-btn');
-    editBtn.disabled = !canEditSelfOrRoot;
-    editBtn.title = canEditSelfOrRoot
-      ? 'Change password'
-      : "Only the root admin can change another user's password";
-
-    const removeBtn = row.querySelector('.mini-icon-btn.danger');
-    removeBtn.disabled = isSelf || user.is_root;
-    removeBtn.title = user.is_root
-      ? "The root account can't be deleted"
-      : isSelf
-        ? "You can't delete your own account"
-        : 'Delete user';
-
-    // Admins reach every server regardless of what's stored against them, so
-    // the row says so rather than showing a pin that isn't being enforced —
-    // see web::auth::CurrentUser::may_access_guild.
-    row.querySelector('.user-scope').textContent = user.is_admin
-      ? 'All servers'
-      : guildLabel(user.guild_id);
-
-    row._username = user.username;
-    row._guildId = user.guild_id || null;
-  }
-
-  // The server a user is pinned to, by name where the bot still knows it —
-  // an id the cache has no guild for (the bot was removed from it, say)
-  // falls back to the raw id so the row still says something true.
-  function guildLabel(guildId) {
-    if (!guildId) return 'All servers';
-    const guild = guilds.find((g) => g.id === guildId);
-    return guild ? guild.name : `Server ${guildId}`;
-  }
-
-  // "All servers" plus every guild this dashboard can see. An admin editing
-  // someone pinned to a guild the admin themselves can't see would drop that
-  // pin silently, so the current value is always included as an option.
-  function fillGuildSelect(select, selectedId) {
-    select.innerHTML = '';
-    const options = [{ id: '', name: 'All servers' }, ...guilds];
-    if (selectedId && !guilds.some((g) => g.id === selectedId)) {
-      options.push({ id: selectedId, name: guildLabel(selectedId) });
-    }
-    for (const option of options) {
-      const el = document.createElement('option');
-      el.value = option.id;
-      el.textContent = option.name;
-      select.appendChild(el);
-    }
-    select.value = selectedId || '';
-  }
-
-  async function loadUsers() {
-    try {
-      const response = await api('/api/users');
-      if (!response.ok) return;
-      const users = await response.json();
-      usersEmptyNote.style.display = users.length === 0 ? 'block' : 'none';
-      reconcileList(usersList, users, (user) => user.username, createUserRow, updateUserRow);
-    } catch (err) { /* showLogin already handled unauthorized */ }
-  }
-
-  async function deleteUser(username) {
-    if (!window.confirm(`Remove "${username}"? They will no longer be able to sign in.`)) return;
-    try {
-      const response = await api(`/api/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        showStatus(body.error || 'Could not remove that user.', { isError: true });
-        return;
-      }
-      showStatus(`Removed "${username}".`);
-      loadUsers();
-    } catch (err) { /* showLogin already handled unauthorized */ }
-  }
-
-  // ---- Add-user modal ----
-  const addUserModalOverlay = document.getElementById('add-user-modal-overlay');
-  const addUserUsernameInput = document.getElementById('new-user-username');
-  const addUserPasswordInput = document.getElementById('new-user-password');
-  const addUserIsAdminInput = document.getElementById('new-user-is-admin');
-  const addUserGuildSelect = document.getElementById('new-user-guild');
-  const addUserError = document.getElementById('add-user-error');
-  const addUserSubmitBtn = document.getElementById('add-user-submit');
-
-  function openAddUserModal() {
-    addUserUsernameInput.value = '';
-    addUserPasswordInput.value = '';
-    addUserIsAdminInput.checked = false;
-    fillGuildSelect(addUserGuildSelect, '');
-    addUserError.textContent = '';
-    addUserModalOverlay.classList.add('open');
-    addUserUsernameInput.focus();
-  }
-
-  function closeAddUserModal() {
-    addUserModalOverlay.classList.remove('open');
-  }
-
-  async function submitAddUser() {
-    const username = addUserUsernameInput.value.trim();
-    const password = addUserPasswordInput.value;
-    if (!username || !password) {
-      addUserError.textContent = 'Username and password are required.';
-      return;
-    }
-    addUserError.textContent = '';
-    setButtonBusy(addUserSubmitBtn, true);
-    try {
-      const response = await api('/api/users', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username,
-          password,
-          is_admin: addUserIsAdminInput.checked,
-          guild_id: addUserGuildSelect.value || null,
-        }),
-      });
-      const body = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        addUserError.textContent = body.error || 'Could not create that user.';
-        return;
-      }
-      closeAddUserModal();
-      showStatus(`Created "${username}".`);
-      loadUsers();
-    } catch (err) { /* showLogin already handled unauthorized */
-    } finally {
-      setButtonBusy(addUserSubmitBtn, false);
-    }
-  }
-
-  document.getElementById('add-user-btn').addEventListener('click', openAddUserModal);
-  document.getElementById('add-user-cancel').addEventListener('click', closeAddUserModal);
-  addUserModalOverlay.addEventListener('click', (event) => {
-    if (event.target === addUserModalOverlay) closeAddUserModal();
-  });
-  addUserSubmitBtn.addEventListener('click', submitAddUser);
-  for (const fieldId of ['new-user-username', 'new-user-password']) {
-    document.getElementById(fieldId).addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') submitAddUser();
-    });
-  }
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && addUserModalOverlay.classList.contains('open')) closeAddUserModal();
-  });
-
-  // ---- Edit-password modal ----
-  const editPasswordModalOverlay = document.getElementById('edit-password-modal-overlay');
-  const editPasswordSubtext = document.getElementById('edit-password-subtext');
-  const editPasswordInput = document.getElementById('edit-password-input');
-  const editPasswordError = document.getElementById('edit-password-error');
-  const editPasswordSubmitBtn = document.getElementById('edit-password-submit');
-  let editPasswordUsername = null;
-
-  function openEditPasswordModal(username) {
-    editPasswordUsername = username;
-    editPasswordInput.value = '';
-    editPasswordError.textContent = '';
-    editPasswordSubtext.textContent = `Set a new password for "${username}".`;
-    editPasswordModalOverlay.classList.add('open');
-    editPasswordInput.focus();
-  }
-
-  function closeEditPasswordModal() {
-    editPasswordModalOverlay.classList.remove('open');
-    editPasswordUsername = null;
-  }
-
-  async function submitEditPassword() {
-    const password = editPasswordInput.value;
-    if (!password) {
-      editPasswordError.textContent = 'Password is required.';
-      return;
-    }
-    editPasswordError.textContent = '';
-    setButtonBusy(editPasswordSubmitBtn, true);
-    try {
-      const response = await api(`/api/users/${encodeURIComponent(editPasswordUsername)}/password`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
-      });
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        editPasswordError.textContent = body.error || 'Could not change that password.';
-        return;
-      }
-      const username = editPasswordUsername;
-      closeEditPasswordModal();
-      showStatus(`Updated password for "${username}".`);
-    } catch (err) { /* showLogin already handled unauthorized */
-    } finally {
-      setButtonBusy(editPasswordSubmitBtn, false);
-    }
-  }
-
-  document.getElementById('edit-password-cancel').addEventListener('click', closeEditPasswordModal);
-  editPasswordModalOverlay.addEventListener('click', (event) => {
-    if (event.target === editPasswordModalOverlay) closeEditPasswordModal();
-  });
-  editPasswordSubmitBtn.addEventListener('click', submitEditPassword);
-  editPasswordInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') submitEditPassword();
-  });
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && editPasswordModalOverlay.classList.contains('open')) closeEditPasswordModal();
-  });
-
-  // ---- Rename-user modal ----
-  const renameUserModalOverlay = document.getElementById('rename-user-modal-overlay');
-  const renameUserSubtext = document.getElementById('rename-user-subtext');
-  const renameUserInput = document.getElementById('rename-user-input');
-  const renameUserError = document.getElementById('rename-user-error');
-  const renameUserSubmitBtn = document.getElementById('rename-user-submit');
-  let renameUserUsername = null;
-
-  function openRenameUserModal(username) {
-    renameUserUsername = username;
-    renameUserInput.value = username;
-    renameUserError.textContent = '';
-    renameUserSubtext.textContent = `Set a new username for "${username}".`;
-    renameUserModalOverlay.classList.add('open');
-    renameUserInput.focus();
-    renameUserInput.select();
-  }
-
-  function closeRenameUserModal() {
-    renameUserModalOverlay.classList.remove('open');
-    renameUserUsername = null;
-  }
-
-  async function submitRenameUser() {
-    const newUsername = renameUserInput.value.trim();
-    if (!newUsername) {
-      renameUserError.textContent = 'Username is required.';
-      return;
-    }
-    renameUserError.textContent = '';
-    setButtonBusy(renameUserSubmitBtn, true);
-    try {
-      const oldUsername = renameUserUsername;
-      const response = await api(`/api/users/${encodeURIComponent(oldUsername)}/username`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ new_username: newUsername }),
-      });
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        renameUserError.textContent = body.error || 'Could not rename that user.';
-        return;
-      }
-      closeRenameUserModal();
-      showStatus(`Renamed "${oldUsername}" to "${newUsername}".`);
-      // currentUser.username is stale for anyone who just renamed themselves
-      // (the server-side session was updated in place, but this tab's own
-      // cached identity wasn't) — refresh it so later self-checks (e.g. the
-      // edit/delete buttons' enabled state) still key off the right name.
-      if (currentUser && oldUsername === currentUser.username) {
-        await loadCurrentUser();
-      }
-      loadUsers();
-    } catch (err) { /* showLogin already handled unauthorized */
-    } finally {
-      setButtonBusy(renameUserSubmitBtn, false);
-    }
-  }
-
-  document.getElementById('rename-user-cancel').addEventListener('click', closeRenameUserModal);
-  renameUserModalOverlay.addEventListener('click', (event) => {
-    if (event.target === renameUserModalOverlay) closeRenameUserModal();
-  });
-  renameUserSubmitBtn.addEventListener('click', submitRenameUser);
-  renameUserInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') submitRenameUser();
-  });
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && renameUserModalOverlay.classList.contains('open')) closeRenameUserModal();
-  });
-
-  const assignGuildModalOverlay = document.getElementById('assign-guild-modal-overlay');
-  const assignGuildSubtext = document.getElementById('assign-guild-subtext');
-  const assignGuildSelect = document.getElementById('assign-guild-select');
-  const assignGuildError = document.getElementById('assign-guild-error');
-  const assignGuildSubmitBtn = document.getElementById('assign-guild-submit');
-  let assignGuildUsername = null;
-
-  function openAssignGuildModal(username, guildId) {
-    assignGuildUsername = username;
-    fillGuildSelect(assignGuildSelect, guildId || '');
-    assignGuildError.textContent = '';
-    assignGuildSubtext.textContent = `Choose which server "${username}" can see and control. Users who can manage users always reach every server.`;
-    assignGuildModalOverlay.classList.add('open');
-    assignGuildSelect.focus();
-  }
-
-  function closeAssignGuildModal() {
-    assignGuildModalOverlay.classList.remove('open');
-    assignGuildUsername = null;
-  }
-
-  async function submitAssignGuild() {
-    const username = assignGuildUsername;
-    const guildId = assignGuildSelect.value || null;
-    assignGuildError.textContent = '';
-    setButtonBusy(assignGuildSubmitBtn, true);
-    try {
-      const response = await api(`/api/users/${encodeURIComponent(username)}/guild`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ guild_id: guildId }),
-      });
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        assignGuildError.textContent = body.error || 'Could not change that server access.';
-        return;
-      }
-      closeAssignGuildModal();
-      // The server drops every session for the account it just rescoped, so
-      // a change to your own account has already invalidated this tab.
-      if (currentUser && username === currentUser.username) {
-        showLogin('Your server access changed — please sign in again.');
-        return;
-      }
-      showStatus(`"${username}" can now reach ${guildId ? guildLabel(guildId) : 'all servers'}.`);
-      loadUsers();
-    } catch (err) { /* showLogin already handled unauthorized */
-    } finally {
-      setButtonBusy(assignGuildSubmitBtn, false);
-    }
-  }
-
-  document.getElementById('assign-guild-cancel').addEventListener('click', closeAssignGuildModal);
-  assignGuildModalOverlay.addEventListener('click', (event) => {
-    if (event.target === assignGuildModalOverlay) closeAssignGuildModal();
-  });
-  assignGuildSubmitBtn.addEventListener('click', submitAssignGuild);
-  document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && assignGuildModalOverlay.classList.contains('open')) closeAssignGuildModal();
-  });
-
-  setTabIcon(false);
-
-  if (token) {
-    showDashboard();
-  }
-})();
-</script>
+<script src="/dashboard.js"></script>
 </body>
 </html>
