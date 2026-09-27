@@ -24,6 +24,8 @@ pub fn routes() -> Router<WebState> {
         )
 }
 
+/// Skips the failed track for good: it is saved as a skip override, so a
+/// playlist play leaves it out from now on, and it comes off the list.
 async fn dismiss_failed(
     State(state): State<WebState>,
     Path((guild_id, video_id)): Path<(String, String)>,
@@ -31,9 +33,15 @@ async fn dismiss_failed(
     let Some(guild_id) = parse_guild_id(&guild_id) else {
         return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
     };
-    if let Err(err) = db::delete_failed_track(&state.db, &guild_id.to_string(), &video_id).await {
+    let guild_id_str = guild_id.to_string();
+    let skipped = replaced_track(&state, &guild_id_str, &video_id).await;
+    if let Err(err) = db::save_skip_override(&state.db, &guild_id_str, &skipped).await {
+        tracing::warn!(%guild_id, %err, "dashboard failed to save a skip override");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to skip track");
+    }
+    if let Err(err) = db::delete_failed_track(&state.db, &guild_id_str, &video_id).await {
         tracing::warn!(%guild_id, %err, "dashboard failed to dismiss a failed track");
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to dismiss track");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "failed to skip track");
     }
     snapshot_response(&state.player, guild_id).await
 }

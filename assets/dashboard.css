@@ -101,6 +101,12 @@ svg { display: block; }
 }
 .ghost-btn:hover:not(:disabled) { background: var(--color-hover); }
 .ghost-btn.danger:hover:not(:disabled) { border-color: var(--color-danger); color: var(--color-danger); }
+.sort-select {
+  height: 32px; padding: 0 12px; border-radius: 9999px; border: 1px solid var(--color-line);
+  background: var(--color-surface); color: var(--color-text); font: inherit; font-size: 0.875rem;
+  cursor: pointer;
+}
+.sort-select:focus-visible { outline: 2px solid var(--color-text); outline-offset: 2px; }
 .outline-btn {
   display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
   height: 28px; padding: 0 calc(var(--spacing) * 3); border-radius: 999px;

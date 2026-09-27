@@ -140,10 +140,16 @@
         <section class="flex flex-col min-w-0">
           <div class="flex items-end justify-between gap-4 mb-4">
             <h2 class="text-xl font-bold leading-tight sm:text-2xl">Overrides</h2>
+            <select class="sort-select" id="overrides-sort" aria-label="Sort overrides">
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="skips">Skips first</option>
+              <option value="replacements">Replacements first</option>
+            </select>
           </div>
-          <p class="text-sm text-secondary mb-4">Tracks that would not play and what plays in their place. An override lasts while a saved playlist still contains the original.</p>
+          <p class="text-sm text-secondary mb-4">Tracks that would not play and what a playlist play does with them: skip them, or queue another track in their place. An override lasts while a saved playlist still contains the original.</p>
           <div class="flex flex-col" id="overrides-list"></div>
-          <div class="text-sm text-secondary my-1 mx-2" id="overrides-empty-note" style="display:none">No overrides yet — replace a track from the queue's "Couldn't play" list to add one.</div>
+          <div class="text-sm text-secondary my-1 mx-2" id="overrides-empty-note" style="display:none">No overrides yet — skip or replace a track from the queue's "Couldn't play" list to add one.</div>
         </section>
       </div>
       <div class="page flex flex-col min-h-full px-4 pt-4 pb-6 sm:px-6 sm:pb-8" id="page-users" style="display:none">

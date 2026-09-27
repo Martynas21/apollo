@@ -882,7 +882,7 @@
     const findBtn = makeMiniIconBtn(SEARCH_ICON, 'Find alternative', false, false);
     findBtn.addEventListener('click', () => enterReplaceMode(item));
     actions.appendChild(findBtn);
-    const skipBtn = makeMiniIconBtn(REMOVE_ICON, 'Skip', false, true);
+    const skipBtn = makeMiniIconBtn(REMOVE_ICON, 'Skip: leave this track out of playlist plays', false, true);
     skipBtn.addEventListener('click', () => dismissFailedTrack(item.video_id));
     actions.appendChild(skipBtn);
     row.appendChild(actions);
@@ -2168,11 +2168,20 @@
     arrow.className = 'shrink-0 text-secondary';
     arrow.textContent = '\u2192';
     row.appendChild(arrow);
-    row.appendChild(createOverrideSide(mapping.replacement, 'override-replacement'));
+    // A skip has no track on the right; the side is kept in the row and
+    // toggled with the badge so a mapping can change kind in place.
+    const skip = document.createElement('div');
+    skip.className = 'override-skip min-w-0 flex-1 flex items-center';
+    const badge = document.createElement('span');
+    badge.className = 'text-2xs font-medium uppercase tracking-wide text-white bg-hover px-2.5 py-0.5 rounded-full';
+    badge.textContent = 'Skip';
+    skip.appendChild(badge);
+    row.appendChild(skip);
+    row.appendChild(createOverrideSide(mapping.replacement || mapping.original, 'override-replacement'));
 
     const actions = document.createElement('div');
     actions.className = 'shrink-0 flex gap-0.5';
-    const changeBtn = makeMiniIconBtn(SEARCH_ICON, 'Change replacement', false, false);
+    const changeBtn = makeMiniIconBtn(SEARCH_ICON, 'Pick a replacement', false, false);
     changeBtn.addEventListener('click', () => enterReplaceMode(row._original, 'override'));
     actions.appendChild(changeBtn);
     const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Remove override', false, true);
@@ -2187,13 +2196,37 @@
   function updateOverrideRow(row, mapping) {
     row._original = mapping.original;
     updateOverrideSide(row.querySelector('.override-original'), mapping.original);
-    updateOverrideSide(row.querySelector('.override-replacement'), mapping.replacement);
+    const isSkip = mapping.action === 'skip';
+    row.querySelector('.override-skip').style.display = isSkip ? 'flex' : 'none';
+    const replacement = row.querySelector('.override-replacement');
+    replacement.style.display = isSkip ? 'none' : 'flex';
+    if (!isSkip) updateOverrideSide(replacement, mapping.replacement);
+  }
+
+  const overridesSort = document.getElementById('overrides-sort');
+  let lastOverrides = [];
+
+  // Sorting is done here rather than on the server, so switching the order
+  // never refetches; ties fall back to newest first.
+  function sortedOverrides(overrides) {
+    const newest = (a, b) => b.created_at - a.created_at;
+    const kindFirst = (kind) => (a, b) => (a.action === kind ? 0 : 1) - (b.action === kind ? 0 : 1) || newest(a, b);
+    const orders = {
+      newest,
+      oldest: (a, b) => a.created_at - b.created_at,
+      skips: kindFirst('skip'),
+      replacements: kindFirst('replace'),
+    };
+    return overrides.slice().sort(orders[overridesSort.value] || newest);
   }
 
   function renderOverrides(overrides) {
+    lastOverrides = overrides;
     overridesEmptyNote.style.display = overrides.length === 0 ? 'block' : 'none';
-    reconcileList(overridesList, overrides, (mapping) => mapping.original.video_id, createOverrideRow, updateOverrideRow);
+    reconcileList(overridesList, sortedOverrides(overrides), (mapping) => mapping.original.video_id, createOverrideRow, updateOverrideRow);
   }
+
+  overridesSort.addEventListener('change', () => renderOverrides(lastOverrides));
 
   async function loadOverrides() {
     try {
@@ -2205,7 +2238,7 @@
 
   async function removeOverride(original) {
     const name = original.title || original.video_id;
-    if (!window.confirm(`Remove the override for "${name}"? It will play as itself again.`)) return;
+    if (!window.confirm(`Remove the override for "${name}"? Playlists will queue it as itself again.`)) return;
     try {
       const response = await api(`/api/guilds/${currentGuildId}/overrides/${encodeURIComponent(original.video_id)}/remove`, { method: 'POST' });
       const body = await response.json();

@@ -1,7 +1,7 @@
 use rand::seq::SliceRandom;
 use serenity::all::GuildId;
 
-use crate::db;
+use crate::db::{self, OverrideAction};
 use crate::model::{QueuedTrack, Track};
 use crate::voice::error::PlayerError;
 use crate::voice::registry::{PlayerRegistry, discard_prefetch};
@@ -13,6 +13,15 @@ use crate::voice::state::GuildState;
 fn upcoming_index(items: &[QueuedTrack], offset: usize, index: usize) -> Option<usize> {
     let at = offset.checked_add(index)?;
     (at < items.len()).then_some(at)
+}
+
+fn placeholder_track() -> Track {
+    Track {
+        video_id: String::new(),
+        title: String::new(),
+        channel: String::new(),
+        duration: None,
+    }
 }
 
 fn storage_error(err: impl std::fmt::Display) -> PlayerError {
@@ -61,8 +70,7 @@ impl PlayerRegistry {
         mut queued: QueuedTrack,
     ) -> Result<(), PlayerError> {
         let guild_id_str = guild_id.to_string();
-        self.apply_track_overrides(guild_id, std::iter::once(&mut queued.track))
-            .await;
+        self.apply_track_override(guild_id, &mut queued).await;
         let (call, start) = {
             let mut guilds = self.guilds.lock().await;
             let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
@@ -107,8 +115,11 @@ impl PlayerRegistry {
         }
         let guild_id_str = guild_id.to_string();
         let mut tracks = tracks;
-        self.apply_track_overrides(guild_id, tracks.iter_mut().map(|queued| &mut queued.track))
+        self.apply_track_overrides(guild_id, &mut tracks, |queued| &mut queued.track, true)
             .await;
+        if tracks.is_empty() {
+            return Ok(());
+        }
         let first = tracks.first().cloned();
 
         let (call, start) = {
@@ -270,8 +281,7 @@ impl PlayerRegistry {
         guild_id: GuildId,
         mut queued: QueuedTrack,
     ) -> Result<(), PlayerError> {
-        self.apply_track_overrides(guild_id, std::iter::once(&mut queued.track))
-            .await;
+        self.apply_track_override(guild_id, &mut queued).await;
         self.jump_to(guild_id, |_, _| Ok(queued)).await
     }
 
@@ -366,13 +376,16 @@ impl PlayerRegistry {
         Ok(())
     }
 
-    /// Swaps in the guild's saved replacement for every track whose video
-    /// has one, so a video that would not play is never queued again while
-    /// its override stands. Only the track changes; who requested it stays.
-    pub(super) async fn apply_track_overrides<'a>(
+    /// Applies the guild's overrides before tracks enter the queue: a track
+    /// with a replacement is swapped for it (who requested it stays), and a
+    /// skipped track is left out when `drop_skipped` is set. Adding a track
+    /// by hand keeps a skipped one, since the request names it directly.
+    pub(super) async fn apply_track_overrides<T>(
         &self,
         guild_id: GuildId,
-        tracks: impl Iterator<Item = &'a mut Track>,
+        tracks: &mut Vec<T>,
+        mut track_of: impl FnMut(&mut T) -> &mut Track,
+        drop_skipped: bool,
     ) {
         let overrides = match db::track_overrides(&self.db, &guild_id.to_string()).await {
             Ok(overrides) => overrides,
@@ -384,10 +397,26 @@ impl PlayerRegistry {
         if overrides.is_empty() {
             return;
         }
-        for track in tracks {
-            if let Some(replacement) = overrides.get(&track.video_id) {
-                *track = replacement.clone();
+        tracks.retain_mut(|item| {
+            let track = track_of(item);
+            match overrides.get(&track.video_id) {
+                Some(OverrideAction::Replace(replacement)) => {
+                    *track = replacement.clone();
+                    true
+                }
+                Some(OverrideAction::Skip) => !drop_skipped,
+                None => true,
             }
+        });
+    }
+
+    /// `apply_track_overrides` for one hand-picked track.
+    async fn apply_track_override(&self, guild_id: GuildId, queued: &mut QueuedTrack) {
+        let mut one = vec![std::mem::replace(&mut queued.track, placeholder_track())];
+        self.apply_track_overrides(guild_id, &mut one, |track| track, false)
+            .await;
+        if let Some(track) = one.pop() {
+            queued.track = track;
         }
     }
 
@@ -454,6 +483,67 @@ mod tests {
         assert_eq!(call.played_video_ids(), vec!["c"]);
         let snapshot = registry.queue_snapshot(guild_id).await;
         assert_eq!(upcoming_ids(&snapshot), vec!["b", "b"]);
+    }
+
+    #[tokio::test]
+    async fn enqueue_many_leaves_skipped_tracks_out() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        db::save_skip_override(&registry.db, &guild_id.to_string(), &queued("a").track)
+            .await
+            .unwrap();
+
+        registry
+            .enqueue_many(guild_id, vec![queued("a"), queued("b"), queued("a")])
+            .await
+            .unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["b"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert!(upcoming_ids(&snapshot).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_playlist_of_only_skipped_tracks_queues_nothing() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        db::save_skip_override(&registry.db, &guild_id.to_string(), &queued("a").track)
+            .await
+            .unwrap();
+
+        registry
+            .enqueue_many(guild_id, vec![queued("a")])
+            .await
+            .unwrap();
+
+        assert!(
+            backend
+                .call_for(guild_id)
+                .unwrap()
+                .played_video_ids()
+                .is_empty()
+        );
+        assert!(
+            registry
+                .queue_snapshot(guild_id)
+                .await
+                .now_playing
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_track_added_by_hand_plays_even_when_skipped() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        db::save_skip_override(&registry.db, &guild_id.to_string(), &queued("a").track)
+            .await
+            .unwrap();
+
+        registry.enqueue_next(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a"]);
     }
 
     #[tokio::test]

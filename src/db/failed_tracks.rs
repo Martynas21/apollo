@@ -1,9 +1,10 @@
-//! Tracks that never produced audio for a guild, and the replacements a guild
-//! chose for them. A failed row lives until it is dismissed, replaced, or the
-//! same video later starts successfully. An override lives for as long as one
-//! of the guild's saved playlists still contains the original video: pruning
-//! after a playlist refresh or removal drops the rest, including overrides
-//! whose original only ever came from search or radio.
+//! Tracks that never produced audio for a guild, and what the guild decided
+//! about them: skip the track, or play another in its place. A failed row
+//! lives until it is skipped, replaced, or the same video later starts
+//! successfully. An override lives for as long as one of the guild's saved
+//! playlists still contains the original video: pruning after a playlist
+//! refresh or removal drops the rest, including overrides whose original only
+//! ever came from search or radio.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -13,11 +14,20 @@ use sqlx::sqlite::SqlitePool;
 
 use crate::model::{QueuedTrack, Track};
 
-/// One saved replacement: `replacement` is queued whenever `original` would be.
+/// What happens when an overridden track would be queued from a playlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideAction {
+    /// The track is left out.
+    Skip,
+    /// This track is queued in its place.
+    Replace(Track),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackOverride {
     pub original: Track,
-    pub replacement: Track,
+    pub action: OverrideAction,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,8 +48,21 @@ type OverrideRow = (
     String,
     String,
     String,
+    String,
     Option<i64>,
+    i64,
 );
+
+const ACTION_REPLACE: &str = "replace";
+const ACTION_SKIP: &str = "skip";
+
+fn action_from_row(action: &str, replacement: TrackRow) -> OverrideAction {
+    if action == ACTION_SKIP {
+        OverrideAction::Skip
+    } else {
+        OverrideAction::Replace(track_from_row(replacement))
+    }
+}
 
 fn track_from_row((video_id, title, channel, duration_secs): TrackRow) -> Track {
     Track {
@@ -123,31 +146,55 @@ pub async fn delete_failed_track(
     Ok(result.rows_affected() > 0)
 }
 
-/// Saves `replacement` as the guild's stand-in for `original`. Any override
-/// that currently points at the original is redirected too, so a replacement
-/// that itself gets replaced never leaves a chain behind.
+/// Saves `replacement` as the guild's stand-in for `original`.
 pub async fn save_track_override(
     pool: &SqlitePool,
     guild_id: &str,
     original: &Track,
     replacement: &Track,
 ) -> Result<()> {
+    save_override(pool, guild_id, original, Some(replacement)).await
+}
+
+/// Marks `original` as one to leave out of the guild's playlist plays.
+pub async fn save_skip_override(pool: &SqlitePool, guild_id: &str, original: &Track) -> Result<()> {
+    save_override(pool, guild_id, original, None).await
+}
+
+/// Any override that currently points at the original is redirected too (or
+/// turned into a skip), so a replacement that itself gets replaced or
+/// skipped never leaves a chain behind.
+async fn save_override(
+    pool: &SqlitePool,
+    guild_id: &str,
+    original: &Track,
+    replacement: Option<&Track>,
+) -> Result<()> {
     let mut tx = pool
         .begin()
         .await
         .context("failed to start track override transaction")?;
     let original_video_id = &original.video_id;
-    let duration_secs = replacement.duration.map(|d| d.as_secs() as i64);
+    let action = if replacement.is_some() {
+        ACTION_REPLACE
+    } else {
+        ACTION_SKIP
+    };
+    let video_id = replacement.map_or("", |t| t.video_id.as_str());
+    let title = replacement.map_or("", |t| t.title.as_str());
+    let channel = replacement.map_or("", |t| t.channel.as_str());
+    let duration_secs = replacement.and_then(|t| t.duration.map(|d| d.as_secs() as i64));
 
     sqlx::query(
         "INSERT INTO track_overrides \
          (guild_id, original_video_id, original_title, original_channel, \
-          original_duration_secs, video_id, title, channel, duration_secs, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, unixepoch())
+          original_duration_secs, action, video_id, title, channel, duration_secs, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, unixepoch())
          ON CONFLICT(guild_id, original_video_id) DO UPDATE SET
              original_title = excluded.original_title,
              original_channel = excluded.original_channel,
              original_duration_secs = excluded.original_duration_secs,
+             action = excluded.action,
              video_id = excluded.video_id,
              title = excluded.title,
              channel = excluded.channel,
@@ -159,27 +206,16 @@ pub async fn save_track_override(
     .bind(&original.title)
     .bind(&original.channel)
     .bind(original.duration.map(|d| d.as_secs() as i64))
-    .bind(&replacement.video_id)
-    .bind(&replacement.title)
-    .bind(&replacement.channel)
+    .bind(action)
+    .bind(video_id)
+    .bind(title)
+    .bind(channel)
     .bind(duration_secs)
     .execute(&mut *tx)
     .await
     .context("failed to save track override")?;
 
-    sqlx::query(
-        "UPDATE track_overrides SET video_id = ?3, title = ?4, channel = ?5, duration_secs = ?6 \
-         WHERE guild_id = ?1 AND video_id = ?2 AND original_video_id != ?2",
-    )
-    .bind(guild_id)
-    .bind(original_video_id)
-    .bind(&replacement.video_id)
-    .bind(&replacement.title)
-    .bind(&replacement.channel)
-    .bind(duration_secs)
-    .execute(&mut *tx)
-    .await
-    .context("failed to redirect chained track overrides")?;
+    redirect_chained_overrides(&mut tx, guild_id, original_video_id, replacement).await?;
 
     tx.commit()
         .await
@@ -187,10 +223,45 @@ pub async fn save_track_override(
     Ok(())
 }
 
+/// Points every override that replaced with `original_video_id` at what the
+/// original now maps to, so it is never queued through another override.
+async fn redirect_chained_overrides(
+    tx: &mut sqlx::SqliteConnection,
+    guild_id: &str,
+    original_video_id: &str,
+    replacement: Option<&Track>,
+) -> Result<()> {
+    let action = if replacement.is_some() {
+        ACTION_REPLACE
+    } else {
+        ACTION_SKIP
+    };
+    sqlx::query(
+        "UPDATE track_overrides \
+         SET action = ?3, video_id = ?4, title = ?5, channel = ?6, duration_secs = ?7 \
+         WHERE guild_id = ?1 AND action = 'replace' AND video_id = ?2 \
+             AND original_video_id != ?2",
+    )
+    .bind(guild_id)
+    .bind(original_video_id)
+    .bind(action)
+    .bind(replacement.map_or("", |t| t.video_id.as_str()))
+    .bind(replacement.map_or("", |t| t.title.as_str()))
+    .bind(replacement.map_or("", |t| t.channel.as_str()))
+    .bind(replacement.and_then(|t| t.duration.map(|d| d.as_secs() as i64)))
+    .execute(&mut *tx)
+    .await
+    .context("failed to redirect chained track overrides")?;
+    Ok(())
+}
+
 /// The guild's overrides, keyed by the original video id.
-pub async fn track_overrides(pool: &SqlitePool, guild_id: &str) -> Result<HashMap<String, Track>> {
-    let rows: Vec<(String, String, String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT original_video_id, video_id, title, channel, duration_secs \
+pub async fn track_overrides(
+    pool: &SqlitePool,
+    guild_id: &str,
+) -> Result<HashMap<String, OverrideAction>> {
+    let rows: Vec<(String, String, String, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT original_video_id, action, video_id, title, channel, duration_secs \
          FROM track_overrides WHERE guild_id = ?1",
     )
     .bind(guild_id)
@@ -200,12 +271,14 @@ pub async fn track_overrides(pool: &SqlitePool, guild_id: &str) -> Result<HashMa
 
     Ok(rows
         .into_iter()
-        .map(|(original, video_id, title, channel, duration_secs)| {
-            (
-                original,
-                track_from_row((video_id, title, channel, duration_secs)),
-            )
-        })
+        .map(
+            |(original, action, video_id, title, channel, duration_secs)| {
+                (
+                    original,
+                    action_from_row(&action, (video_id, title, channel, duration_secs)),
+                )
+            },
+        )
         .collect())
 }
 
@@ -219,7 +292,7 @@ pub async fn list_track_overrides(pool: &SqlitePool, guild_id: &str) -> Result<V
              COALESCE(pt.title, NULLIF(o.original_title, ''), o.original_video_id), \
              COALESCE(pt.channel, NULLIF(o.original_channel, ''), ''), \
              COALESCE(pt.duration_secs, o.original_duration_secs), \
-             o.video_id, o.title, o.channel, o.duration_secs \
+             o.action, o.video_id, o.title, o.channel, o.duration_secs, o.created_at \
          FROM track_overrides o \
          LEFT JOIN playlist_tracks pt ON pt.rowid = (SELECT MIN(c.rowid) FROM playlist_tracks c \
              JOIN playlists p ON p.id = c.playlist_id \
@@ -235,10 +308,11 @@ pub async fn list_track_overrides(pool: &SqlitePool, guild_id: &str) -> Result<V
     Ok(rows
         .into_iter()
         .map(
-            |(o_id, o_title, o_channel, o_secs, video_id, title, channel, duration_secs)| {
+            |(o_id, o_title, o_channel, o_secs, action, video_id, title, channel, secs, at)| {
                 TrackOverride {
                     original: track_from_row((o_id, o_title, o_channel, o_secs)),
-                    replacement: track_from_row((video_id, title, channel, duration_secs)),
+                    action: action_from_row(&action, (video_id, title, channel, secs)),
+                    created_at: at,
                 }
             },
         )
@@ -363,7 +437,39 @@ mod tests {
 
         let overrides = track_overrides(&pool, "1").await?;
         assert_eq!(overrides.len(), 1);
-        assert_eq!(overrides["a"], sample_track("c", None));
+        assert_eq!(
+            overrides["a"],
+            OverrideAction::Replace(sample_track("c", None))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_skip_is_an_override_without_a_replacement() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        save(&pool, "1", "a", "b").await?;
+        save_skip_override(&pool, "1", &sample_track("a", None)).await?;
+        save_skip_override(&pool, "1", &sample_track("c", None)).await?;
+
+        let overrides = track_overrides(&pool, "1").await?;
+        assert_eq!(overrides["a"], OverrideAction::Skip);
+        assert_eq!(overrides["c"], OverrideAction::Skip);
+        let listed = list_track_overrides(&pool, "1").await?;
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|m| m.action == OverrideAction::Skip));
+        assert!(listed.iter().any(|m| m.original == sample_track("c", None)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skipping_a_replacement_turns_the_overrides_that_used_it_into_skips() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        save(&pool, "1", "a", "b").await?;
+        save_skip_override(&pool, "1", &sample_track("b", None)).await?;
+
+        let overrides = track_overrides(&pool, "1").await?;
+        assert_eq!(overrides["a"], OverrideAction::Skip);
+        assert_eq!(overrides["b"], OverrideAction::Skip);
         Ok(())
     }
 
@@ -374,13 +480,13 @@ mod tests {
         save(&pool, "2", "x", "y").await?;
 
         let listed = list_track_overrides(&pool, "1").await?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].original, sample_track("a", None));
         assert_eq!(
-            listed,
-            vec![TrackOverride {
-                original: sample_track("a", None),
-                replacement: sample_track("b", None),
-            }]
+            listed[0].action,
+            OverrideAction::Replace(sample_track("b", None))
         );
+        assert!(listed[0].created_at > 0);
 
         assert!(delete_track_override(&pool, "1", "a").await?);
         assert!(!delete_track_override(&pool, "1", "a").await?);
@@ -434,8 +540,14 @@ mod tests {
         save(&pool, "1", "b", "c").await?;
 
         let overrides = track_overrides(&pool, "1").await?;
-        assert_eq!(overrides["a"], sample_track("c", None));
-        assert_eq!(overrides["b"], sample_track("c", None));
+        assert_eq!(
+            overrides["a"],
+            OverrideAction::Replace(sample_track("c", None))
+        );
+        assert_eq!(
+            overrides["b"],
+            OverrideAction::Replace(sample_track("c", None))
+        );
         Ok(())
     }
 

@@ -15,9 +15,9 @@ mod stats;
 mod users;
 
 pub use failed_tracks::{
-    FailedTrack, TrackOverride, delete_failed_track, delete_track_override, failed_tracks,
-    list_track_overrides, prune_track_overrides, record_failed_track, save_track_override,
-    track_overrides,
+    FailedTrack, OverrideAction, TrackOverride, delete_failed_track, delete_track_override,
+    failed_tracks, list_track_overrides, prune_track_overrides, record_failed_track,
+    save_skip_override, save_track_override, track_overrides,
 };
 pub use playlists::{
     SavedPlaylist, delete_guild_playlist, get_guild_playlist, get_playlist_thumbnail_video_id,

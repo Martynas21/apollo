@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serenity::all::{ChannelId, GuildId};
 
-use crate::db::{FailedTrack, TrackOverride};
+use crate::db::{FailedTrack, OverrideAction, TrackOverride};
 use crate::model::{QueuedTrack, Track};
 use crate::voice::PlayerError;
 
@@ -79,16 +79,25 @@ pub fn failed_track_json(failed: &FailedTrack) -> FailedTrackJson {
     }
 }
 
+/// `action` is "replace" (with `replacement` set) or "skip" (without).
 #[derive(Serialize)]
 pub struct TrackOverrideJson {
     original: TrackJson,
-    replacement: TrackJson,
+    action: &'static str,
+    replacement: Option<TrackJson>,
+    created_at: i64,
 }
 
 pub fn track_override_json(mapping: &TrackOverride) -> TrackOverrideJson {
+    let (action, replacement) = match &mapping.action {
+        OverrideAction::Replace(track) => ("replace", Some(track_json_from_track(track))),
+        OverrideAction::Skip => ("skip", None),
+    };
     TrackOverrideJson {
         original: track_json_from_track(&mapping.original),
-        replacement: track_json_from_track(&mapping.replacement),
+        action,
+        replacement,
+        created_at: mapping.created_at,
     }
 }
 

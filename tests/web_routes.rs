@@ -450,6 +450,35 @@ fn failed_sample(video_id: &str) -> QueuedTrack {
 }
 
 #[tokio::test]
+async fn skipping_a_failed_track_saves_a_skip_override() {
+    let (app, db) = test_app_with_db().await;
+    let token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+    apollo::db::record_failed_track(&db, "111", &failed_sample("abc"), "video is unavailable")
+        .await
+        .expect("seeding a failed track should succeed");
+
+    let skipped = request(
+        &app,
+        "POST",
+        "/api/guilds/111/failed/abc/dismiss",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(skipped.status(), StatusCode::OK);
+
+    let listed = request(&app, "GET", "/api/guilds/111/overrides", Some(&token), None).await;
+    let body = json_body(listed).await;
+    assert_eq!(body[0]["original"]["video_id"], "abc");
+    assert_eq!(body[0]["original"]["title"], "Title abc");
+    assert_eq!(body[0]["action"], "skip");
+    assert_eq!(body[0]["replacement"], Value::Null);
+    assert!(body[0]["created_at"].as_i64().unwrap_or(0) > 0);
+}
+
+#[tokio::test]
 async fn a_failed_track_shows_in_the_snapshot_until_it_is_dismissed() {
     let (app, db) = test_app_with_db().await;
     let token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
@@ -585,6 +614,7 @@ async fn overrides_are_listed_by_name_and_can_be_removed() {
     let listed_body = json_body(listed).await;
     assert_eq!(listed_body[0]["original"]["video_id"], "abc");
     assert_eq!(listed_body[0]["original"]["title"], "Title abc");
+    assert_eq!(listed_body[0]["action"], "replace");
     assert_eq!(listed_body[0]["replacement"]["video_id"], "xyz");
 
     let removed = request(

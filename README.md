@@ -152,10 +152,11 @@ slash commands. It covers "Now Playing" plus transport controls
 a WebSocket), queue management (remove/reorder/clear), YouTube search and
 add-to-queue, saved-playlist management (import/play/refresh/remove), a
 "Couldn't play" list under the queue for tracks yt-dlp could not start (skip
-them, or search for a stand-in that is queued next and used in their place
-whenever they come up again), an Overrides page listing those stand-ins
-where each can be changed or removed, and per-guild play-count favourites,
-for whichever of the bot's servers you select. Unlike a Discord command (which could infer the caller's current
+them from future playlist plays, or search for a stand-in that is queued
+next and used in their place whenever a playlist would queue them), an
+Overrides page listing those skips and stand-ins where each can be changed
+or removed, and per-guild play-count favourites, for whichever of the bot's
+servers you select. Unlike a Discord command (which could infer the caller's current
 voice channel), the dashboard has no such context — it prompts you to pick
 a voice channel the first time you play something for a guild. The bot
 leaves on its own ~2.5 minutes after the queue drains empty (see
