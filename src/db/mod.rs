@@ -5,6 +5,7 @@ use sqlx::sqlite::{
 use std::str::FromStr;
 use std::time::Duration;
 
+mod failed_tracks;
 mod playlists;
 mod queue;
 mod session;
@@ -13,6 +14,11 @@ mod settings;
 mod stats;
 mod users;
 
+pub use failed_tracks::{
+    FailedTrack, TrackOverride, delete_failed_track, delete_track_override, failed_tracks,
+    list_track_overrides, prune_track_overrides, record_failed_track, save_track_override,
+    track_overrides,
+};
 pub use playlists::{
     SavedPlaylist, delete_guild_playlist, get_guild_playlist, get_playlist_thumbnail_video_id,
     get_playlist_tracks, list_guild_playlists, replace_playlist_tracks, save_guild_playlist,

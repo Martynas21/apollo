@@ -68,6 +68,8 @@ pub fn router(state: WebState) -> Router {
     let protected = routes::guilds::routes()
         .merge(routes::playback::routes())
         .merge(routes::queue::routes())
+        .merge(routes::failed::routes())
+        .merge(routes::overrides::routes())
         .merge(routes::search::routes())
         .merge(routes::playlists::routes())
         .merge(routes::favourites::routes())

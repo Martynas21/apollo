@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use apollo::model::Track;
+use apollo::model::{QueuedTrack, Track};
 use apollo::voice::PlayerRegistry;
 use apollo::voice::backend::{AudioSource, VoiceBackend, VoiceCall, VoiceEvents};
 use apollo::voice::resolve::PlaybackError;
@@ -20,7 +20,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use serenity::all::{Cache, ChannelId, GuildId};
+use serenity::all::{Cache, ChannelId, GuildId, UserId};
+use sqlx::SqlitePool;
 use tower::ServiceExt;
 
 /// Stands in for the real IPC-backed voice connection. None of these tests
@@ -66,6 +67,11 @@ const ADMIN_USERNAME: &str = "admin";
 const ADMIN_PASSWORD: &str = "hunter2-hunter2";
 
 async fn test_app() -> Router {
+    test_app_with_db().await.0
+}
+
+/// The router plus the pool it runs on, for tests that seed rows directly.
+async fn test_app_with_db() -> (Router, SqlitePool) {
     let db = apollo::db::connect("sqlite::memory:")
         .await
         .expect("in-memory db should connect");
@@ -81,8 +87,8 @@ async fn test_app() -> Router {
         youtube.clone(),
     );
     let cache = Arc::new(Cache::new());
-    let state = WebState::new(player, youtube, db, cache);
-    apollo::web::router(state)
+    let state = WebState::new(player, youtube, db.clone(), cache);
+    (apollo::web::router(state), db)
 }
 
 async fn request(
@@ -332,15 +338,14 @@ async fn a_guild_pinned_user_is_confined_to_that_guild_on_every_guild_scoped_rou
     assert_eq!(other_guild.status(), StatusCode::FORBIDDEN);
 
     // A write route is refused by the same middleware, not just the reads.
-    let other_guild_write = request(
-        &app,
-        "POST",
+    for path in [
         "/api/guilds/222/skip",
-        Some(&pinned_token),
-        None,
-    )
-    .await;
-    assert_eq!(other_guild_write.status(), StatusCode::FORBIDDEN);
+        "/api/guilds/222/failed/abc/dismiss",
+        "/api/guilds/222/overrides/abc/remove",
+    ] {
+        let other_guild_write = request(&app, "POST", path, Some(&pinned_token), None).await;
+        assert_eq!(other_guild_write.status(), StatusCode::FORBIDDEN, "{path}");
+    }
 
     // Routes that address no guild stay reachable.
     let me_response = request(&app, "GET", "/api/me", Some(&pinned_token), None).await;
@@ -430,4 +435,215 @@ async fn rescoping_a_user_revokes_the_session_that_still_carries_the_old_guild()
     )
     .await;
     assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+}
+
+fn failed_sample(video_id: &str) -> QueuedTrack {
+    QueuedTrack {
+        track: Track {
+            video_id: video_id.to_string(),
+            title: format!("Title {video_id}"),
+            channel: "Channel".to_string(),
+            duration: Some(std::time::Duration::from_secs(90)),
+        },
+        requested_by: UserId::new(7),
+    }
+}
+
+#[tokio::test]
+async fn a_failed_track_shows_in_the_snapshot_until_it_is_dismissed() {
+    let (app, db) = test_app_with_db().await;
+    let token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+    apollo::db::record_failed_track(&db, "111", &failed_sample("abc"), "video is unavailable")
+        .await
+        .expect("seeding a failed track should succeed");
+
+    let before = request(
+        &app,
+        "GET",
+        "/api/guilds/111/now-playing",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(before.status(), StatusCode::OK);
+    let before_body = json_body(before).await;
+    assert_eq!(before_body["failed"][0]["video_id"], "abc");
+    assert_eq!(before_body["failed"][0]["title"], "Title abc");
+    assert_eq!(before_body["failed"][0]["error"], "video is unavailable");
+
+    let dismissed = request(
+        &app,
+        "POST",
+        "/api/guilds/111/failed/abc/dismiss",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(dismissed.status(), StatusCode::OK);
+    assert_eq!(json_body(dismissed).await["failed"], json!([]));
+    assert!(
+        apollo::db::failed_tracks(&db, "111")
+            .await
+            .expect("listing failed tracks should succeed")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn dismissing_a_track_that_is_not_listed_is_a_no_op() {
+    let app = test_app().await;
+    let token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+
+    let response = request(
+        &app,
+        "POST",
+        "/api/guilds/111/failed/missing/dismiss",
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn failed_track_routes_reject_a_malformed_guild_id() {
+    let app = test_app().await;
+    let token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+
+    let dismiss = request(
+        &app,
+        "POST",
+        "/api/guilds/not-a-guild/failed/abc/dismiss",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(dismiss.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(dismiss).await["error"], "invalid guild id");
+
+    let replace = request(
+        &app,
+        "POST",
+        "/api/guilds/not-a-guild/failed/abc/replace",
+        Some(&token),
+        Some(json!({ "video_id": "xyz" })),
+    )
+    .await;
+    assert_eq!(replace.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(replace).await["error"], "invalid guild id");
+}
+
+#[tokio::test]
+async fn a_failed_track_cannot_be_replaced_with_itself() {
+    let (app, db) = test_app_with_db().await;
+    let token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+
+    let response = request(
+        &app,
+        "POST",
+        "/api/guilds/111/failed/abc/replace",
+        Some(&token),
+        Some(json!({ "video_id": "abc" })),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        apollo::db::track_overrides(&db, "111")
+            .await
+            .expect("listing overrides should succeed")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn overrides_are_listed_by_name_and_can_be_removed() {
+    let (app, db) = test_app_with_db().await;
+    let token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+    apollo::db::save_track_override(
+        &db,
+        "111",
+        &failed_sample("abc").track,
+        &failed_sample("xyz").track,
+    )
+    .await
+    .expect("seeding an override should succeed");
+
+    let listed = request(&app, "GET", "/api/guilds/111/overrides", Some(&token), None).await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed_body = json_body(listed).await;
+    assert_eq!(listed_body[0]["original"]["video_id"], "abc");
+    assert_eq!(listed_body[0]["original"]["title"], "Title abc");
+    assert_eq!(listed_body[0]["replacement"]["video_id"], "xyz");
+
+    let removed = request(
+        &app,
+        "POST",
+        "/api/guilds/111/overrides/abc/remove",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    assert_eq!(json_body(removed).await, json!([]));
+
+    let removed_again = request(
+        &app,
+        "POST",
+        "/api/guilds/111/overrides/abc/remove",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(removed_again.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn changing_an_override_that_does_not_exist_is_not_found() {
+    let app = test_app().await;
+    let token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+
+    let response = request(
+        &app,
+        "POST",
+        "/api/guilds/111/overrides/abc/replace",
+        Some(&token),
+        Some(json!({ "video_id": "xyz" })),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(json_body(response).await["error"], "override not found");
+}
+
+#[tokio::test]
+async fn an_override_cannot_point_a_track_at_itself() {
+    let app = test_app().await;
+    let token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+
+    let response = request(
+        &app,
+        "POST",
+        "/api/guilds/111/overrides/abc/replace",
+        Some(&token),
+        Some(json!({ "video_id": "abc" })),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

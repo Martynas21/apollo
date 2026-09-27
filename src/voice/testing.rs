@@ -257,6 +257,14 @@ impl FakeBackend {
             .insert(video_id.to_string(), Some(message.to_string()));
     }
 
+    pub(super) fn make_playable(&self, video_id: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_video_ids
+            .remove(video_id);
+    }
+
     pub(super) fn make_unplayable(&self, video_id: &str) {
         self.state
             .lock()

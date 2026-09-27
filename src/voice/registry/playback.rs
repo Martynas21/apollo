@@ -5,7 +5,7 @@ use serenity::all::GuildId;
 use uuid::Uuid;
 
 use crate::db;
-use crate::model::QueuedTrack;
+use crate::model::{QueuedTrack, Track};
 use crate::voice::backend::{AudioSource, VoiceCall, VoiceTrack};
 use crate::voice::error::PlayerError;
 use crate::voice::registry::{PlayerRegistry, Prefetch, discard_prefetch};
@@ -103,6 +103,7 @@ impl PlayerRegistry {
         let mut started = false;
         let mut failures = 0;
         while let Some((queued, epoch, retry)) = candidate.take() {
+            let attempted = queued.clone();
             match self
                 .try_start_playback(
                     guild_id,
@@ -121,21 +122,9 @@ impl PlayerRegistry {
                 StartOutcome::Stale => return,
                 StartOutcome::Failed(err) => {
                     failures += 1;
-                    if failures >= MAX_CONSECUTIVE_START_FAILURES {
-                        tracing::error!(
-                            %guild_id,
-                            %err,
-                            failures,
-                            "giving up on starting playback; the remaining queue is kept"
-                        );
-                        self.abandon_start(guild_id, epoch).await;
-                        break;
-                    }
-                    tracing::warn!(%err, "failed to start queued track, trying the next one");
                     candidate = self
-                        .promote_next(guild_id)
-                        .await
-                        .map(|(queued, epoch)| (queued, epoch, false));
+                        .handle_start_failure(guild_id, &attempted, &err, epoch, failures)
+                        .await;
                 }
             }
         }
@@ -145,6 +134,34 @@ impl PlayerRegistry {
         }
 
         self.persist_session(guild_id).await;
+    }
+
+    /// Records the candidate that would not start and hands back the next one
+    /// to try, or `None` once the sequence has to give up.
+    async fn handle_start_failure(
+        &self,
+        guild_id: GuildId,
+        attempted: &QueuedTrack,
+        err: &PlayerError,
+        epoch: u64,
+        failures: u32,
+    ) -> Option<(QueuedTrack, u64, bool)> {
+        self.record_failed_start(guild_id, attempted, &Self::start_failure_message(err))
+            .await;
+        if failures >= MAX_CONSECUTIVE_START_FAILURES {
+            tracing::error!(
+                %guild_id,
+                %err,
+                failures,
+                "giving up on starting playback; the remaining queue is kept"
+            );
+            self.abandon_start(guild_id, epoch).await;
+            return None;
+        }
+        tracing::warn!(%err, "failed to start queued track, trying the next one");
+        self.promote_next(guild_id)
+            .await
+            .map(|(queued, epoch)| (queued, epoch, false))
     }
 
     /// Drops the abandoned candidate, off the head of the queue as well as
@@ -269,11 +286,8 @@ impl PlayerRegistry {
             self.apply_track_outcome(guild_id, track_id, outcome).await;
         }
 
-        if !retry
-            && let Err(err) =
-                db::record_track_play(&self.db, &guild_id.to_string(), &queued.track).await
-        {
-            tracing::warn!(%guild_id, %err, "failed to record track play count");
+        if !retry {
+            self.note_committed_in_db(guild_id, &queued.track).await;
         }
 
         if needs_radio_refill {
@@ -281,6 +295,18 @@ impl PlayerRegistry {
         }
 
         StartOutcome::Committed
+    }
+
+    /// Counts the play and forgets any earlier failure of the same video,
+    /// which evidently plays now.
+    async fn note_committed_in_db(&self, guild_id: GuildId, track: &Track) {
+        let guild_id_str = guild_id.to_string();
+        if let Err(err) = db::record_track_play(&self.db, &guild_id_str, track).await {
+            tracing::warn!(%guild_id, %err, "failed to record track play count");
+        }
+        if let Err(err) = db::delete_failed_track(&self.db, &guild_id_str, &track.video_id).await {
+            tracing::warn!(%guild_id, %err, "failed to clear an earlier failure of the track");
+        }
     }
 
     /// Records the track as the guild's latest. The fresh-URL retry of a

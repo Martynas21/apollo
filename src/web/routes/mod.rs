@@ -1,6 +1,8 @@
 pub mod auth;
+pub mod failed;
 pub mod favourites;
 pub mod guilds;
+pub mod overrides;
 pub mod playback;
 pub mod playlists;
 pub mod queue;

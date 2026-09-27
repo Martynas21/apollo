@@ -186,6 +186,23 @@ failures; a track that finishes or fails later on resets the count. Errors
 later in a track always advance. Prefetched stream
 URLs older than an hour are resolved again before use, since they expire.
 
+Every track that never produced audio is remembered in the `failed_tracks`
+table (`record_failed_start`): each candidate `run_start_sequence` passes
+over, including the fresh-URL retry pass, and each track that fails early
+even after its retry. Errors after the first 5 s and stale starts are not
+recorded. A later non-retry `commit_started_track` of the same video deletes
+its row, and so does dismissing or replacing it from the dashboard. A
+replacement is stored as a per-guild override (`track_overrides`), which
+`enqueue_next`, `enqueue_many`, `play_now` and the radio refill apply before
+a track enters the queue; copies already sitting in the queue when the
+override is saved are left as they are. Overrides are pruned after a
+playlist refresh or removal once no saved playlist of the guild contains the
+original video. The dashboard's Overrides page lists the mappings and can
+change or remove one, which only touches the table. Neither dismiss nor
+replace is a new player action: dismiss only touches the table, and replace
+queues the stand-in through `enqueue_next`, so the matrix below is unchanged
+by them.
+
 ## Action × state compatibility matrix
 
 One row per player-affecting action, one column per state. "radio" columns

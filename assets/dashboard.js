@@ -22,6 +22,9 @@
   let searchDebounce = null;
   let searchSeq = 0;
   let searchActiveIndex = -1;
+  // The failed track a search is picking a stand-in for; null outside
+  // replace mode.
+  let replaceTarget = null;
   let lastSeenPlayingVideoId = null;
   let statusDismissTimeout = null;
   let npCrossfadeTimeout = null;
@@ -246,6 +249,7 @@
     closeJoinModal();
     loadPlaylists(guildId);
     loadFavourites(guildId);
+    if (pageOverrides.style.display !== 'none') loadOverrides();
   }
 
   // Tears the feed down completely: the socket, any pending reconnect and
@@ -533,6 +537,7 @@
 
   const COVER_PLAY_ICON = '<svg width="36" height="36" viewBox="0 0 24 24" fill="currentColor"><polygon points="7,3 22,12 7,21"/></svg>';
   const REMOVE_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+  const SEARCH_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>';
   const PLAY_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,3 21,12 6,21"/></svg>';
   const GRIP_ICON = '<svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="2.5" cy="2.5" r="1.5"/><circle cx="7.5" cy="2.5" r="1.5"/><circle cx="2.5" cy="8" r="1.5"/><circle cx="7.5" cy="8" r="1.5"/><circle cx="2.5" cy="13.5" r="1.5"/><circle cx="7.5" cy="13.5" r="1.5"/></svg>';
   const REFRESH_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>';
@@ -858,6 +863,51 @@
     );
   }
 
+  // ---- Couldn't play ----
+  // Tracks the server could not start, listed under the queue with a Skip
+  // (dismiss) and a Find alternative (search in replace mode) action.
+  const failedSection = document.getElementById('failed-section');
+  const failedList = document.getElementById('failed-list');
+  const failedCountBadge = document.getElementById('failed-count-badge');
+
+  function createFailedRow(item) {
+    const row = createTrackRow(item);
+    const error = document.createElement('div');
+    error.className = 'failed-error text-danger text-xs truncate';
+    error.textContent = item.error;
+    row.querySelector('.compact-meta').appendChild(error);
+
+    const actions = document.createElement('div');
+    actions.className = 'compact-actions shrink-0 flex gap-0.5';
+    const findBtn = makeMiniIconBtn(SEARCH_ICON, 'Find alternative', false, false);
+    findBtn.addEventListener('click', () => enterReplaceMode(item));
+    actions.appendChild(findBtn);
+    const skipBtn = makeMiniIconBtn(REMOVE_ICON, 'Skip', false, true);
+    skipBtn.addEventListener('click', () => dismissFailedTrack(item.video_id));
+    actions.appendChild(skipBtn);
+    row.appendChild(actions);
+
+    updateFailedRow(row, item);
+    return row;
+  }
+
+  function updateFailedRow(row, item) {
+    updateTrackRowContent(row, item);
+    const error = row.querySelector('.failed-error');
+    if (error.textContent !== item.error) error.textContent = item.error;
+  }
+
+  function renderFailed(snapshot) {
+    const failed = snapshot.failed || [];
+    failedCountBadge.textContent = failed.length;
+    failedSection.style.display = failed.length === 0 ? 'none' : 'flex';
+    reconcileList(failedList, failed, (item) => item.video_id, createFailedRow, updateFailedRow);
+  }
+
+  function dismissFailedTrack(videoId) {
+    sendAction(`failed/${encodeURIComponent(videoId)}/dismiss`, { method: 'POST' });
+  }
+
   // Fades `.np-info` out, swaps its text, then lets the same transition fade
   // it back in. Any pending swap from a previous rapid track change is
   // cleared first so overlapping calls don't cut each other's fade short.
@@ -984,6 +1034,7 @@
 
     renderHeroOrEmpty(snapshot);
     renderQueue(snapshot);
+    renderFailed(snapshot);
 
     const transportDisabled = snapshot.state !== 'playing' && snapshot.state !== 'paused';
     // A restart clears in-memory playback state but the queue is reloaded
@@ -1357,7 +1408,33 @@
     searchDropdown.classList.remove('open');
   }
 
+  const searchReplaceBanner = document.getElementById('search-replace-banner');
+  const searchReplaceText = document.getElementById('search-replace-text');
+
+  // Replace mode turns the search bar into the picker for a failed track's
+  // stand-in: results get a "Use" button, and choosing one records the
+  // replacement and queues it next.
+  function enterReplaceMode(item, kind = 'failed') {
+    const title = item.title || item.video_id;
+    replaceTarget = { kind, video_id: item.video_id, title };
+    searchReplaceText.textContent = `Replacing “${title}” — pick a track`;
+    searchReplaceBanner.style.display = 'flex';
+    closeDrawers();
+    clearTimeout(searchDebounce);
+    searchInput.value = `${item.title || ''} ${item.channel || ''}`.trim();
+    searchInput.focus();
+    runSearch(searchInput.value, false);
+  }
+
+  function exitReplaceMode() {
+    replaceTarget = null;
+    searchReplaceBanner.style.display = 'none';
+  }
+
+  document.getElementById('search-replace-cancel').addEventListener('click', () => clearSearch());
+
   function clearSearch() {
+    exitReplaceMode();
     searchInput.value = '';
     searchResults.innerHTML = '';
     searchEmptyNote.style.display = 'none';
@@ -1373,7 +1450,7 @@
     const addBtn = document.createElement('button');
     addBtn.type = 'button';
     addBtn.className = 'outline-btn';
-    addBtn.textContent = 'Add';
+    addBtn.textContent = replaceTarget ? 'Use' : 'Add';
     addBtn.addEventListener('click', () => row._activate(addBtn));
     row.appendChild(addBtn);
   }
@@ -1387,7 +1464,14 @@
 
   function updateSearchRow(row, track) {
     updateTrackRowContent(row, track);
-    row._activate = () => {
+    const addBtn = row.querySelector('.outline-btn');
+    if (addBtn) addBtn.textContent = replaceTarget ? 'Use' : 'Add';
+    row._activate = (btn) => {
+      if (replaceTarget) {
+        const pick = replaceTarget.kind === 'override' ? changeOverride : replaceFailedTrack;
+        pick(replaceTarget.video_id, replaceTarget.title, track.video_id, track.title, btn);
+        return;
+      }
       addToQueue(track.video_id, track.title);
       closeSearchDropdown();
     };
@@ -1523,8 +1607,10 @@
       searchActiveIndex = -1;
       return;
     }
-    const isLink = extractVideoId(query) !== null;
-    const isPlaylistLink = !isLink && looksLikePlaylistUrl(query);
+    // In replace mode a link is just another query: nothing is added on the
+    // user's behalf, and a playlist cannot stand in for one track.
+    const isLink = !replaceTarget && extractVideoId(query) !== null;
+    const isPlaylistLink = !replaceTarget && !isLink && looksLikePlaylistUrl(query);
     if (isLink || isPlaylistLink) {
       // A link resolves to something unrelated to any earlier results — clear
       // the stale list immediately instead of leaving it visible mid-flight.
@@ -1541,7 +1627,11 @@
   });
 
   searchInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') { closeSearchDropdown(); return; }
+    if (event.key === 'Escape') {
+      if (replaceTarget) clearSearch();
+      else closeSearchDropdown();
+      return;
+    }
     if (!searchDropdown.classList.contains('open') || searchResults.children.length === 0) return;
     if (event.key === 'ArrowDown') {
       event.preventDefault();
@@ -1577,6 +1667,33 @@
       }
       renderSnapshot(body);
       showStatus(`Added "${title}" to the queue.`);
+      loadFavourites(currentGuildId);
+      clearSearch();
+    } catch (err) { /* showLogin already handled unauthorized */
+    } finally {
+      setButtonBusy(btn, false);
+    }
+  }
+
+  async function replaceFailedTrack(originalId, originalTitle, videoId, title, btn) {
+    setButtonBusy(btn, true);
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/failed/${encodeURIComponent(originalId)}/replace`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_id: videoId }),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        if (body.error === NOT_CONNECTED_ERROR) {
+          openJoinModal(() => replaceFailedTrack(originalId, originalTitle, videoId, title));
+          return;
+        }
+        showStatus(body.error || 'Could not replace that track.', { isError: true });
+        return;
+      }
+      renderSnapshot(body);
+      showStatus(`Queued "${title}" next in place of "${originalTitle}".`);
       loadFavourites(currentGuildId);
       clearSearch();
     } catch (err) { /* showLogin already handled unauthorized */
@@ -1923,6 +2040,8 @@
   // ---- Users (admin only) ----
   const navDashboardBtn = document.getElementById('nav-dashboard-btn');
   const navUsersBtn = document.getElementById('nav-users-btn');
+  const navOverridesBtn = document.getElementById('nav-overrides-btn');
+  const pageOverrides = document.getElementById('page-overrides');
   const pageDashboardBody = document.getElementById('page-dashboard-body');
   const pageUsers = document.getElementById('page-users');
   const usersList = document.getElementById('users-list');
@@ -1934,14 +2053,22 @@
   // to the Dashboard page.
   function showPage(name) {
     const onUsers = name === 'users';
-    pageDashboardBody.style.display = onUsers ? 'none' : 'flex';
+    const onOverrides = name === 'overrides';
+    const onDashboard = !onUsers && !onOverrides;
+    pageDashboardBody.style.display = onDashboard ? 'flex' : 'none';
     pageUsers.style.display = onUsers ? 'flex' : 'none';
+    pageOverrides.style.display = onOverrides ? 'flex' : 'none';
+    // The overrides page keeps the search bar: changing a mapping picks its
+    // new track there, in replace mode.
     topbarSearch.style.display = onUsers ? 'none' : '';
     dashboard.classList.toggle('on-users', onUsers);
-    navDashboardBtn.classList.toggle('active', !onUsers);
+    dashboard.classList.toggle('on-overrides', onOverrides);
+    navDashboardBtn.classList.toggle('active', onDashboard);
     navUsersBtn.classList.toggle('active', onUsers);
+    navOverridesBtn.classList.toggle('active', onOverrides);
     closeDrawers();
     if (onUsers) loadUsers();
+    if (onOverrides) loadOverrides();
   }
 
   // ---- Sidebar and queue drawers ----
@@ -1996,6 +2123,122 @@
 
   navDashboardBtn.addEventListener('click', () => showPage('dashboard'));
   navUsersBtn.addEventListener('click', () => showPage('users'));
+  navOverridesBtn.addEventListener('click', () => showPage('overrides'));
+
+  // ---- Overrides page ----
+  // One row per saved mapping: the track that would not play on the left,
+  // what plays in its place on the right. Change picks a new stand-in via
+  // the search bar's replace mode; Remove drops the mapping.
+  const overridesList = document.getElementById('overrides-list');
+  const overridesEmptyNote = document.getElementById('overrides-empty-note');
+
+  function createOverrideSide(track, className) {
+    const side = document.createElement('div');
+    side.className = `${className} min-w-0 flex-1 flex items-center gap-3`;
+    const thumb = document.createElement('div');
+    thumb.className = 'compact-thumb thumb relative size-10 rounded shrink-0 overflow-hidden';
+    applyThumbnail(thumb, track.video_id, track.video_id);
+    side.appendChild(thumb);
+    const meta = document.createElement('div');
+    meta.className = 'min-w-0 flex-1 flex flex-col gap-0.5';
+    const title = document.createElement('span');
+    title.className = 'override-title text-base truncate';
+    meta.appendChild(title);
+    const channel = document.createElement('div');
+    channel.className = 'override-channel text-sm text-secondary truncate';
+    meta.appendChild(channel);
+    side.appendChild(meta);
+    updateOverrideSide(side, track);
+    return side;
+  }
+
+  function updateOverrideSide(side, track) {
+    const title = side.querySelector('.override-title');
+    const channel = side.querySelector('.override-channel');
+    const label = track.title || track.video_id;
+    if (title.textContent !== label) title.textContent = label;
+    if (channel.textContent !== track.channel) channel.textContent = track.channel;
+  }
+
+  function createOverrideRow(mapping) {
+    const row = document.createElement('div');
+    row.className = 'compact-row relative flex items-center gap-3 min-h-14 p-2 rounded shrink-0 overflow-hidden hover:bg-hover';
+    row.appendChild(createOverrideSide(mapping.original, 'override-original'));
+    const arrow = document.createElement('span');
+    arrow.className = 'shrink-0 text-secondary';
+    arrow.textContent = '\u2192';
+    row.appendChild(arrow);
+    row.appendChild(createOverrideSide(mapping.replacement, 'override-replacement'));
+
+    const actions = document.createElement('div');
+    actions.className = 'shrink-0 flex gap-0.5';
+    const changeBtn = makeMiniIconBtn(SEARCH_ICON, 'Change replacement', false, false);
+    changeBtn.addEventListener('click', () => enterReplaceMode(row._original, 'override'));
+    actions.appendChild(changeBtn);
+    const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Remove override', false, true);
+    removeBtn.addEventListener('click', () => removeOverride(row._original));
+    actions.appendChild(removeBtn);
+    row.appendChild(actions);
+
+    updateOverrideRow(row, mapping);
+    return row;
+  }
+
+  function updateOverrideRow(row, mapping) {
+    row._original = mapping.original;
+    updateOverrideSide(row.querySelector('.override-original'), mapping.original);
+    updateOverrideSide(row.querySelector('.override-replacement'), mapping.replacement);
+  }
+
+  function renderOverrides(overrides) {
+    overridesEmptyNote.style.display = overrides.length === 0 ? 'block' : 'none';
+    reconcileList(overridesList, overrides, (mapping) => mapping.original.video_id, createOverrideRow, updateOverrideRow);
+  }
+
+  async function loadOverrides() {
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/overrides`);
+      if (!response.ok) return;
+      renderOverrides(await response.json());
+    } catch (err) { /* showLogin already handled unauthorized */ }
+  }
+
+  async function removeOverride(original) {
+    const name = original.title || original.video_id;
+    if (!window.confirm(`Remove the override for "${name}"? It will play as itself again.`)) return;
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/overrides/${encodeURIComponent(original.video_id)}/remove`, { method: 'POST' });
+      const body = await response.json();
+      if (!response.ok) {
+        showStatus(body.error || 'Could not remove that override.', { isError: true });
+        return;
+      }
+      showStatus(`Removed the override for "${name}".`);
+      renderOverrides(body);
+    } catch (err) { /* showLogin already handled unauthorized */ }
+  }
+
+  async function changeOverride(originalId, originalTitle, videoId, title, btn) {
+    setButtonBusy(btn, true);
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/overrides/${encodeURIComponent(originalId)}/replace`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_id: videoId }),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        showStatus(body.error || 'Could not change that override.', { isError: true });
+        return;
+      }
+      showStatus(`"${title}" now plays in place of "${originalTitle}".`);
+      renderOverrides(body);
+      clearSearch();
+    } catch (err) { /* showLogin already handled unauthorized */
+    } finally {
+      setButtonBusy(btn, false);
+    }
+  }
 
   async function loadCurrentUser() {
     try {

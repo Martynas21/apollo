@@ -110,7 +110,8 @@ Key points:
   `serve()` seam, and the middleware layering), `response.rs` (shared JSON
   error shape, guild/channel id parsing, `Track` wire-format mapping),
   `routes/` (one file per surface — `guilds.rs`, `playback.rs`, `queue.rs`,
-  `search.rs`, `playlists.rs`, `favourites.rs`, `users.rs`, `auth.rs` — each
+  `failed.rs`, `overrides.rs`, `search.rs`, `playlists.rs`, `favourites.rs`,
+  `users.rs`, `auth.rs` — each
   owning its handlers and its own `routes()`), `auth.rs` (password hashing +
   database-backed session tokens — middleware, not a route module). The
   single-page frontend it serves lives in `assets/` (`dashboard.html`,
@@ -137,8 +138,9 @@ Key points:
 - `src/db/` — sqlx/SQLite, split by table group: `settings.rs` (per-guild
   volume), `playlists.rs` (saved playlists + cached tracks), `session.rs`
   (guild session persistence), `queue.rs` (the persisted play queue),
-  `stats.rs` (play counts), `users.rs` (dashboard accounts), `sessions.rs`
-  (dashboard login sessions). `mod.rs` holds `connect` and re-exports
+  `failed_tracks.rs` (tracks that never produced audio, and the per-guild
+  replacement overrides chosen for them), `stats.rs` (play counts),
+  `users.rs` (dashboard accounts), `sessions.rs` (dashboard login sessions). `mod.rs` holds `connect` and re-exports
   everything else under `crate::db::*`. Migrations
   in `migrations/` are embedded into the binary at compile time (sqlx
   `migrate!`).

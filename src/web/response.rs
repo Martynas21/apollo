@@ -8,6 +8,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serenity::all::{ChannelId, GuildId};
 
+use crate::db::{FailedTrack, TrackOverride};
 use crate::model::{QueuedTrack, Track};
 use crate::voice::PlayerError;
 
@@ -60,6 +61,34 @@ pub fn track_json(queued: &QueuedTrack) -> TrackJson {
         channel: queued.track.channel.clone(),
         video_id: queued.track.video_id.clone(),
         duration_secs: queued.track.duration.map(|d| d.as_secs()),
+    }
+}
+
+/// A track that never produced audio, with the reason the start failed.
+#[derive(Serialize)]
+pub struct FailedTrackJson {
+    #[serde(flatten)]
+    track: TrackJson,
+    error: String,
+}
+
+pub fn failed_track_json(failed: &FailedTrack) -> FailedTrackJson {
+    FailedTrackJson {
+        track: track_json_from_track(&failed.track),
+        error: failed.error.clone(),
+    }
+}
+
+#[derive(Serialize)]
+pub struct TrackOverrideJson {
+    original: TrackJson,
+    replacement: TrackJson,
+}
+
+pub fn track_override_json(mapping: &TrackOverride) -> TrackOverrideJson {
+    TrackOverrideJson {
+        original: track_json_from_track(&mapping.original),
+        replacement: track_json_from_track(&mapping.replacement),
     }
 }
 

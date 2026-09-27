@@ -2,7 +2,7 @@ use rand::seq::SliceRandom;
 use serenity::all::GuildId;
 
 use crate::db;
-use crate::model::QueuedTrack;
+use crate::model::{QueuedTrack, Track};
 use crate::voice::error::PlayerError;
 use crate::voice::registry::{PlayerRegistry, discard_prefetch};
 use crate::voice::state::GuildState;
@@ -58,9 +58,11 @@ impl PlayerRegistry {
     pub async fn enqueue_next(
         &self,
         guild_id: GuildId,
-        queued: QueuedTrack,
+        mut queued: QueuedTrack,
     ) -> Result<(), PlayerError> {
         let guild_id_str = guild_id.to_string();
+        self.apply_track_overrides(guild_id, std::iter::once(&mut queued.track))
+            .await;
         let (call, start) = {
             let mut guilds = self.guilds.lock().await;
             let call = self.voice.call(guild_id).ok_or(PlayerError::NotConnected)?;
@@ -105,6 +107,8 @@ impl PlayerRegistry {
         }
         let guild_id_str = guild_id.to_string();
         let mut tracks = tracks;
+        self.apply_track_overrides(guild_id, tracks.iter_mut().map(|queued| &mut queued.track))
+            .await;
         let first = tracks.first().cloned();
 
         let (call, start) = {
@@ -264,8 +268,10 @@ impl PlayerRegistry {
     pub async fn play_now(
         &self,
         guild_id: GuildId,
-        queued: QueuedTrack,
+        mut queued: QueuedTrack,
     ) -> Result<(), PlayerError> {
+        self.apply_track_overrides(guild_id, std::iter::once(&mut queued.track))
+            .await;
         self.jump_to(guild_id, |_, _| Ok(queued)).await
     }
 
@@ -360,6 +366,31 @@ impl PlayerRegistry {
         Ok(())
     }
 
+    /// Swaps in the guild's saved replacement for every track whose video
+    /// has one, so a video that would not play is never queued again while
+    /// its override stands. Only the track changes; who requested it stays.
+    pub(super) async fn apply_track_overrides<'a>(
+        &self,
+        guild_id: GuildId,
+        tracks: impl Iterator<Item = &'a mut Track>,
+    ) {
+        let overrides = match db::track_overrides(&self.db, &guild_id.to_string()).await {
+            Ok(overrides) => overrides,
+            Err(err) => {
+                tracing::warn!(%guild_id, %err, "failed to load track overrides");
+                return;
+            }
+        };
+        if overrides.is_empty() {
+            return;
+        }
+        for track in tracks {
+            if let Some(replacement) = overrides.get(&track.video_id) {
+                *track = replacement.clone();
+            }
+        }
+    }
+
     pub(super) fn restart_prefetch(&self, state: &mut GuildState, next: Option<QueuedTrack>) {
         if let Some(old) = state.prefetch.take() {
             discard_prefetch(old);
@@ -380,6 +411,62 @@ mod tests {
     use crate::voice::testing::{
         current_track_id, joined_registry, new_registry, queued, upcoming_ids,
     };
+
+    async fn override_a_with_b(registry: &PlayerRegistry, guild_id: GuildId) {
+        db::save_track_override(
+            &registry.db,
+            &guild_id.to_string(),
+            &queued("a").track,
+            &queued("b").track,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn enqueue_next_queues_the_override_in_place_of_the_original() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        override_a_with_b(&registry, guild_id).await;
+
+        registry.enqueue_next(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["b"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        let now_playing = snapshot.now_playing.unwrap();
+        assert_eq!(now_playing.track, queued("b").track);
+        assert_eq!(now_playing.requested_by, queued("a").requested_by);
+    }
+
+    #[tokio::test]
+    async fn enqueue_many_swaps_every_overridden_track() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        override_a_with_b(&registry, guild_id).await;
+
+        registry
+            .enqueue_many(guild_id, vec![queued("c"), queued("a"), queued("a")])
+            .await
+            .unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["c"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["b", "b"]);
+    }
+
+    #[tokio::test]
+    async fn play_now_starts_the_override_in_place_of_the_original() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        override_a_with_b(&registry, guild_id).await;
+
+        registry.play_now(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["b"]);
+    }
 
     #[tokio::test]
     async fn enqueue_starts_playback_immediately_on_an_empty_queue() {

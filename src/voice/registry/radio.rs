@@ -154,6 +154,9 @@ impl PlayerRegistry {
             tracing::warn!(%guild_id, %seed, "radio refill: hydration returned no tracks");
             return;
         }
+        let mut hydrated = hydrated;
+        self.apply_track_overrides(guild_id, hydrated.iter_mut())
+            .await;
 
         let pushed = self
             .push_radio_refill(guild_id, epoch, requested_by, hydrated)

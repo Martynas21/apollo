@@ -4,8 +4,10 @@ use std::time::Duration;
 use serenity::all::GuildId;
 use uuid::Uuid;
 
+use crate::db;
 use crate::model::QueuedTrack;
 use crate::voice::backend::VoiceCall;
+use crate::voice::error::PlayerError;
 use crate::voice::registry::{PlayerRegistry, discard_prefetch};
 
 /// A track that errors before playing this long never really started: its
@@ -20,7 +22,8 @@ const MAX_CONSECUTIVE_EARLY_FAILURES: u32 = 3;
 
 enum EarlyRetry {
     Retry(QueuedTrack, u64, Arc<dyn VoiceCall>),
-    Spent,
+    /// The retry is used up (or unavailable); carries the track that failed.
+    Spent(Option<QueuedTrack>),
     Stale,
 }
 
@@ -54,19 +57,71 @@ impl PlayerRegistry {
                 );
                 self.spawn_start_sequence(guild_id, call, queued, epoch, None, true);
             }
-            EarlyRetry::Spent if self.note_early_failure(guild_id).await => {
-                tracing::error!(
-                    %guild_id,
-                    %error,
-                    "several tracks in a row failed at the start; giving up on the queue"
-                );
-                self.abandon_current(guild_id).await;
-            }
-            EarlyRetry::Spent => {
-                tracing::warn!(%guild_id, %track_id, %error, "track failed again; moving on");
-                self.advance(guild_id, track_id).await;
+            EarlyRetry::Spent(failed) => {
+                self.move_on_after_spent_retry(guild_id, track_id, failed, error)
+                    .await;
             }
             EarlyRetry::Stale => {}
+        }
+    }
+
+    /// Records the track that failed even after its retry, then either gives
+    /// up on the queue or moves on to the next track.
+    async fn move_on_after_spent_retry(
+        &self,
+        guild_id: GuildId,
+        track_id: Uuid,
+        failed: Option<QueuedTrack>,
+        error: &str,
+    ) {
+        if let Some(queued) = &failed {
+            self.record_failed_start(guild_id, queued, error).await;
+        }
+        if self.note_early_failure(guild_id).await {
+            tracing::error!(
+                %guild_id,
+                %error,
+                "several tracks in a row failed at the start; giving up on the queue"
+            );
+            self.abandon_current(guild_id).await;
+        } else {
+            tracing::warn!(%guild_id, %track_id, %error, "track failed again; moving on");
+            self.advance(guild_id, track_id).await;
+        }
+    }
+
+    /// Remembers a track that never produced audio, so the dashboard can
+    /// offer to skip or replace it.
+    pub(super) async fn record_failed_start(
+        &self,
+        guild_id: GuildId,
+        queued: &QueuedTrack,
+        error: &str,
+    ) {
+        if let Err(err) =
+            db::record_failed_track(&self.db, &guild_id.to_string(), queued, error).await
+        {
+            tracing::warn!(%guild_id, %err, "failed to record a track that would not start");
+        }
+    }
+
+    /// The message worth showing for a start failure: the playback error
+    /// itself rather than the "playback error:" wrapper around it.
+    pub(super) fn start_failure_message(err: &PlayerError) -> String {
+        match err {
+            PlayerError::Playback(message) => message.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    /// The guild's tracks that never produced audio, newest first.
+    pub async fn failed_tracks(&self, guild_id: GuildId) -> Vec<db::FailedTrack> {
+        match db::failed_tracks(&self.db, &guild_id.to_string()).await {
+            Ok(failed) => failed,
+            Err(err) => {
+                tracing::warn!(%guild_id, %err, "failed to load failed tracks");
+                Vec::new()
+            }
         }
     }
 
@@ -86,7 +141,7 @@ impl PlayerRegistry {
             state.now_playing.clone(),
             state.retry_used,
         ) else {
-            return EarlyRetry::Spent;
+            return EarlyRetry::Spent(state.now_playing.clone());
         };
         state.retry_used = true;
         state.current_handle = None;
@@ -170,6 +225,102 @@ mod tests {
             .iter()
             .find(|t| t.video_id == video_id)
             .map(|t| t.play_count)
+    }
+
+    async fn failed_ids(registry: &PlayerRegistry, guild_id: GuildId) -> Vec<String> {
+        let mut ids: Vec<String> = db::failed_tracks(&registry.db, &guild_id.to_string())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|failed| failed.track.video_id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_track_whose_stream_cannot_be_resolved_is_recorded_as_failed() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        backend.make_unplayable("a");
+        registry
+            .enqueue_many(guild_id, vec![queued("a"), queued("b")])
+            .await
+            .unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let failed = db::failed_tracks(&registry.db, &guild_id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].track, queued("a").track);
+        assert_eq!(failed[0].error, "video is unavailable (private or deleted)");
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "b");
+    }
+
+    #[tokio::test]
+    async fn a_track_that_fails_early_even_after_its_retry_is_recorded() {
+        let (registry, backend, guild_id, a_id) = playing_a_then_b().await;
+        backend.fail_track(guild_id, a_id, Duration::ZERO).await;
+        registry.settle_playback_start(guild_id).await;
+        assert!(failed_ids(&registry, guild_id).await.is_empty());
+
+        let retry_id = current_track_id(&registry, guild_id).await;
+        backend.fail_track(guild_id, retry_id, Duration::ZERO).await;
+        registry.settle_playback_start(guild_id).await;
+
+        assert_eq!(failed_ids(&registry, guild_id).await, vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn every_candidate_an_abandoned_start_passed_over_is_recorded() {
+        let (registry, _backend, guild_id) = abandoned_start().await;
+
+        assert_eq!(failed_ids(&registry, guild_id).await, vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn a_failure_well_into_a_track_is_not_recorded() {
+        let (registry, backend, guild_id, a_id) = playing_a_then_b().await;
+
+        backend
+            .fail_track(guild_id, a_id, Duration::from_secs(60))
+            .await;
+        registry.settle_playback_start(guild_id).await;
+
+        assert!(failed_ids(&registry, guild_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recorded_video_that_later_starts_is_forgotten() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        backend.make_unplayable("a");
+        registry
+            .enqueue_many(guild_id, vec![queued("a"), queued("b")])
+            .await
+            .unwrap();
+        registry.settle_playback_start(guild_id).await;
+        assert_eq!(failed_ids(&registry, guild_id).await, vec!["a"]);
+
+        backend.make_playable("a");
+        registry.play_now(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        // The row is cleared right after the start commits, outside the
+        // guild lock the settle waits on.
+        let mut cleared = false;
+        for _ in 0..500 {
+            if failed_ids(&registry, guild_id).await.is_empty() {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(cleared, "the failed row was not cleared in time");
+        assert_eq!(
+            registry.failed_tracks(guild_id).await,
+            Vec::<db::FailedTrack>::new()
+        );
     }
 
     #[tokio::test]
@@ -326,12 +477,27 @@ mod tests {
     async fn a_prefetch_older_than_the_limit_is_resolved_again() {
         let (mut registry, backend, guild_id) = joined_registry().await;
         registry.prefetch_max_age = Duration::ZERO;
+        let resolves_of_b = || {
+            backend
+                .buffered_source_calls()
+                .iter()
+                .filter(|id| *id == "b")
+                .count()
+        };
+        // Every resolve parks at the gate, so "b" is queued before "a"
+        // starts and its prefetch is armed by that start.
+        let gate = backend.hold_downloads();
         registry.enqueue(guild_id, queued("a")).await.unwrap();
         registry.enqueue(guild_id, queued("b")).await.unwrap();
+        gate.notify_one();
         registry.settle_playback_start(guild_id).await;
+        wait_until(|| resolves_of_b() == 1).await;
         let a_id = current_track_id(&registry, guild_id).await;
 
         backend.finish_track(guild_id, a_id).await;
+        gate.notify_one();
+        wait_until(|| resolves_of_b() == 2).await;
+        gate.notify_one();
         // Waiting on the track itself, since the guild still reads as playing
         // "a" for as long as it takes the finish to be applied.
         wait_until(|| backend.call_for(guild_id).unwrap().played_video_ids().len() == 2).await;
@@ -340,11 +506,6 @@ mod tests {
             backend.call_for(guild_id).unwrap().played_video_ids(),
             vec!["a", "b"]
         );
-        let resolves_of_b = backend
-            .buffered_source_calls()
-            .iter()
-            .filter(|id| *id == "b")
-            .count();
-        assert_eq!(resolves_of_b, 2);
+        assert_eq!(resolves_of_b(), 2);
     }
 }

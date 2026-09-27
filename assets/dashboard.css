@@ -225,7 +225,8 @@ select.input { cursor: pointer; }
 }
 .queue-open .queue-panel { transform: none; visibility: visible; transition: transform .2s var(--ease), visibility 0s; }
 .sidebar-open .scrim, .queue-open .scrim { display: block; }
-.on-users .queue-panel, .on-users #queue-toggle-btn { display: none; }
+.on-users .queue-panel, .on-users #queue-toggle-btn,
+.on-overrides .queue-panel, .on-overrides #queue-toggle-btn { display: none; }
 @media (min-width: 900px) {
   .queue-panel { top: var(--header-h); left: auto; width: min(360px, 100vw); border-radius: 0; transform: translateX(100%); }
 }

@@ -5,6 +5,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
+use serenity::all::GuildId;
 
 use crate::db;
 use crate::model::QueuedTrack;
@@ -210,6 +211,7 @@ async fn refresh_playlist(
             "failed to refresh playlist",
         );
     }
+    prune_overrides(&state, guild_id).await;
 
     let author = match db::set_playlist_author(&state.db, playlist.id, listing.author.as_deref())
         .await
@@ -232,6 +234,14 @@ async fn refresh_playlist(
     .into_response()
 }
 
+/// Drops replacement overrides whose original video no longer sits in any
+/// of the guild's saved playlists; the response never fails over it.
+async fn prune_overrides(state: &WebState, guild_id: GuildId) {
+    if let Err(err) = db::prune_track_overrides(&state.db, &guild_id.to_string()).await {
+        tracing::warn!(%guild_id, %err, "dashboard failed to prune track overrides");
+    }
+}
+
 async fn remove_playlist(
     State(state): State<WebState>,
     Path((guild_id, playlist_id)): Path<(String, i64)>,
@@ -241,7 +251,10 @@ async fn remove_playlist(
     };
 
     match db::delete_guild_playlist(&state.db, &guild_id.to_string(), playlist_id).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            prune_overrides(&state, guild_id).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => error_response(StatusCode::NOT_FOUND, "playlist not found"),
         Err(err) => {
             tracing::warn!(%err, "dashboard failed to remove playlist");

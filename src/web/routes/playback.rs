@@ -14,7 +14,8 @@ use crate::model::QueuedTrack;
 use crate::voice::{PlayerError, PlayerRegistry};
 use crate::web::WebState;
 use crate::web::response::{
-    TrackJson, error_response, parse_guild_id, player_error_status, track_json,
+    FailedTrackJson, TrackJson, error_response, failed_track_json, parse_guild_id,
+    player_error_status, track_json,
 };
 
 const SNAPSHOT_PUSH_INTERVAL: Duration = Duration::from_millis(1500);
@@ -41,17 +42,19 @@ struct SnapshotJson {
     volume: u8,
     radio_enabled: bool,
     upcoming: Vec<TrackJson>,
+    failed: Vec<FailedTrackJson>,
 }
 
 async fn build_snapshot(player: &PlayerRegistry, guild_id: GuildId) -> SnapshotJson {
     // One bounded round trip to the worker per snapshot: a worker that is
     // slow to answer costs a missing position, not a silent feed.
-    let (snapshot, paused, status, volume, radio_enabled) = tokio::join!(
+    let (snapshot, paused, status, volume, radio_enabled, failed) = tokio::join!(
         player.queue_snapshot(guild_id),
         player.is_paused(guild_id),
         tokio::time::timeout(SNAPSHOT_PUSH_INTERVAL, player.track_status(guild_id)),
         player.get_volume(guild_id),
         player.is_radio_enabled(guild_id),
+        player.failed_tracks(guild_id),
     );
     let status = status.ok().flatten();
 
@@ -71,6 +74,7 @@ async fn build_snapshot(player: &PlayerRegistry, guild_id: GuildId) -> SnapshotJ
     };
 
     let upcoming: Vec<TrackJson> = snapshot.upcoming.iter().map(track_json).collect();
+    let failed: Vec<FailedTrackJson> = failed.iter().map(failed_track_json).collect();
 
     let position_ms = if matches!(state, "playing" | "paused") {
         status.map(|status| u64::try_from(status.position.as_millis()).unwrap_or(u64::MAX))
@@ -85,10 +89,11 @@ async fn build_snapshot(player: &PlayerRegistry, guild_id: GuildId) -> SnapshotJ
         volume,
         radio_enabled,
         upcoming,
+        failed,
     }
 }
 
-async fn snapshot_response(player: &PlayerRegistry, guild_id: GuildId) -> Response {
+pub(super) async fn snapshot_response(player: &PlayerRegistry, guild_id: GuildId) -> Response {
     Json(build_snapshot(player, guild_id).await).into_response()
 }
 
