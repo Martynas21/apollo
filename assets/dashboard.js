@@ -1693,7 +1693,7 @@
       actions.className = 'playlist-actions flex items-center justify-end gap-1';
 
       const refreshBtn = makeMiniIconBtn(REFRESH_ICON, 'Refresh from YouTube', false, false);
-      refreshBtn.addEventListener('click', () => refreshPlaylist(playlist.id, playlist.name));
+      refreshBtn.addEventListener('click', () => refreshPlaylist(playlist.id, playlist.name, cover, refreshBtn));
       actions.appendChild(refreshBtn);
 
       const removeBtn = makeMiniIconBtn(REMOVE_ICON, 'Remove playlist', false, true);
@@ -1774,7 +1774,12 @@
     }
   }
 
-  async function refreshPlaylist(id, name) {
+  // Refreshing can take a while (yt-dlp lists the whole playlist), so the
+  // cover shows the same spinner as playing while the request is in flight
+  // and the refresh button is locked against a second click.
+  async function refreshPlaylist(id, name, cover, refreshBtn) {
+    setButtonBusy(cover, true);
+    if (refreshBtn) refreshBtn.disabled = true;
     try {
       const response = await api(`/api/guilds/${currentGuildId}/playlists/${id}/refresh`, { method: 'POST' });
       const body = await response.json();
@@ -1784,7 +1789,11 @@
       }
       showStatus(`Refreshed "${name}" (${body.track_count} track${body.track_count === 1 ? '' : 's'}).`);
       loadPlaylists(currentGuildId);
-    } catch (err) { /* showLogin already handled unauthorized */ }
+    } catch (err) { /* showLogin already handled unauthorized */
+    } finally {
+      setButtonBusy(cover, false);
+      if (refreshBtn) refreshBtn.disabled = false;
+    }
   }
 
   async function removePlaylist(id, name) {
