@@ -131,6 +131,11 @@ impl VoiceTrack for FakeTrack {
         Ok(())
     }
 
+    async fn seek(&self, position: Duration) -> Result<(), String> {
+        self.state.lock().unwrap().position = position;
+        Ok(())
+    }
+
     fn notify_when_finished(&self, guild_id: GuildId, events: Arc<dyn VoiceEvents>) {
         self.state.lock().unwrap().registered = Some((guild_id, events));
     }

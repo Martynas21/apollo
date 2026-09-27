@@ -36,6 +36,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// room than a local command.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// `Seek` makes the worker fetch and discard audio up to the target, so it
+/// waits on the CDN like `Join` waits on Discord.
+const SEEK_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct Connection {
     /// Hands frames to the writer task; swapped for a fresh one on every
     /// reconnect and for a closed one once the link has been given up on.
@@ -589,6 +593,15 @@ impl VoiceTrack for IpcTrack {
         .await
     }
 
+    async fn seek(&self, position: std::time::Duration) -> Result<(), String> {
+        let request = Request::Seek {
+            guild_id: self.guild_id.get(),
+            track_id: self.track_id,
+            position_ms: u64::try_from(position.as_millis()).unwrap_or(u64::MAX),
+        };
+        self.request_with_timeout(request, SEEK_TIMEOUT).await
+    }
+
     fn notify_when_finished(&self, _guild_id: GuildId, _events: Arc<dyn VoiceEvents>) {}
 
     async fn status(&self) -> Option<TrackStatus> {
@@ -611,7 +624,19 @@ impl VoiceTrack for IpcTrack {
 
 impl IpcTrack {
     async fn request(&self, request: Request) -> Result<(), String> {
-        match self.connection.request(request).await? {
+        self.request_with_timeout(request, REQUEST_TIMEOUT).await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        request: Request,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        match self
+            .connection
+            .request_with_timeout(request, timeout)
+            .await?
+        {
             Response::Ok => Ok(()),
             other => Err(format!("unexpected response: {other:?}")),
         }

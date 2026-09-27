@@ -402,6 +402,30 @@ impl Sessions {
             paused: matches!(state.playing, PlayMode::Pause),
         })
     }
+
+    /// Moves the current track to `position`. The stream is not byte-seekable,
+    /// so songbird reads forward to the target (re-requesting from the start
+    /// for a backward seek), which takes as long as fetching that much audio.
+    pub async fn seek(
+        &self,
+        guild_id: u64,
+        track_id: Uuid,
+        position: Duration,
+    ) -> Result<(), String> {
+        let handle = self.current_handle(guild_id, track_id)?;
+        let landed = handle
+            .seek_async(position)
+            .await
+            .map_err(|e| e.to_string())?;
+        tracing::info!(
+            guild_id,
+            %track_id,
+            requested_ms = millis(position),
+            landed_ms = millis(landed),
+            "track seeked"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -422,7 +446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_resume_stop_set_volume_reject_an_unknown_guild() {
+    async fn track_commands_reject_an_unknown_guild() {
         let sessions = sessions();
         let track_id = Uuid::new_v4();
         assert!(sessions.pause(1, track_id).is_err());
@@ -430,6 +454,7 @@ mod tests {
         assert!(sessions.stop(1, track_id).is_err());
         assert!(sessions.set_volume(1, track_id, 0.5).is_err());
         assert!(sessions.status(1, track_id).await.is_err());
+        assert!(sessions.seek(1, track_id, Duration::ZERO).await.is_err());
     }
 
     #[tokio::test]
@@ -457,6 +482,7 @@ mod tests {
         let stale_id = Uuid::new_v4();
         assert!(sessions.pause(1, stale_id).is_err());
         assert!(sessions.stop(1, stale_id).is_err());
+        assert!(sessions.seek(1, stale_id, Duration::ZERO).await.is_err());
 
         assert!(sessions.pause(1, current_id).is_ok());
     }

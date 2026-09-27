@@ -252,6 +252,7 @@ mod tests {
         ToggleRadio,
         ClearQueue,
         SetVolume,
+        Seek,
         RemoveQueueTrack,
         MoveQueueTrack,
         EnqueueNext,
@@ -260,7 +261,7 @@ mod tests {
     }
 
     impl MatrixAction {
-        const ALL: [MatrixAction; 13] = [
+        const ALL: [MatrixAction; 14] = [
             MatrixAction::Pause,
             MatrixAction::Resume,
             MatrixAction::Skip,
@@ -269,6 +270,7 @@ mod tests {
             MatrixAction::ToggleRadio,
             MatrixAction::ClearQueue,
             MatrixAction::SetVolume,
+            MatrixAction::Seek,
             MatrixAction::RemoveQueueTrack,
             MatrixAction::MoveQueueTrack,
             MatrixAction::EnqueueNext,
@@ -302,6 +304,11 @@ mod tests {
                 MatrixAction::SetVolume => {
                     let _ = registry.set_volume(guild_id, 42).await;
                 }
+                MatrixAction::Seek => {
+                    let _ = registry
+                        .seek(guild_id, std::time::Duration::from_secs(3))
+                        .await;
+                }
                 MatrixAction::RemoveQueueTrack => {
                     let _ = registry.remove_queue_track(guild_id, 0).await;
                 }
@@ -330,6 +337,7 @@ mod tests {
                 MatrixAction::ToggleRadio => "toggle_radio",
                 MatrixAction::ClearQueue => "clear_queue",
                 MatrixAction::SetVolume => "set_volume",
+                MatrixAction::Seek => "seek",
                 MatrixAction::RemoveQueueTrack => "remove_queue_track",
                 MatrixAction::MoveQueueTrack => "move_queue_track",
                 MatrixAction::EnqueueNext => "enqueue_next",

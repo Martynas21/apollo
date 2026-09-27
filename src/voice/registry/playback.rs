@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use serenity::all::GuildId;
 use uuid::Uuid;
@@ -12,6 +13,10 @@ use crate::voice::resolve::PlaybackError;
 use crate::voice::state::{AdvanceFill, GuildState, StartOutcome, TrackOutcome};
 
 const MAX_VOLUME: u8 = 100;
+
+/// How far short of the end a seek may land, so the decoder never has to
+/// seek onto the final packet.
+const SEEK_END_MARGIN: Duration = Duration::from_secs(1);
 
 const RADIO_HISTORY_CAP: usize = 5;
 
@@ -511,6 +516,27 @@ impl PlayerRegistry {
         result
     }
 
+    /// Moves the current track to `position`, clamped to just short of its
+    /// length so the track still ends the normal way. A paused track stays
+    /// paused at the new position.
+    pub async fn seek(&self, guild_id: GuildId, position: Duration) -> Result<(), PlayerError> {
+        let (handle, duration) = {
+            let guilds = self.guilds.lock().await;
+            let state = guilds.get(&guild_id);
+            (
+                state.and_then(|state| state.current_handle.clone()),
+                state
+                    .and_then(|state| state.now_playing.as_ref())
+                    .and_then(|queued| queued.track.duration),
+            )
+        };
+        let handle = handle.ok_or(PlayerError::NothingPlaying)?;
+        let position = duration.map_or(position, |duration| {
+            position.min(duration.saturating_sub(SEEK_END_MARGIN))
+        });
+        handle.seek(position).await.map_err(PlayerError::Playback)
+    }
+
     /// Records the pause flag for `handle` if it is still the current track.
     async fn set_paused(&self, guild_id: GuildId, handle: &Arc<dyn VoiceTrack>, paused: bool) {
         let mut guilds = self.guilds.lock().await;
@@ -853,6 +879,66 @@ mod tests {
                 .now_playing
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn seek_moves_the_current_track() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+        let track = backend.call_for(guild_id).unwrap().last_track();
+
+        registry
+            .seek(guild_id, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let status = track.status().await.unwrap();
+        assert_eq!(status.position, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn seek_is_clamped_short_of_the_track_length() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+        let track = backend.call_for(guild_id).unwrap().last_track();
+
+        registry
+            .seek(guild_id, Duration::from_secs(30))
+            .await
+            .unwrap();
+
+        let status = track.status().await.unwrap();
+        assert_eq!(status.position, Duration::from_secs(9));
+    }
+
+    #[tokio::test]
+    async fn seek_keeps_a_paused_track_paused() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+        let track = backend.call_for(guild_id).unwrap().last_track();
+        registry.pause(guild_id).await.unwrap();
+
+        registry
+            .seek(guild_id, Duration::from_secs(3))
+            .await
+            .unwrap();
+
+        assert!(track.is_paused());
+        assert_eq!(registry.is_paused(guild_id).await, Some(true));
+        assert_eq!(
+            track.status().await.unwrap().position,
+            Duration::from_secs(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn seek_with_nothing_playing_is_rejected() {
+        let (registry, _backend, guild_id) = joined_registry().await;
+        let result = registry.seek(guild_id, Duration::from_secs(3)).await;
+        assert!(matches!(result, Err(PlayerError::NothingPlaying)));
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ voice/registry/queue.rs      enqueue, enqueue_next, enqueue_many, remove_queue_t
                              move_queue_track, play_queue_track, clear_queue, shuffle
 voice/registry/playback.rs   spawn/run_start_sequence, try_start_playback,
                              resolve_for_start, commit_started_track, advance,
-                             pause, resume, skip, stop, get_volume/set_volume
+                             pause, resume, seek, skip, stop, get_volume/set_volume
 voice/registry/session.rs    join, leave, leave_if_idle, persist_session,
                              restore_session_if_new, load/apply persisted session
 voice/registry/radio.rs      toggle_radio, is_radio_enabled, maybe_spawn_radio_refill,
@@ -204,6 +204,7 @@ off; where it doesn't, a single cell covers both.
 | `toggle_radio` | flips the flag; refills if turning on with an empty queue | same | same | same | same |
 | `clear_queue` | `QueueEmpty`, or empties a queue left behind | `QueueEmpty` unless upcoming tracks exist; otherwise drops them, keeping the loading track at the head | drops upcoming, leaves `now_playing` (the head) alone; refills if radio is on | same as Playing | `QueueEmpty`, or empties a queue left behind |
 | `set_volume` | persists the setting; no current track to apply it to | persists; no handle yet | persists and applies to the current handle | same as Playing | persists |
+| `seek` | `NothingPlaying` | `NothingPlaying` (no handle yet) | moves the handle to the requested position, clamped to a second short of the track's end | same as Playing, stays paused | `NothingPlaying` |
 | `remove_queue_track` | `InvalidQueueIndex` | `InvalidQueueIndex` unless upcoming tracks exist | removes the track at that queue position, leaves `now_playing` alone, restarts the prefetch if the first upcoming track changed | same as Playing | `InvalidQueueIndex` |
 | `move_queue_track` | `InvalidQueueIndex` | `InvalidQueueIndex` unless upcoming tracks exist | moves an upcoming track from one queue position to another, shifting the tracks in between, leaves `now_playing` alone, restarts the prefetch if the first upcoming track changed | same as Playing | `InvalidQueueIndex` |
 | `play_queue_track` | `InvalidQueueIndex`, or starts the chosen track of a queue left behind | `InvalidQueueIndex` unless upcoming tracks exist | pulls the chosen upcoming track out of the queue, stops the current handle without requeuing it, and starts the chosen track immediately; every other upcoming track keeps its relative order | same as Playing | same as Empty |

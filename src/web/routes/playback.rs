@@ -30,6 +30,7 @@ pub fn routes() -> Router<WebState> {
         .route("/api/guilds/{guild_id}/shuffle", post(shuffle))
         .route("/api/guilds/{guild_id}/toggle-radio", post(toggle_radio))
         .route("/api/guilds/{guild_id}/volume", post(set_volume))
+        .route("/api/guilds/{guild_id}/seek", post(seek))
 }
 
 #[derive(Serialize)]
@@ -233,5 +234,25 @@ async fn set_volume(
         return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
     };
     let result = state.player.set_volume(guild_id, body.level).await;
+    respond_after(&state.player, guild_id, result).await
+}
+
+#[derive(Deserialize)]
+struct SeekRequest {
+    position_ms: u64,
+}
+
+async fn seek(
+    State(state): State<WebState>,
+    Path(guild_id): Path<String>,
+    Json(body): Json<SeekRequest>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+    let result = state
+        .player
+        .seek(guild_id, Duration::from_millis(body.position_ms))
+        .await;
     respond_after(&state.player, guild_id, result).await
 }

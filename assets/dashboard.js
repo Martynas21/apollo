@@ -29,6 +29,12 @@
   // renderQueue must not let the live snapshot feed reconcile row DOM/order
   // out from under the user's cursor.
   let queueDragActive = false;
+  // True from the moment the progress bar is pressed until the seek it ends
+  // in has been answered — while set, updateProgress must not let the
+  // snapshot feed pull the bar back to where playback was before the seek.
+  let seekActive = false;
+  let seekPointerId = null;
+  let lastSnapshot = null;
 
   const loginScreen = document.getElementById('login-screen');
   const dashboard = document.getElementById('dashboard');
@@ -870,6 +876,7 @@
   // to the track's remaining length, rather than polling every tick — the
   // bar then advances smoothly between snapshots with no JS interval.
   function updateProgress(snapshot) {
+    if (seekActive) return;
     const wrap = document.getElementById('np-progress');
     const fill = document.getElementById('np-progress-fill');
     const elapsedEl = document.getElementById('np-elapsed');
@@ -944,6 +951,7 @@
   }
 
   function renderSnapshot(snapshot) {
+    lastSnapshot = snapshot;
     setSnapshotStale(false);
     clearTimeout(staleTimer);
     staleTimer = setTimeout(() => setSnapshotStale(true), SNAPSHOT_STALE_MS);
@@ -1008,11 +1016,13 @@
       const body = await response.json();
       if (!response.ok) {
         showStatus(body.error || 'Something went wrong.', { isError: true });
-        return;
+        return null;
       }
       showStatus('');
       renderSnapshot(body);
+      return body;
     } catch (err) { /* showLogin already handled unauthorized */ }
+    return null;
   }
 
   document.getElementById('toggle-btn').addEventListener('click', () => togglePauseOrResume());
@@ -1090,6 +1100,87 @@
       });
     }, 250);
   });
+
+  // Click-to-jump and drag-to-scrub on the progress bar. From press to
+  // release the pointer owns the fill and the elapsed label; the seek's own
+  // snapshot (or the last live one, if the seek failed) then takes them back.
+  const seekBar = document.getElementById('np-progress');
+
+  function seekFractionAt(clientX) {
+    const rect = seekBar.getBoundingClientRect();
+    if (rect.width <= 0) return 0;
+    return Math.min(Math.max((clientX - rect.left) / rect.width, 0), 1);
+  }
+
+  // The track length in seconds while there is something to seek in.
+  function seekableDuration() {
+    if (!lastSnapshot || !lastSnapshot.track) return null;
+    if (lastSnapshot.state !== 'playing' && lastSnapshot.state !== 'paused') return null;
+    const duration = lastSnapshot.track.duration_secs;
+    return duration > 0 ? duration : null;
+  }
+
+  function placeSeekTime(fraction, duration) {
+    document.getElementById('np-progress-time').textContent = formatDuration(fraction * duration);
+    seekBar.style.setProperty('--seek-x', `${fraction * 100}%`);
+  }
+
+  function showSeekPreview(fraction, duration) {
+    const fill = document.getElementById('np-progress-fill');
+    fill.style.transition = 'none';
+    fill.style.width = `${fraction * 100}%`;
+    document.getElementById('np-elapsed').textContent = formatDuration(fraction * duration);
+    placeSeekTime(fraction, duration);
+  }
+
+  seekBar.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || seekActive) return;
+    const duration = seekableDuration();
+    if (duration == null) return;
+    event.preventDefault();
+    seekBar.setPointerCapture(event.pointerId);
+    seekPointerId = event.pointerId;
+    seekActive = true;
+    seekBar.classList.add('seeking');
+    showSeekPreview(seekFractionAt(event.clientX), duration);
+  });
+
+  seekBar.addEventListener('pointermove', (event) => {
+    const duration = seekableDuration();
+    if (duration == null) return;
+    const fraction = seekFractionAt(event.clientX);
+    if (event.pointerId === seekPointerId) showSeekPreview(fraction, duration);
+    else placeSeekTime(fraction, duration);
+  });
+
+  seekBar.addEventListener('pointerup', (event) => {
+    if (event.pointerId !== seekPointerId) return;
+    const duration = seekableDuration();
+    finishSeek(duration == null ? null : seekFractionAt(event.clientX) * duration);
+  });
+
+  seekBar.addEventListener('pointercancel', (event) => {
+    if (event.pointerId === seekPointerId) finishSeek(null);
+  });
+
+  async function finishSeek(targetSecs) {
+    seekPointerId = null;
+    seekBar.classList.remove('seeking');
+    let snapshot = null;
+    if (targetSecs != null) {
+      snapshot = await sendAction('seek', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ position_ms: Math.round(targetSecs * 1000) }),
+      });
+    }
+    seekActive = false;
+    // sendAction rendered its snapshot while the guard was still up, so the
+    // bar is redrawn here: from the seek's reply, or from the last live
+    // snapshot when there is none.
+    const source = snapshot || lastSnapshot;
+    if (source) updateProgress(source);
+  }
 
   // ---- Join-a-voice-channel modal ----
   // Surfaced reactively: a queue/playlist action fails with PlayerError::

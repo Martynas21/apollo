@@ -52,6 +52,11 @@ pub enum Request {
         guild_id: u64,
         track_id: Uuid,
     },
+    Seek {
+        guild_id: u64,
+        track_id: Uuid,
+        position_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

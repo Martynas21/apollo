@@ -163,8 +163,9 @@
   </div>
 
   <footer class="player-bar relative z-10 shrink-0 grid items-center gap-2 px-2 bg-surface md:gap-4 md:px-4" id="player-bar">
-    <div class="np-progress absolute inset-x-0 top-0" id="np-progress">
-      <div class="np-progress-track absolute inset-x-0 top-0"><div class="np-progress-fill" id="np-progress-fill"></div></div>
+    <div class="np-progress absolute inset-x-0 cursor-pointer touch-none" id="np-progress">
+      <div class="np-progress-track absolute inset-x-0"><div class="np-progress-fill" id="np-progress-fill"><span class="np-progress-orb"></span></div></div>
+      <span class="np-progress-time" id="np-progress-time"></span>
     </div>
 
     <div class="flex items-center gap-0 sm:gap-1">

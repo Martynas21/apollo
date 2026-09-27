@@ -337,13 +337,32 @@ select.input { cursor: pointer; }
 }
 #np-elapsed:empty ~ .time-sep { display: none; }
 #radio-btn.active { background: none; color: var(--color-accent); }
-/* The progress line runs along the bar's top edge. The fill's width and
-   transition are driven from updateProgress. */
-.np-progress { display: none; height: 4px; }
-.np-progress-track { height: 2px; background: var(--color-line-strong); transition: height .1s ease; }
-.player-bar:hover .np-progress-track { height: 4px; }
+/* The progress line runs along the bar's top edge, centred in a taller hit
+   area that straddles the edge so it is easy to press. The fill's width and
+   transition are driven from updateProgress; the orb rides the fill's right
+   edge, and the time bubble follows the pointer through --seek-x. */
+.np-progress { display: none; height: 16px; top: -8px; }
+.np-progress-track {
+  top: 50%; height: 2px; background: var(--color-line-strong);
+  transform: translateY(-50%); transition: height .1s ease;
+}
+.player-bar:hover .np-progress-track, .np-progress.seeking .np-progress-track { height: 4px; }
 .np-progress-fill { position: absolute; inset: 0 auto 0 0; width: 0%; background: var(--color-accent); }
 .snapshot-stale .np-progress-fill { opacity: .45; }
+.np-progress-orb {
+  position: absolute; right: 0; top: 50%; width: 12px; height: 12px; border-radius: 50%;
+  background: var(--color-accent); transform: translate(50%, -50%) scale(0); transition: transform .12s ease;
+}
+.player-bar:hover .np-progress-orb { transform: translate(50%, -50%) scale(1); }
+.np-progress.seeking .np-progress-orb { transform: translate(50%, -50%) scale(1.25); }
+.np-progress-time {
+  position: absolute; bottom: 100%; left: var(--seek-x, 0%); transform: translate(-50%, -2px);
+  padding: 2px 6px; border-radius: var(--radius); background: var(--color-toast); color: var(--color-toast-text);
+  font-size: var(--text-xs); font-variant-numeric: tabular-nums; white-space: nowrap;
+  opacity: 0; pointer-events: none; transition: opacity .1s ease;
+}
+.np-progress-time:empty { display: none; }
+.np-progress:hover .np-progress-time, .np-progress.seeking .np-progress-time { opacity: 1; }
 .np-hero, .np-empty { display: none; }
 .np-art { background: linear-gradient(135deg, var(--color-accent), var(--color-accent-2)); }
 .np-art svg { width: 22px; height: 22px; }

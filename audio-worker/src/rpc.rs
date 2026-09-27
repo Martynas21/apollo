@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use apollo_ipc::proto::{Envelope, Event as IpcEvent, Request, Response};
 use apollo_ipc::{read_frame, write_frame};
@@ -50,6 +51,16 @@ async fn dispatch(sessions: &Sessions, request: Request) -> Result<Response, Str
             .status(guild_id, track_id)
             .await
             .map(Response::Status),
+        Request::Seek {
+            guild_id,
+            track_id,
+            position_ms,
+        } => {
+            sessions
+                .seek(guild_id, track_id, Duration::from_millis(position_ms))
+                .await?;
+            Ok(Response::Ok)
+        }
     }
 }
 

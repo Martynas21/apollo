@@ -268,6 +268,25 @@ async fn a_malformed_guild_id_is_rejected_with_bad_request_and_the_shared_error_
 }
 
 #[tokio::test]
+async fn seek_with_nothing_playing_is_a_conflict_with_the_shared_error_shape() {
+    let app = test_app().await;
+    let token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)
+        .await
+        .expect("admin login should succeed");
+
+    let response = request(
+        &app,
+        "POST",
+        "/api/guilds/111/seek",
+        Some(&token),
+        Some(json!({ "position_ms": 1000 })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(json_body(response).await["error"], "nothing is playing");
+}
+
+#[tokio::test]
 async fn a_guild_pinned_user_is_confined_to_that_guild_on_every_guild_scoped_route() {
     let app = test_app().await;
     let admin_token = login(&app, ADMIN_USERNAME, ADMIN_PASSWORD)

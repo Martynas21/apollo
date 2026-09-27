@@ -74,6 +74,8 @@ pub trait VoiceTrack: Send + Sync {
     async fn stop(&self) -> Result<(), String>;
     async fn pause(&self) -> Result<(), String>;
     async fn resume(&self) -> Result<(), String>;
+    /// Moves playback to `position` within the track.
+    async fn seek(&self, position: Duration) -> Result<(), String>;
     fn notify_when_finished(&self, guild_id: GuildId, events: Arc<dyn VoiceEvents>);
     async fn status(&self) -> Option<TrackStatus>;
 }

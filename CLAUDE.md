@@ -64,7 +64,7 @@ Three-crate Cargo workspace:
   `Response`/`Event` enums (`proto.rs`) and DTOs (`dto.rs`). `apollo` is the
   IPC client (`src/voice/ipc_backend.rs`'s `VoiceBackend`), `apollo-audio-worker`
   the server (`audio-worker/src/rpc.rs`). Requests are `Join`/`Leave`/`Play`/
-  `Pause`/`Resume`/`Stop`/`SetVolume`/`Status`, all keyed by `guild_id` +
+  `Pause`/`Resume`/`Stop`/`SetVolume`/`Status`/`Seek`, all keyed by `guild_id` +
   `track_id` (a `Uuid`, minted per-track so stale responses/events for an
   already-superseded track can be detected and dropped); worker→apollo
   `Event`s (`TrackFinished`/`TrackErrored`/`ConnectionLost`) drive queue
