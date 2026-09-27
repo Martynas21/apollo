@@ -1239,9 +1239,9 @@
     return null;
   }
 
-  // Faithful mirror of the backend's looks_like_playlist_url
-  // (src/commands/playback.rs) so "is this a playlist link" is decided
-  // identically client-side and server-side.
+  // A YouTube link carrying a `list` parameter (and no video id, which
+  // extractVideoId handles first) is previewed as a playlist rather than
+  // searched for; the server re-validates the host before listing it.
   function looksLikePlaylistUrl(input) {
     let url;
     try { url = new URL(input); } catch { return false; }
@@ -1256,6 +1256,7 @@
   const searchResults = document.getElementById('search-results');
   const searchEmptyNote = document.getElementById('search-empty-note');
   const searchLoadingNote = document.getElementById('search-loading-note');
+  const searchLoadingText = document.getElementById('search-loading-text');
 
   function openSearchDropdown() {
     searchDropdown.classList.add('open');
@@ -1274,31 +1275,77 @@
     closeSearchDropdown();
   }
 
-  function createSearchRow(track) {
-    const row = createTrackRow(track);
+  // Every search row carries `_activate`, the action its Add button and the
+  // Enter key share: a track row adds that track, a playlist row imports the
+  // playlist and starts it.
+  function appendSearchAddButton(row) {
     const addBtn = document.createElement('button');
     addBtn.type = 'button';
     addBtn.className = 'outline-btn';
     addBtn.textContent = 'Add';
-    addBtn.addEventListener('click', () => {
-      addToQueue(row._videoId, row._title);
-      closeSearchDropdown();
-    });
+    addBtn.addEventListener('click', () => row._activate(addBtn));
     row.appendChild(addBtn);
-    row._videoId = track.video_id;
-    row._title = track.title;
+  }
+
+  function createSearchRow(track) {
+    const row = createTrackRow(track);
+    appendSearchAddButton(row);
+    updateSearchRow(row, track);
     return row;
   }
 
   function updateSearchRow(row, track) {
     updateTrackRowContent(row, track);
-    row._videoId = track.video_id;
-    row._title = track.title;
+    row._activate = () => {
+      addToQueue(track.video_id, track.title);
+      closeSearchDropdown();
+    };
+  }
+
+  function playlistCountLabel(trackCount) {
+    if (trackCount == null) return 'Playlist';
+    return `Playlist · ${trackCount} track${trackCount === 1 ? '' : 's'}`;
+  }
+
+  function createPlaylistSearchRow(preview) {
+    const row = document.createElement('div');
+    row.className = 'compact-row relative flex items-center gap-3 min-h-14 p-2 rounded shrink-0 overflow-hidden hover:bg-hover';
+
+    const thumb = document.createElement('div');
+    thumb.className = 'compact-thumb thumb relative size-10 rounded shrink-0 overflow-hidden';
+    applyThumbnail(thumb, preview.thumbnail_video_id, preview.url);
+    row.appendChild(thumb);
+
+    const meta = document.createElement('div');
+    meta.className = 'compact-meta min-w-0 flex-1 flex flex-col gap-0.5';
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'compact-title text-base truncate';
+    titleSpan.textContent = preview.name;
+    meta.appendChild(titleSpan);
+    const sub = document.createElement('div');
+    sub.className = 'compact-channel text-sm text-secondary truncate';
+    sub.textContent = playlistCountLabel(preview.track_count);
+    meta.appendChild(sub);
+    row.appendChild(meta);
+
+    appendSearchAddButton(row);
+    row._activate = (btn) => importAndPlayPlaylist(preview.url, btn);
+    return row;
   }
 
   function renderSearchResults(tracks) {
     searchEmptyNote.style.display = tracks.length === 0 ? 'block' : 'none';
     reconcileList(searchResults, tracks, (track) => track.video_id, createSearchRow, updateSearchRow);
+    openSearchDropdown();
+    setSearchActiveIndex(-1);
+  }
+
+  function renderPlaylistPreview(preview) {
+    searchEmptyNote.style.display = 'none';
+    searchResults.innerHTML = '';
+    const row = createPlaylistSearchRow(preview);
+    searchResults.appendChild(row);
+    animateEnter(row);
     openSearchDropdown();
     setSearchActiveIndex(-1);
   }
@@ -1317,27 +1364,44 @@
     document.getElementById('search-bar').classList.toggle('loading', loading);
   }
 
-  async function runSearch(query, isLink) {
+  function showSearchLoading(text) {
+    searchLoadingText.textContent = text;
+    searchLoadingNote.style.display = 'flex';
+    searchEmptyNote.style.display = 'none';
+    openSearchDropdown();
+  }
+
+  // Runs one search-bar lookup, guarded by `searchSeq` so a slow response
+  // never lands over a newer query. `path` is the API call, `onResult` is
+  // handed the parsed body of a successful response.
+  async function runSearchLookup(path, failureMessage, onResult) {
     const seq = ++searchSeq;
     setSearchBarLoading(true);
-    if (!isLink) {
-      searchLoadingNote.style.display = 'flex';
-      searchEmptyNote.style.display = 'none';
-      openSearchDropdown();
-    }
     try {
-      const response = await api(`/api/guilds/${currentGuildId}/search?q=${encodeURIComponent(query)}`);
+      const response = await api(path);
       const body = await response.json();
       if (seq !== searchSeq) return; // a newer search superseded this one
       searchLoadingNote.style.display = 'none';
       if (!response.ok) {
-        showStatus(body.error || 'Search failed.', { isError: true });
+        showStatus(body.error || failureMessage, { isError: true });
         searchResults.innerHTML = '';
         searchEmptyNote.style.display = 'none';
         closeSearchDropdown();
         return;
       }
       showStatus('');
+      onResult(body);
+    } catch (err) {
+      if (seq === searchSeq) searchLoadingNote.style.display = 'none';
+    } finally {
+      if (seq === searchSeq) setSearchBarLoading(false);
+    }
+  }
+
+  function runSearch(query, isLink) {
+    if (!isLink) showSearchLoading('Searching…');
+    const path = `/api/guilds/${currentGuildId}/search?q=${encodeURIComponent(query)}`;
+    return runSearchLookup(path, 'Search failed.', (body) => {
       if (isLink && Array.isArray(body) && body.length > 0) {
         // Nothing to disambiguate for a recognized link — add it straight away.
         searchInput.value = '';
@@ -1348,11 +1412,13 @@
         return;
       }
       renderSearchResults(body);
-    } catch (err) {
-      if (seq === searchSeq) searchLoadingNote.style.display = 'none';
-    } finally {
-      if (seq === searchSeq) setSearchBarLoading(false);
-    }
+    });
+  }
+
+  function runPlaylistPreview(url) {
+    showSearchLoading('Loading playlist…');
+    const path = `/api/guilds/${currentGuildId}/playlists/preview?url=${encodeURIComponent(url)}`;
+    return runSearchLookup(path, 'Could not load that playlist.', renderPlaylistPreview);
   }
 
   searchInput.addEventListener('input', () => {
@@ -1369,15 +1435,15 @@
     const isLink = extractVideoId(query) !== null;
     const isPlaylistLink = !isLink && looksLikePlaylistUrl(query);
     if (isLink || isPlaylistLink) {
-      // There's nothing meaningful to show while a link resolves — clear any
-      // stale result list immediately instead of leaving it visible mid-flight.
+      // A link resolves to something unrelated to any earlier results — clear
+      // the stale list immediately instead of leaving it visible mid-flight.
       searchResults.innerHTML = '';
       searchEmptyNote.style.display = 'none';
       closeSearchDropdown();
       searchActiveIndex = -1;
     }
     if (isPlaylistLink) {
-      searchDebounce = setTimeout(() => importPlaylistFromSearch(query), 300);
+      searchDebounce = setTimeout(() => runPlaylistPreview(query), 300);
       return;
     }
     searchDebounce = setTimeout(() => runSearch(query, isLink), 300);
@@ -1394,10 +1460,9 @@
       setSearchActiveIndex(searchActiveIndex - 1);
     } else if (event.key === 'Enter') {
       const row = searchResults.children[searchActiveIndex === -1 ? 0 : searchActiveIndex];
-      if (row) {
+      if (row && row._activate) {
         event.preventDefault();
-        addToQueue(row._videoId, row._title);
-        closeSearchDropdown();
+        row._activate();
       }
     }
   });
@@ -1429,8 +1494,12 @@
     }
   }
 
-  async function importPlaylistFromSearch(url) {
+  // Picking a playlist from the search dropdown saves it to the guild's
+  // playlists and queues it in one go, so the row behaves like a track's Add.
+  async function importAndPlayPlaylist(url, btn) {
+    setButtonBusy(btn, true);
     setSearchBarLoading(true);
+    let imported = null;
     try {
       const response = await api(`/api/guilds/${currentGuildId}/playlists/import`, {
         method: 'POST',
@@ -1442,13 +1511,16 @@
         showStatus(body.error || 'Could not import that playlist.', { isError: true });
         return;
       }
-      searchInput.value = '';
-      showStatus(`Imported "${body.name}" (${body.track_count} track${body.track_count === 1 ? '' : 's'}).`);
-      loadPlaylists(currentGuildId);
+      imported = body;
     } catch (err) { /* showLogin already handled unauthorized */
     } finally {
       setSearchBarLoading(false);
+      setButtonBusy(btn, false);
     }
+    if (!imported) return;
+    clearSearch();
+    loadPlaylists(currentGuildId);
+    await playPlaylist(imported.id, imported.name);
   }
 
   async function playTrackNow(videoId, title, btn) {

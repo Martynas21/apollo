@@ -19,6 +19,15 @@ pub struct PlaylistListing {
     pub tracks: Vec<Track>,
 }
 
+/// What a playlist link resolves to before it is imported: enough to show it
+/// as a search result without listing every track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistPreview {
+    pub title: Option<String>,
+    pub track_count: Option<usize>,
+    pub thumbnail_video_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedTrack {
     pub track: Track,

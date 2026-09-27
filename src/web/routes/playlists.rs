@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -15,6 +15,10 @@ use crate::web::routes::playback::respond_after;
 pub fn routes() -> Router<WebState> {
     Router::new()
         .route("/api/guilds/{guild_id}/playlists", get(list_playlists))
+        .route(
+            "/api/guilds/{guild_id}/playlists/preview",
+            get(preview_playlist),
+        )
         .route(
             "/api/guilds/{guild_id}/playlists/import",
             post(import_playlist),
@@ -79,6 +83,40 @@ async fn list_playlists(State(state): State<WebState>, Path(guild_id): Path<Stri
     }
 
     Json(playlists_json).into_response()
+}
+
+#[derive(Deserialize)]
+struct PreviewPlaylistQuery {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct PlaylistPreviewJson {
+    name: String,
+    url: String,
+    track_count: Option<usize>,
+    thumbnail_video_id: Option<String>,
+}
+
+async fn preview_playlist(
+    State(state): State<WebState>,
+    Path(guild_id): Path<String>,
+    Query(params): Query<PreviewPlaylistQuery>,
+) -> Response {
+    let Some(_guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+
+    match state.youtube.preview_playlist(&params.url).await {
+        Ok(preview) => Json(PlaylistPreviewJson {
+            name: preview.title.unwrap_or_else(|| params.url.clone()),
+            url: params.url,
+            track_count: preview.track_count,
+            thumbnail_video_id: preview.thumbnail_video_id,
+        })
+        .into_response(),
+        Err(err) => error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    }
 }
 
 #[derive(Deserialize)]

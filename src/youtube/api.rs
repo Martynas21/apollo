@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::model::{PlaylistListing, Track};
+use crate::model::{PlaylistListing, PlaylistPreview, Track};
 use crate::youtube::ytdlp::{STDERR_TRUNCATE_LEN, YtDlp, YtDlpError, truncate_tail};
 
 const SEARCH_LIMIT: usize = 5;
@@ -98,6 +98,8 @@ struct YtDlpEntry {
     duration: Option<f64>,
     #[serde(default)]
     playlist_title: Option<String>,
+    #[serde(default)]
+    playlist_count: Option<u64>,
 }
 
 fn track_from_entry(entry: YtDlpEntry) -> Option<Track> {
@@ -140,6 +142,20 @@ fn first_playlist_title(stdout: &str) -> Option<String> {
             .ok()
             .and_then(|entry| entry.playlist_title)
             .filter(|title| !title.is_empty())
+    })
+}
+
+// A flat listing cut to its first entry still carries the playlist's title
+// and total entry count on that entry, which is all a preview needs. The
+// first entry doubles as the cover, whether or not it is playable.
+fn playlist_preview_from_stdout(stdout: &str) -> Option<PlaylistPreview> {
+    let first = parse_entries(stdout).next()?;
+    Some(PlaylistPreview {
+        title: first.playlist_title.filter(|title| !title.is_empty()),
+        track_count: first
+            .playlist_count
+            .and_then(|count| usize::try_from(count).ok()),
+        thumbnail_video_id: first.id.filter(|id| !id.is_empty()),
     })
 }
 
@@ -272,6 +288,23 @@ impl YouTubeClient {
         })
     }
 
+    pub async fn preview_playlist(
+        &self,
+        playlist_url_or_id: &str,
+    ) -> Result<PlaylistPreview, YouTubeApiError> {
+        let target = build_playlist_target(playlist_url_or_id)?;
+        let stdout = self
+            .run(
+                &["--flat-playlist", "--no-warnings", "--playlist-end", "1"],
+                &target,
+                YT_DLP_TIMEOUT,
+            )
+            .await?;
+        playlist_preview_from_stdout(&stdout).ok_or_else(|| {
+            YouTubeApiError::YtDlpFailed("no metadata returned for playlist".to_string())
+        })
+    }
+
     pub async fn hydrate_videos(&self, video_ids: &[&str]) -> Result<Vec<Track>, YouTubeApiError> {
         if video_ids.is_empty() {
             return Ok(Vec::new());
@@ -396,6 +429,7 @@ mod tests {
             uploader: None,
             duration: Some(f64::NAN),
             playlist_title: None,
+            playlist_count: None,
         };
         assert_eq!(track_from_entry(entry).unwrap().duration, None);
     }
@@ -409,6 +443,7 @@ mod tests {
             uploader: None,
             duration: Some(f64::INFINITY),
             playlist_title: None,
+            playlist_count: None,
         };
         assert_eq!(track_from_entry(entry).unwrap().duration, None);
     }
@@ -422,6 +457,7 @@ mod tests {
             uploader: None,
             duration: Some(f64::MAX),
             playlist_title: None,
+            playlist_count: None,
         };
         assert_eq!(track_from_entry(entry).unwrap().duration, None);
     }
@@ -506,6 +542,37 @@ mod tests {
     fn first_playlist_title_skips_blank_and_unparseable_lines() {
         let stdout = "\nnot json\n{\"id\": \"a\", \"playlist_title\": \"Chill Mix\"}\n";
         assert_eq!(first_playlist_title(stdout), Some("Chill Mix".to_string()));
+    }
+
+    #[test]
+    fn playlist_preview_reads_title_count_and_cover_from_first_entry() {
+        let stdout = "{\"id\": \"a\", \"playlist_title\": \"Chill Mix\", \"playlist_count\": 42}\n";
+        assert_eq!(
+            playlist_preview_from_stdout(stdout),
+            Some(PlaylistPreview {
+                title: Some("Chill Mix".to_string()),
+                track_count: Some(42),
+                thumbnail_video_id: Some("a".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn playlist_preview_tolerates_missing_fields() {
+        let stdout = "{\"id\": \"\", \"playlist_title\": \"\"}\n";
+        assert_eq!(
+            playlist_preview_from_stdout(stdout),
+            Some(PlaylistPreview {
+                title: None,
+                track_count: None,
+                thumbnail_video_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn playlist_preview_none_without_any_entry() {
+        assert_eq!(playlist_preview_from_stdout("\nnot json\n"), None);
     }
 
     #[test]

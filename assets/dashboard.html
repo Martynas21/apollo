@@ -61,7 +61,7 @@
       </div>
       <div class="search-dropdown absolute inset-x-0 z-20 bg-surface rounded-lg p-2 shadow-menu" id="search-dropdown">
         <div class="flex flex-col max-h-90 overflow-y-auto overflow-x-hidden" id="search-results"></div>
-        <div class="items-center gap-2 text-sm text-secondary my-1 mx-2" id="search-loading-note" style="display:none"><div class="search-spinner" style="display:block"></div>Searching…</div>
+        <div class="items-center gap-2 text-sm text-secondary my-1 mx-2" id="search-loading-note" style="display:none"><div class="search-spinner" style="display:block"></div><span id="search-loading-text">Searching…</span></div>
         <div class="text-sm text-secondary my-1 mx-2" id="search-empty-note" style="display:none">No matches — try a different search term.</div>
       </div>
     </div>
@@ -112,7 +112,7 @@
     </nav>
 
     <main class="flex-1 min-w-0 overflow-y-auto border border-b-0 rounded-t-xl" id="main">
-      <div class="page flex flex-col min-h-full px-4 pt-2 pb-6 sm:px-6 sm:pb-8" id="page-dashboard-body">
+      <div class="page flex flex-col min-h-full px-4 pt-4 pb-6 sm:px-6 sm:pb-8" id="page-dashboard-body">
         <section class="flex flex-col min-w-0">
           <div class="flex items-end justify-between gap-4 mb-4"><h2 class="text-xl font-bold leading-tight sm:text-2xl">Playlists</h2></div>
           <div class="flex gap-4 overflow-x-auto px-1 pt-1 pb-3" id="playlist-row"></div>
@@ -131,7 +131,7 @@
         </section>
       </div>
 
-      <div class="page flex flex-col min-h-full px-4 pt-2 pb-6 sm:px-6 sm:pb-8" id="page-users" style="display:none">
+      <div class="page flex flex-col min-h-full px-4 pt-4 pb-6 sm:px-6 sm:pb-8" id="page-users" style="display:none">
         <section class="flex flex-col min-w-0">
           <div class="flex items-end justify-between gap-4 mb-4">
             <h2 class="text-xl font-bold leading-tight sm:text-2xl">Users</h2>
