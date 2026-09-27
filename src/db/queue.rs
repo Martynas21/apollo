@@ -303,6 +303,8 @@ pub async fn queue_replace_all(
         .await
         .context("failed to start queue replace transaction")?;
 
+    ensure_guild_session_row(&mut tx, guild_id).await?;
+
     sqlx::query("DELETE FROM guild_session_queue WHERE guild_id = ?1")
         .bind(guild_id)
         .execute(&mut *tx)

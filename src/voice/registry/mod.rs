@@ -256,10 +256,11 @@ mod tests {
         MoveQueueTrack,
         EnqueueNext,
         PlayQueueTrack,
+        PlayNow,
     }
 
     impl MatrixAction {
-        const ALL: [MatrixAction; 12] = [
+        const ALL: [MatrixAction; 13] = [
             MatrixAction::Pause,
             MatrixAction::Resume,
             MatrixAction::Skip,
@@ -272,6 +273,7 @@ mod tests {
             MatrixAction::MoveQueueTrack,
             MatrixAction::EnqueueNext,
             MatrixAction::PlayQueueTrack,
+            MatrixAction::PlayNow,
         ];
 
         async fn invoke(&self, registry: &PlayerRegistry, guild_id: GuildId) {
@@ -312,6 +314,9 @@ mod tests {
                 MatrixAction::PlayQueueTrack => {
                     let _ = registry.play_queue_track(guild_id, 0).await;
                 }
+                MatrixAction::PlayNow => {
+                    let _ = registry.play_now(guild_id, queued("z")).await;
+                }
             }
         }
 
@@ -329,6 +334,7 @@ mod tests {
                 MatrixAction::MoveQueueTrack => "move_queue_track",
                 MatrixAction::EnqueueNext => "enqueue_next",
                 MatrixAction::PlayQueueTrack => "play_queue_track",
+                MatrixAction::PlayNow => "play_now",
             }
         }
     }

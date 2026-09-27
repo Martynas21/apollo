@@ -10,6 +10,7 @@ use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serenity::all::GuildId;
 
+use crate::model::QueuedTrack;
 use crate::voice::{PlayerError, PlayerRegistry};
 use crate::web::WebState;
 use crate::web::response::{
@@ -24,6 +25,7 @@ pub fn routes() -> Router<WebState> {
         .route("/api/guilds/{guild_id}/ws", get(now_playing_ws))
         .route("/api/guilds/{guild_id}/toggle-pause", post(toggle_pause))
         .route("/api/guilds/{guild_id}/skip", post(skip))
+        .route("/api/guilds/{guild_id}/play", post(play_now))
         .route("/api/guilds/{guild_id}/stop", post(stop))
         .route("/api/guilds/{guild_id}/shuffle", post(shuffle))
         .route("/api/guilds/{guild_id}/toggle-radio", post(toggle_radio))
@@ -163,6 +165,33 @@ async fn skip(State(state): State<WebState>, Path(guild_id): Path<String>) -> Re
         return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
     };
     let result = state.player.skip(guild_id).await;
+    respond_after(&state.player, guild_id, result).await
+}
+
+#[derive(Deserialize)]
+struct PlayNowRequest {
+    video_id: String,
+}
+
+async fn play_now(
+    State(state): State<WebState>,
+    Path(guild_id): Path<String>,
+    Json(body): Json<PlayNowRequest>,
+) -> Response {
+    let Some(guild_id) = parse_guild_id(&guild_id) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid guild id");
+    };
+
+    let track = match state.youtube.get_video(&body.video_id).await {
+        Ok(track) => track,
+        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    let queued = QueuedTrack {
+        track,
+        requested_by: state.cache.current_user().id,
+    };
+    let result = state.player.play_now(guild_id, queued).await;
     respond_after(&state.player, guild_id, result).await
 }
 

@@ -280,20 +280,38 @@ select.input { cursor: pointer; }
 .playlist-chip.row-exit {
   opacity: 0; transform: scale(.94); flex-basis: 0; max-width: 0; margin-right: 0; overflow: hidden;
 }
-.playlist-cover::after { content: ''; position: absolute; inset: 0; background: rgba(0,0,0,.45); opacity: 0; transition: opacity .15s ease; }
-.playlist-chip:hover .playlist-cover::after, .playlist-chip:focus-within .playlist-cover::after { opacity: 1; }
-/* The actions sit across the cover's bottom edge and only show on
+/* The cover is a button that plays the playlist; a dim overlay (drawn as
+   ::before so the shared busy spinner keeps ::after) and a play glyph
+   appear on hover/focus, and always on touch screens. */
+.playlist-cover { color: var(--color-text); }
+.playlist-cover::before { content: ''; position: absolute; inset: 0; background: rgba(0,0,0,.45); opacity: 0; transition: opacity .15s ease; }
+.playlist-chip:hover .playlist-cover::before, .playlist-chip:focus-within .playlist-cover::before { opacity: 1; }
+.playlist-cover:disabled { opacity: 1; cursor: default; }
+.playlist-cover.btn-busy::before { opacity: 1; }
+.playlist-cover.btn-busy::after { width: 20px; height: 20px; margin: -10px 0 0 -10px; }
+/* Refresh/remove sit across the cover's bottom edge and only show on
    hover/focus (always, on touch screens). */
-.playlist-actions, .playlist-chip > .primary-btn {
-  position: absolute; left: calc(var(--spacing) * 2); top: calc(var(--card-w) - 40px);
-  opacity: 0; transition: opacity .15s ease;
+.playlist-actions {
+  position: absolute; left: calc(var(--spacing) * 2); right: calc(var(--spacing) * 2);
+  top: calc(var(--card-w) - 40px); opacity: 0; transition: opacity .15s ease;
 }
-.playlist-actions { right: calc(var(--spacing) * 2); }
 .playlist-actions .mini-icon-btn { background: rgba(0,0,0,.6); color: var(--color-text); }
 .playlist-actions .mini-icon-btn:hover:not(:disabled) { background: rgba(0,0,0,.8); }
-.playlist-chip:hover .playlist-actions, .playlist-chip:focus-within .playlist-actions,
-.playlist-chip:hover > .primary-btn, .playlist-chip:focus-within > .primary-btn { opacity: 1; }
-@media (hover: none) { .playlist-actions, .playlist-chip > .primary-btn { opacity: 1; } }
+.playlist-chip:hover .playlist-actions, .playlist-chip:focus-within .playlist-actions { opacity: 1; }
+@media (hover: none) { .playlist-actions { opacity: 1; } }
+
+/* -- Click-to-play artwork -- */
+/* The glyph a playlist cover or a most played row's thumbnail shows over
+   its artwork: hidden until the card/row is hovered or focused, hidden
+   again while the busy spinner is up. */
+.cover-play { z-index: 1; opacity: 0; transition: opacity .15s ease; pointer-events: none; }
+.cover-play svg { filter: drop-shadow(0 1px 3px rgba(0,0,0,.6)); }
+.compact-thumb .cover-play svg { width: 28px; height: 28px; }
+.compact-thumb .cover-play { background: rgba(0,0,0,.45); color: var(--color-text); }
+.playlist-chip:hover .cover-play, .playlist-chip:focus-within .cover-play,
+.play-row:hover .cover-play, .play-row:focus-visible .cover-play { opacity: 1; }
+@media (hover: none) { .playlist-chip .cover-play { opacity: 1; } }
+.btn-busy .cover-play { opacity: 0; }
 
 /* -- Player bar -- */
 .player-bar {
@@ -515,7 +533,6 @@ select.input { cursor: pointer; }
 .mb-4 { margin-bottom: calc(var(--spacing) * 4); }
 .mb-7 { margin-bottom: calc(var(--spacing) * 7); }
 .ml-2 { margin-left: calc(var(--spacing) * 2); }
-.mr-auto { margin-right: auto; }
 
 /* Typography */
 .text-2xs { font-size: var(--text-2xs); }

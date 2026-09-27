@@ -245,13 +245,39 @@ impl PlayerRegistry {
     /// queue, dropping the track it replaces instead of requeuing it (like
     /// `skip`, but landing on a chosen track rather than the front of the
     /// queue), and starts it immediately. Every other upcoming track keeps
-    /// its relative order behind the new current track. Bumping the epoch
-    /// invalidates any start sequence still in flight for the track that was
-    /// buffering, the same guard `stop()` uses.
+    /// its relative order behind the new current track.
     pub async fn play_queue_track(
         &self,
         guild_id: GuildId,
         index: usize,
+    ) -> Result<(), PlayerError> {
+        self.jump_to(guild_id, |items, offset| {
+            let at = upcoming_index(items, offset, index).ok_or(PlayerError::InvalidQueueIndex)?;
+            Ok(items.remove(at))
+        })
+        .await
+    }
+
+    /// Starts a track that is not in the queue right away: it takes the
+    /// head of the queue from the current track, which is dropped like
+    /// `skip` drops it, and the upcoming tracks stay queued behind it.
+    pub async fn play_now(
+        &self,
+        guild_id: GuildId,
+        queued: QueuedTrack,
+    ) -> Result<(), PlayerError> {
+        self.jump_to(guild_id, |_, _| Ok(queued)).await
+    }
+
+    /// Replaces the head of the queue with the track `choose` picks out of
+    /// (or adds to) the upcoming list, stops whatever is playing without
+    /// requeuing it and starts the chosen track. Bumping the epoch
+    /// invalidates any start sequence still in flight for the track that
+    /// was buffering, the same guard `stop()` uses.
+    async fn jump_to(
+        &self,
+        guild_id: GuildId,
+        choose: impl FnOnce(&mut Vec<QueuedTrack>, usize) -> Result<QueuedTrack, PlayerError>,
     ) -> Result<(), PlayerError> {
         let guild_id_str = guild_id.to_string();
         let (handle, call, epoch, target) = {
@@ -263,10 +289,7 @@ impl PlayerRegistry {
                 .await
                 .map_err(storage_error)?;
             let offset = state.upcoming_offset();
-            let Some(at) = upcoming_index(&items, offset, index) else {
-                return Err(PlayerError::InvalidQueueIndex);
-            };
-            let target = items.remove(at);
+            let target = choose(&mut items, offset)?;
             if offset > 0 && !items.is_empty() {
                 items.remove(0);
             }
@@ -282,6 +305,7 @@ impl PlayerRegistry {
             state.current_track_id = None;
             state.now_playing = Some(target.clone());
             state.epoch = state.epoch.wrapping_add(1);
+            state.radio_exhausted = false;
             // Jumping straight to a chosen track is a deliberate change of
             // direction — drop the recency-weighted history so the next
             // radio refill seeds off this track instead of a stale entry
@@ -548,6 +572,59 @@ mod tests {
         let result = registry.play_queue_track(guild_id, 0).await;
 
         assert!(matches!(result, Err(PlayerError::InvalidQueueIndex)));
+    }
+
+    #[tokio::test]
+    async fn play_now_starts_playback_immediately_on_an_empty_queue() {
+        let (registry, backend, guild_id) = joined_registry().await;
+
+        registry.play_now(guild_id, queued("a")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+        assert!(snapshot.upcoming.is_empty());
+    }
+
+    #[tokio::test]
+    async fn play_now_replaces_the_current_track_and_keeps_the_upcoming_queue() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        registry.enqueue(guild_id, queued("a")).await.unwrap();
+        registry
+            .enqueue_many(guild_id, vec![queued("b"), queued("c")])
+            .await
+            .unwrap();
+        registry.settle_playback_start(guild_id).await;
+        let a_track = backend.call_for(guild_id).unwrap().last_track();
+
+        registry.play_now(guild_id, queued("d")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        assert!(a_track.was_stopped());
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a", "d"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["b", "c"]);
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "d");
+    }
+
+    #[tokio::test]
+    async fn play_now_onto_a_queue_left_behind_plays_ahead_of_it() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        db::queue_push_back(&registry.db, &guild_id.to_string(), &queued("left"))
+            .await
+            .unwrap();
+
+        registry.play_now(guild_id, queued("new")).await.unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["new"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["left"]);
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "new");
     }
 
     #[tokio::test]

@@ -525,6 +525,7 @@
     row.querySelector('.compact-duration').textContent = formatDuration(track.duration_secs);
   }
 
+  const COVER_PLAY_ICON = '<svg width="36" height="36" viewBox="0 0 24 24" fill="currentColor"><polygon points="7,3 22,12 7,21"/></svg>';
   const REMOVE_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
   const PLAY_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,3 21,12 6,21"/></svg>';
   const GRIP_ICON = '<svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="2.5" cy="2.5" r="1.5"/><circle cx="7.5" cy="2.5" r="1.5"/><circle cx="2.5" cy="8" r="1.5"/><circle cx="7.5" cy="8" r="1.5"/><circle cx="2.5" cy="13.5" r="1.5"/><circle cx="7.5" cy="13.5" r="1.5"/></svg>';
@@ -532,6 +533,15 @@
   const EDIT_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>';
   const USER_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>';
   const SERVER_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg>';
+
+  // The play glyph that a clickable thumbnail (a playlist cover, a most
+  // played row) shows over its artwork on hover.
+  function makeCoverPlayGlyph() {
+    const glyph = document.createElement('span');
+    glyph.className = 'cover-play absolute inset-0 flex items-center justify-center';
+    glyph.innerHTML = COVER_PLAY_ICON;
+    return glyph;
+  }
 
   function makeMiniIconBtn(iconSvg, title, disabled, danger) {
     const btn = document.createElement('button');
@@ -1441,11 +1451,48 @@
     }
   }
 
+  async function playTrackNow(videoId, title, btn) {
+    setButtonBusy(btn, true);
+    try {
+      const response = await api(`/api/guilds/${currentGuildId}/play`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ video_id: videoId }),
+      });
+      const body = await response.json();
+      if (!response.ok) {
+        if (body.error === NOT_CONNECTED_ERROR) {
+          openJoinModal(() => playTrackNow(videoId, title));
+          return;
+        }
+        showStatus(body.error || 'Could not play that track.', { isError: true });
+        return;
+      }
+      renderSnapshot(body);
+      showStatus(`Playing "${title}".`);
+      loadFavourites(currentGuildId);
+    } catch (err) { /* showLogin already handled unauthorized */
+    } finally {
+      setButtonBusy(btn, false);
+    }
+  }
+
   // ---- Playlists ----
   const playlistRow = document.getElementById('playlist-row');
 
+  // A card's cover is its play control: clicking the artwork starts the
+  // playlist, so the card itself carries no Play button.
+  function createPlaylistCover() {
+    const cover = document.createElement('button');
+    cover.type = 'button';
+    cover.title = 'Play playlist';
+    cover.className = 'playlist-cover thumb relative flex items-center justify-center w-full aspect-square rounded-lg mb-2 overflow-hidden';
+    return cover;
+  }
+
   function applyPlaylistCover(cover, playlist) {
     applyThumbnail(cover, playlist.thumbnail_video_id, String(playlist.id));
+    if (cover.classList.contains('playlist-cover')) cover.appendChild(makeCoverPlayGlyph());
   }
 
   function renderPlaylists(playlists) {
@@ -1454,9 +1501,9 @@
       const chip = document.createElement('div');
       chip.className = 'playlist-chip relative flex flex-col gap-0.5 min-w-0';
 
-      const cover = document.createElement('div');
-      cover.className = 'playlist-cover thumb relative flex items-center justify-center w-full aspect-square rounded-lg mb-2 overflow-hidden';
+      const cover = createPlaylistCover();
       applyPlaylistCover(cover, playlist);
+      cover.addEventListener('click', () => playPlaylist(playlist.id, playlist.name, cover));
       chip.appendChild(cover);
 
       const name = document.createElement('div');
@@ -1470,14 +1517,7 @@
       chip.appendChild(count);
 
       const actions = document.createElement('div');
-      actions.className = 'playlist-actions flex items-center gap-1';
-
-      const playBtn = document.createElement('button');
-      playBtn.type = 'button';
-      playBtn.className = 'primary-btn small mr-auto';
-      playBtn.textContent = 'Play';
-      playBtn.addEventListener('click', () => playPlaylist(playlist.id, playlist.name, playBtn));
-      actions.appendChild(playBtn);
+      actions.className = 'playlist-actions flex items-center justify-end gap-1';
 
       const refreshBtn = makeMiniIconBtn(REFRESH_ICON, 'Refresh from YouTube', false, false);
       refreshBtn.addEventListener('click', () => refreshPlaylist(playlist.id, playlist.name));
@@ -1607,13 +1647,32 @@
       : playCountText;
   }
 
+  // The row itself plays the track right away (the thumbnail shows a play
+  // glyph on hover to say so); the Add button queues it instead, and stops
+  // its click short of the row so it does not also play.
   function createFavouriteTrackRow(track) {
     const row = createTrackRow(track);
+    row.classList.add('play-row', 'cursor-pointer');
+    row.title = 'Play now';
+    row.tabIndex = 0;
+    row.setAttribute('role', 'button');
+    const thumb = row.querySelector('.compact-thumb');
+    thumb.appendChild(makeCoverPlayGlyph());
+    const play = () => playTrackNow(row._videoId, row._title, thumb);
+    row.addEventListener('click', play);
+    row.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); play(); }
+    });
+
     const addBtn = document.createElement('button');
     addBtn.type = 'button';
     addBtn.className = 'outline-btn';
     addBtn.textContent = 'Add';
-    addBtn.addEventListener('click', () => addToQueue(row._videoId, row._title, addBtn));
+    addBtn.title = 'Add to queue';
+    addBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      addToQueue(row._videoId, row._title, addBtn);
+    });
     row.appendChild(addBtn);
     updateFavouriteTrackRow(row, track);
     return row;
@@ -1635,8 +1694,8 @@
     const chip = document.createElement('div');
     chip.className = 'playlist-chip relative flex flex-col gap-0.5 min-w-0';
 
-    const cover = document.createElement('div');
-    cover.className = 'playlist-cover thumb relative flex items-center justify-center w-full aspect-square rounded-lg mb-2 overflow-hidden';
+    const cover = createPlaylistCover();
+    cover.addEventListener('click', () => playPlaylist(chip._playlistId, chip._playlistName, cover));
     chip.appendChild(cover);
 
     const name = document.createElement('div');
@@ -1646,13 +1705,6 @@
     const count = document.createElement('div');
     count.className = 'playlist-count text-sm text-secondary truncate';
     chip.appendChild(count);
-
-    const playBtn = document.createElement('button');
-    playBtn.type = 'button';
-    playBtn.className = 'primary-btn small';
-    playBtn.textContent = 'Play';
-    playBtn.addEventListener('click', () => playPlaylist(chip._playlistId, chip._playlistName, playBtn));
-    chip.appendChild(playBtn);
 
     updateFavPlaylistChip(chip, playlist);
     return chip;
