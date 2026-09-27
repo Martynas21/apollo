@@ -8,6 +8,8 @@ pub struct Config {
     pub database_url: String,
     pub yt_dlp_cookies_file: Option<String>,
     pub playlist_track_limit: usize,
+    /// Local hour at which every saved playlist is re-listed; `None` disables it.
+    pub playlist_resync_hour: Option<u32>,
     pub audio_worker_socket: String,
     pub dashboard_bind_addr: String,
     pub dashboard_username: Option<String>,
@@ -15,6 +17,8 @@ pub struct Config {
 }
 
 const DEFAULT_PLAYLIST_TRACK_LIMIT: usize = 500;
+
+const DEFAULT_PLAYLIST_RESYNC_HOUR: u32 = 3;
 
 const DEFAULT_DASHBOARD_BIND_ADDR: &str = "127.0.0.1:8787";
 
@@ -37,6 +41,7 @@ impl Config {
             database_url: env_var(&lookup, "DATABASE_URL")?,
             yt_dlp_cookies_file: optional_env_var(&lookup, "YT_DLP_COOKIES_FILE"),
             playlist_track_limit: playlist_track_limit(&lookup)?,
+            playlist_resync_hour: playlist_resync_hour(&lookup)?,
             audio_worker_socket: optional_env_var(&lookup, "AUDIO_WORKER_SOCKET")
                 .unwrap_or_else(|| DEFAULT_AUDIO_WORKER_SOCKET.to_string()),
             dashboard_bind_addr: optional_env_var(&lookup, "DASHBOARD_BIND_ADDR")
@@ -58,6 +63,27 @@ fn playlist_track_limit(
             .with_context(|| format!("PLAYLIST_TRACK_LIMIT is not a valid number: {value}")),
         Err(std::env::VarError::NotPresent) => Ok(DEFAULT_PLAYLIST_TRACK_LIMIT),
         Err(err) => Err(err).context("failed to read PLAYLIST_TRACK_LIMIT"),
+    }
+}
+
+fn playlist_resync_hour(
+    lookup: &impl Fn(&str) -> Result<String, std::env::VarError>,
+) -> Result<Option<u32>> {
+    let value = match lookup("PLAYLIST_RESYNC_HOUR") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(Some(DEFAULT_PLAYLIST_RESYNC_HOUR)),
+        Err(err) => return Err(err).context("failed to read PLAYLIST_RESYNC_HOUR"),
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(Some(DEFAULT_PLAYLIST_RESYNC_HOUR));
+    }
+    if trimmed.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    match trimmed.parse::<u32>() {
+        Ok(hour) if hour < 24 => Ok(Some(hour)),
+        _ => anyhow::bail!("PLAYLIST_RESYNC_HOUR must be an hour 0-23 or `off`: {value}"),
     }
 }
 
@@ -122,6 +148,7 @@ mod tests {
         assert_eq!(config.discord_guild_id, None);
         assert_eq!(config.yt_dlp_cookies_file, None);
         assert_eq!(config.playlist_track_limit, 500);
+        assert_eq!(config.playlist_resync_hour, Some(3));
         assert_eq!(config.dashboard_bind_addr, "127.0.0.1:8787");
         assert_eq!(config.dashboard_username, None);
         assert_eq!(config.dashboard_password, None);
@@ -255,5 +282,60 @@ mod tests {
         vars.insert("PLAYLIST_TRACK_LIMIT", "not-a-number");
         let err = Config::from_source(lookup(&vars)).expect_err("should fail");
         assert!(err.to_string().contains("PLAYLIST_TRACK_LIMIT"));
+    }
+
+    #[test]
+    fn playlist_resync_hour_absent_or_blank_uses_default() {
+        let mut vars = full_vars();
+        assert_eq!(
+            Config::from_source(lookup(&vars))
+                .unwrap()
+                .playlist_resync_hour,
+            Some(3)
+        );
+        vars.insert("PLAYLIST_RESYNC_HOUR", "  ");
+        assert_eq!(
+            Config::from_source(lookup(&vars))
+                .unwrap()
+                .playlist_resync_hour,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn playlist_resync_hour_present_parses() {
+        let mut vars = full_vars();
+        vars.insert("PLAYLIST_RESYNC_HOUR", "5");
+        let config = Config::from_source(lookup(&vars)).unwrap();
+        assert_eq!(config.playlist_resync_hour, Some(5));
+    }
+
+    #[test]
+    fn playlist_resync_hour_off_disables_in_any_case() {
+        let mut vars = full_vars();
+        vars.insert("PLAYLIST_RESYNC_HOUR", "off");
+        assert_eq!(
+            Config::from_source(lookup(&vars))
+                .unwrap()
+                .playlist_resync_hour,
+            None
+        );
+        vars.insert("PLAYLIST_RESYNC_HOUR", "OFF");
+        assert_eq!(
+            Config::from_source(lookup(&vars))
+                .unwrap()
+                .playlist_resync_hour,
+            None
+        );
+    }
+
+    #[test]
+    fn playlist_resync_hour_out_of_range_or_malformed_produces_error_naming_it() {
+        for bad in ["24", "-1", "abc"] {
+            let mut vars = full_vars();
+            vars.insert("PLAYLIST_RESYNC_HOUR", bad);
+            let err = Config::from_source(lookup(&vars)).expect_err("should fail");
+            assert!(err.to_string().contains("PLAYLIST_RESYNC_HOUR"), "{bad}");
+        }
     }
 }

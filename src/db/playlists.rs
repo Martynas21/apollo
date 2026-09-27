@@ -18,6 +18,8 @@ pub struct SavedPlaylist {
 
 type PlaylistRow = (i64, String, String, Option<String>, Option<i64>);
 
+type GuildPlaylistRow = (String, i64, String, String, Option<String>, Option<i64>);
+
 fn playlist_from_row(row: PlaylistRow) -> SavedPlaylist {
     let (id, name, url, author, cached_at) = row;
     SavedPlaylist {
@@ -40,6 +42,33 @@ pub async fn list_guild_playlists(pool: &SqlitePool, guild_id: &str) -> Result<V
     .context("failed to list guild playlists")?;
 
     Ok(rows.into_iter().map(playlist_from_row).collect())
+}
+
+/// A saved playlist together with the guild that owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuildPlaylist {
+    pub guild_id: String,
+    pub playlist: SavedPlaylist,
+}
+
+pub async fn list_all_playlists(pool: &SqlitePool) -> Result<Vec<GuildPlaylist>> {
+    let rows: Vec<GuildPlaylistRow> = sqlx::query_as(
+        "SELECT guild_id, id, name, url, author, cached_at FROM playlists \
+         ORDER BY guild_id, id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to list all playlists")?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(guild_id, id, name, url, author, cached_at)| GuildPlaylist {
+                guild_id,
+                playlist: playlist_from_row((id, name, url, author, cached_at)),
+            },
+        )
+        .collect())
 }
 
 pub async fn save_guild_playlist(
@@ -533,6 +562,34 @@ mod tests {
                 .map(|t| t.video_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["new1", "new2"]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_all_playlists_spans_every_guild() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+        let first =
+            save_guild_playlist(&pool, "1", "A", "https://example.com/a", None, "42").await?;
+        let second =
+            save_guild_playlist(&pool, "2", "B", "https://example.com/b", Some("Bob"), "42")
+                .await?;
+
+        let all = list_all_playlists(&pool).await?;
+        let summary: Vec<_> = all
+            .iter()
+            .map(|entry| {
+                (
+                    entry.guild_id.as_str(),
+                    entry.playlist.id,
+                    entry.playlist.author.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![("1", first, None), ("2", second, Some("Bob"))]
         );
 
         Ok(())

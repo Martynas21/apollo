@@ -20,9 +20,9 @@ pub use failed_tracks::{
     save_skip_override, save_track_override, track_overrides,
 };
 pub use playlists::{
-    SavedPlaylist, delete_guild_playlist, get_guild_playlist, get_playlist_thumbnail_video_id,
-    get_playlist_tracks, list_guild_playlists, replace_playlist_tracks, save_guild_playlist,
-    set_playlist_author,
+    GuildPlaylist, SavedPlaylist, delete_guild_playlist, get_guild_playlist,
+    get_playlist_thumbnail_video_id, get_playlist_tracks, list_all_playlists, list_guild_playlists,
+    replace_playlist_tracks, save_guild_playlist, set_playlist_author,
 };
 #[cfg(test)]
 pub use queue::queue_push_back;

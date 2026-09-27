@@ -110,7 +110,8 @@ this — see `cargo clippy` in Development above:
   decrementing counter, capped retry count) or must be one of the small set
   of intentional long-running service loops: `apollo-audio-worker`'s driver
   loop, the IPC accept/read/write loops (`src/voice/ipc_backend.rs`,
-  `audio-worker/src/rpc.rs`), and the DB migration-retry loop (`src/db/mod.rs`).
+  `audio-worker/src/rpc.rs`), the DB migration-retry loop (`src/db/mod.rs`),
+  and the daily playlist-resync loop (`src/playlists/resync.rs`).
   A new unbounded loop outside that list needs explicit justification in
   review.
 - Functions stay under ~60 lines (`clippy::too_many_lines`) — split by
@@ -138,6 +139,11 @@ See `.env.example` for the full list and inline docs:
   without it, video resolution (and even search) can fail with "Sign in to
   confirm you're not a bot." Point this at a Netscape-format `cookies.txt`
   exported from a real browser session.
+- `PLAYLIST_RESYNC_HOUR` — optional, defaults to `3`: the local hour at which
+  every saved playlist is re-listed from YouTube so its cached tracks stay
+  current. `off` disables the daily resync.
+- `TZ` — optional, the timezone that hour is read in (e.g. `Europe/Vilnius`).
+  Unset means the host's zone when running directly and UTC in Docker.
 - `RUST_LOG` — optional log verbosity (`tracing-subscriber` `EnvFilter` syntax).
 - `DASHBOARD_BIND_ADDR` — optional, defaults to `127.0.0.1:8787`. See
   [Web dashboard](#web-dashboard).
@@ -150,7 +156,8 @@ The web dashboard is Apollo's only control surface — there are no Discord
 slash commands. It covers "Now Playing" plus transport controls
 (pause/resume, skip, stop, shuffle, radio toggle, volume, live-updated over
 a WebSocket), queue management (remove/reorder/clear), YouTube search and
-add-to-queue, saved-playlist management (import/play/refresh/remove), a
+add-to-queue, saved-playlist management (import/play/refresh/remove — every
+saved playlist is also re-listed daily, see `PLAYLIST_RESYNC_HOUR`), a
 "Couldn't play" list under the queue for tracks yt-dlp could not start (skip
 them from future playlist plays, or search for a stand-in that is queued
 next and used in their place whenever a playlist would queue them), an

@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Context;
 use apollo::voice::PlayerRegistry;
 use apollo::voice::ipc_backend::IpcBackend;
-use apollo::{config, db, voice, web, youtube};
+use apollo::{config, db, playlists, voice, web, youtube};
 use serenity::all as serenity;
 use songbird::serenity::SerenityInit;
 use tracing_subscriber::EnvFilter;
@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
 
     clear_stale_slash_commands(&client.http, config.discord_guild_id).await?;
 
+    spawn_playlist_resync(&config, db_pool.clone(), youtube_client.clone());
     spawn_dashboard(
         &config,
         dashboard_player,
@@ -187,6 +188,17 @@ fn spawn_dashboard(
             tracing::error!(%err, "dashboard server exited");
         }
     });
+}
+
+fn spawn_playlist_resync(
+    config: &config::Config,
+    db_pool: sqlx::SqlitePool,
+    youtube: youtube::api::YouTubeClient,
+) {
+    match config.playlist_resync_hour {
+        Some(hour) => playlists::resync::spawn_daily(db_pool, youtube, hour),
+        None => tracing::info!("daily playlist resync disabled"),
+    }
 }
 
 fn init_tracing() {

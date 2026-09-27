@@ -9,6 +9,7 @@ use serenity::all::GuildId;
 
 use crate::db;
 use crate::model::QueuedTrack;
+use crate::playlists::{self, RefreshError};
 use crate::web::WebState;
 use crate::web::response::{error_response, parse_guild_id};
 use crate::web::routes::playback::respond_after;
@@ -199,36 +200,33 @@ async fn refresh_playlist(
         }
     };
 
-    let listing = match state.youtube.list_playlist_items(&playlist.url).await {
-        Ok(listing) => listing,
-        Err(err) => return error_response(StatusCode::BAD_REQUEST, err.to_string()),
-    };
-
-    if let Err(err) = db::replace_playlist_tracks(&state.db, playlist.id, &listing.tracks).await {
-        tracing::warn!(%err, playlist_id, "dashboard failed to cache refreshed playlist tracks");
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to refresh playlist",
-        );
-    }
-    prune_overrides(&state, guild_id).await;
-
-    let author = match db::set_playlist_author(&state.db, playlist.id, listing.author.as_deref())
-        .await
+    let refreshed = match playlists::refresh(
+        &state.db,
+        &state.youtube,
+        &guild_id.to_string(),
+        &playlist,
+    )
+    .await
     {
-        Ok(()) => listing.author,
-        Err(err) => {
-            tracing::warn!(%err, playlist_id, "dashboard failed to update refreshed playlist author");
-            playlist.author
+        Ok(refreshed) => refreshed,
+        Err(RefreshError::Listing(err)) => {
+            return error_response(StatusCode::BAD_REQUEST, err.to_string());
+        }
+        Err(RefreshError::Db(err)) => {
+            tracing::warn!(%err, playlist_id, "dashboard failed to cache refreshed playlist tracks");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to refresh playlist",
+            );
         }
     };
 
-    let thumbnail_video_id = listing.tracks.first().map(|track| track.video_id.clone());
+    let thumbnail_video_id = refreshed.tracks.first().map(|track| track.video_id.clone());
     Json(PlaylistJson {
         id: playlist.id,
         name: playlist.name,
-        author,
-        track_count: listing.tracks.len(),
+        author: refreshed.author,
+        track_count: refreshed.tracks.len(),
         thumbnail_video_id,
     })
     .into_response()

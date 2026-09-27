@@ -75,7 +75,7 @@ ARG APOLLO_UID
 # yt-dlp/YouTube, only a pre-resolved file on the shared buffer volume.
 ARG TARGETARCH
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata curl unzip \
     && case "$TARGETARCH" in \
         amd64) deno_arch=x86_64; ytdlp_asset=yt-dlp_linux ;; \
         arm64) deno_arch=aarch64; ytdlp_asset=yt-dlp_linux_aarch64 ;; \

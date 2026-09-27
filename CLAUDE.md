@@ -135,6 +135,11 @@ Key points:
 - `src/voice/resolve.rs` — resolves a track to a direct streamable URL
   (metadata-only `yt-dlp -j`, no download). `src/voice/mod.rs` does the
   `yt-dlp` startup dependency check.
+- `src/playlists/` — saved-playlist maintenance: `refresh` (re-list via
+  `yt-dlp`, replace the cached tracks, prune overrides) is shared by the
+  dashboard's refresh action and `resync.rs`, the daily worker that runs it
+  for every playlist at `PLAYLIST_RESYNC_HOUR` local time (`chrono::Local`,
+  so `TZ` applies).
 - `src/db/` — sqlx/SQLite, split by table group: `settings.rs` (per-guild
   volume), `playlists.rs` (saved playlists + cached tracks), `session.rs`
   (guild session persistence), `queue.rs` (the persisted play queue),
@@ -150,8 +155,9 @@ Key points:
 - **No recursion** — use iteration.
 - **No unbounded loops** outside an explicitly-allowed list: `apollo-audio-worker`'s
   driver loop, the IPC accept/read/write loops (`ipc_backend.rs`, `audio-worker/src/rpc.rs`),
-  and the DB migration-retry loop (`db/mod.rs`). A new unbounded loop anywhere else
-  needs explicit justification in review.
+  the DB migration-retry loop (`db/mod.rs`), and the daily playlist-resync loop
+  (`src/playlists/resync.rs`). A new unbounded loop anywhere else needs explicit
+  justification in review.
 - **Functions stay under ~60 lines** (`clippy::too_many_lines`, threshold set
   in `clippy.toml`) — split by sub-step, not arbitrary truncation.
 - **No `unwrap()`/`expect()`/`panic!()` outside `#[cfg(test)]`** — propagate

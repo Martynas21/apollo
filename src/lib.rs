@@ -14,6 +14,7 @@
 pub mod config;
 pub mod db;
 pub mod model;
+pub mod playlists;
 pub mod voice;
 pub mod web;
 pub mod youtube;
