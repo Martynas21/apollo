@@ -31,7 +31,8 @@ fn playlist_from_row(row: PlaylistRow) -> SavedPlaylist {
 
 pub async fn list_guild_playlists(pool: &SqlitePool, guild_id: &str) -> Result<Vec<SavedPlaylist>> {
     let rows: Vec<PlaylistRow> = sqlx::query_as(
-        "SELECT id, name, url, author, cached_at FROM playlists WHERE guild_id = ?1 ORDER BY id",
+        "SELECT id, name, url, author, cached_at FROM playlists WHERE guild_id = ?1 \
+         ORDER BY id DESC",
     )
     .bind(guild_id)
     .fetch_all(pool)
@@ -253,8 +254,8 @@ mod tests {
 
         let playlists = list_guild_playlists(&pool, "1").await?;
         assert_eq!(playlists.len(), 2);
-        assert_eq!(playlists[0].name, "Chill Mix");
-        assert_eq!(playlists[1].name, "Workout");
+        assert_eq!(playlists[0].name, "Workout");
+        assert_eq!(playlists[1].name, "Chill Mix");
 
         let fetched = get_guild_playlist(&pool, "1", playlists[0].id).await?;
         assert_eq!(fetched, Some(playlists[0].clone()));
