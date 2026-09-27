@@ -60,6 +60,7 @@
         <input class="flex-1 min-w-0 bg-transparent border-0 outline-none text-white text-md placeholder:text-secondary" type="text" id="search-input" placeholder="Search YouTube or paste a URL">
       </div>
       <div class="search-dropdown absolute inset-x-0 z-20 bg-surface rounded-lg p-2 shadow-menu" id="search-dropdown">
+        <div class="items-center gap-2 text-sm text-secondary my-1 mx-2" id="search-replace-banner" style="display:none"><span class="flex-1 min-w-0 truncate" id="search-replace-text"></span><button class="outline-btn" id="search-replace-cancel" type="button">Cancel</button></div>
         <div class="flex flex-col max-h-90 overflow-y-auto overflow-x-hidden" id="search-results"></div>
         <div class="items-center gap-2 text-sm text-secondary my-1 mx-2" id="search-loading-note" style="display:none"><div class="search-spinner" style="display:block"></div><span id="search-loading-text">Searching…</span></div>
         <div class="text-sm text-secondary my-1 mx-2" id="search-empty-note" style="display:none">No matches — try a different search term.</div>
@@ -118,9 +119,9 @@
           <div class="flex gap-4 overflow-x-auto px-1 pt-1 pb-3" id="playlist-row"></div>
         </section>
 
-        <section class="flex flex-col min-w-0 mt-8">
+        <section class="track-grid-host flex flex-col min-w-0 mt-8">
           <div class="flex items-end justify-between gap-4 mb-4"><h2 class="text-xl font-bold leading-tight sm:text-2xl">Most played</h2></div>
-          <div class="track-grid grid gap-x-6" id="favourite-tracks"></div>
+          <div class="track-grid grid gap-x-6 overflow-x-auto px-1 pt-1 pb-3" id="favourite-tracks"></div>
           <div class="text-sm text-secondary my-1 mx-2" id="favourite-tracks-empty-note" style="display:none">No plays yet — tracks show up here once they have been played.</div>
         </section>
 
@@ -158,6 +159,13 @@
       <!-- The list itself scrolls (the drag code reads its scroll offset), with
            nothing above the first row so row offsets start at zero. -->
       <div class="flex-1 min-h-0 overflow-y-auto overflow-x-hidden flex flex-col px-2 pb-2 order-2" id="queue-list"></div>
+      <!-- Tracks that would not play, kept outside #queue-list so the drag
+           code's row offsets are unaffected. -->
+      <div class="order-3 shrink-0 flex flex-col px-2 pb-2" id="failed-section" style="display:none">
+        <div class="h-px bg-line mx-2 my-2"></div>
+        <h3 class="flex items-center text-sm font-medium text-secondary px-2 pb-2">Couldn't play<span class="ml-2 text-xs font-medium bg-hover text-secondary px-2 py-0.5 rounded-full" id="failed-count-badge">0</span></h3>
+        <div class="flex flex-col max-h-80 overflow-y-auto overflow-x-hidden" id="failed-list"></div>
+      </div>
       <div class="order-1 text-sm text-secondary my-2 mx-4" id="queue-empty-note" style="display:none">Queue is empty — add something from Search.</div>
     </aside>
   </div>

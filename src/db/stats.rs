@@ -171,6 +171,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn top_played_tracks_stops_at_the_limit() -> Result<()> {
+        let pool = connect("sqlite::memory:").await?;
+
+        for (video_id, plays) in [("a", 1), ("b", 3), ("c", 2)] {
+            for _ in 0..plays {
+                record_track_play(&pool, "1", &sample_track(video_id, None)).await?;
+            }
+        }
+
+        let plays = top_played_tracks(&pool, "1", 2).await?;
+        assert_eq!(
+            plays
+                .iter()
+                .map(|p| (p.video_id.as_str(), p.play_count))
+                .collect::<Vec<_>>(),
+            vec![("b", 3), ("c", 2)]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn playlist_play_counts_only_list_playlists_that_have_been_played() -> Result<()> {
         let pool = connect("sqlite::memory:").await?;
         let played_id = save_guild_playlist(

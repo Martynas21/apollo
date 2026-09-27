@@ -14,7 +14,7 @@ pub fn routes() -> Router<WebState> {
     Router::new().route("/api/guilds/{guild_id}/favourites", get(favourites))
 }
 
-const FAVOURITES_LIMIT: i64 = 5;
+const FAVOURITES_LIMIT: i64 = 10;
 
 #[derive(Serialize)]
 struct FavouriteTrackJson {
