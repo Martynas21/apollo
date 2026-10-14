@@ -95,7 +95,8 @@ impl serenity::EventHandler for Handler {
 
     /// Leaves voice once the bot's channel has had no listeners for
     /// `ALONE_GRACE`, whether the last one left or the bot itself arrived in
-    /// an empty channel.
+    /// an empty channel, and joins a listener who arrives in a guild the bot
+    /// is in no channel of while that guild still has a queue to play.
     async fn voice_state_update(
         &self,
         ctx: serenity::Context,
@@ -116,14 +117,41 @@ impl serenity::EventHandler for Handler {
             }
             return;
         }
-
-        let Some(channel) = self.player.current_channel(guild_id).await else {
+        if voice::presence::is_bot(&ctx.cache, guild_id, &new) {
             return;
-        };
-        if old.and_then(|state| state.channel_id) == Some(channel)
-            && voice::presence::is_alone(&ctx.cache, guild_id, channel)
-        {
-            spawn_alone_grace(self.player.clone(), ctx.cache.clone(), guild_id);
+        }
+
+        match self.player.current_channel(guild_id).await {
+            Some(channel) => {
+                if old.and_then(|state| state.channel_id) == Some(channel)
+                    && voice::presence::is_alone(&ctx.cache, guild_id, channel)
+                {
+                    spawn_alone_grace(self.player.clone(), ctx.cache.clone(), guild_id);
+                }
+            }
+            None => {
+                if let Some(joined) = voice::presence::joined_channel(old.as_ref(), &new) {
+                    join_for_pending_queue(&self.player, guild_id, joined).await;
+                }
+            }
+        }
+    }
+}
+
+/// Joins a listener's channel when the guild's queue still has tracks; with
+/// nothing queued the bot stays out of voice rather than join and idle out.
+async fn join_for_pending_queue(
+    player: &PlayerRegistry,
+    guild_id: serenity::GuildId,
+    channel: serenity::ChannelId,
+) {
+    match player.join_if_queue_pending(guild_id, channel).await {
+        Ok(true) => {
+            tracing::info!(%guild_id, %channel, "joined voice: a listener arrived with a queue waiting");
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::warn!(%guild_id, %channel, %err, "failed to join a listener's channel");
         }
     }
 }

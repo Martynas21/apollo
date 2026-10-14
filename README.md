@@ -167,7 +167,11 @@ servers you select. Unlike a Discord command (which could infer the caller's cur
 voice channel), the dashboard has no such context — it prompts you to pick
 a voice channel the first time you play something for a guild. The bot
 leaves on its own ~2.5 minutes after the queue drains empty (see
-`IDLE_DISCONNECT` in `src/voice/registry/mod.rs`).
+`IDLE_DISCONNECT` in `src/voice/registry/mod.rs`), and 30 seconds after it
+is left alone in its channel. If it leaves (or is restarted) with tracks
+still queued, it rejoins on its own the next time someone enters a voice
+channel in that server and resumes from the head of the queue; it never
+moves between channels by itself.
 
 It listens on `DASHBOARD_BIND_ADDR` (default `127.0.0.1:8787`, i.e.
 localhost-only until you put something in front of it) and serves plain

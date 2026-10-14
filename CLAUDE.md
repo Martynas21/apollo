@@ -129,9 +129,12 @@ Key points:
   single-video metadata, playlist listing — all via `yt-dlp -j`) plus
   `extract_video_id` for pulling a video ID out of a YouTube URL.
 - `src/voice/presence.rs` — counts listeners in the bot's voice channel from
-  the serenity cache; `main.rs`'s `voice_state_update` leaves voice when
-  there have been none for 30 s (the last one left, or the bot joined an
-  empty channel).
+  the serenity cache and tells a channel arrival from any other voice-state
+  change; `main.rs`'s `voice_state_update` leaves voice when there have been
+  no listeners for 30 s (the last one left, or the bot joined an empty
+  channel) and joins a listener's channel when the bot is in no channel of
+  the guild and the guild's persisted queue still has tracks
+  (`PlayerRegistry::join_if_queue_pending`).
 - `src/voice/resolve.rs` — resolves a track to a direct streamable URL
   (metadata-only `yt-dlp -j`, no download). `src/voice/mod.rs` does the
   `yt-dlp` startup dependency check.

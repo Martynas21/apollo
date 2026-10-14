@@ -19,7 +19,8 @@ voice/registry/queue.rs      enqueue, enqueue_next, enqueue_many, remove_queue_t
 voice/registry/playback.rs   spawn/run_start_sequence, try_start_playback,
                              resolve_for_start, commit_started_track, advance,
                              pause, resume, seek, skip, stop, get_volume/set_volume
-voice/registry/session.rs    join, leave, leave_if_idle, persist_session,
+voice/registry/session.rs    join, join_if_queue_pending, leave, leave_if_idle,
+                             persist_session,
                              restore_session_if_new, load/apply persisted session
 voice/registry/radio.rs      toggle_radio, is_radio_enabled, maybe_spawn_radio_refill,
                              run_radio_refill*, radio_refill_*, push_radio_refill,
@@ -146,7 +147,13 @@ Everything follows from that:
 - **Coming back starts it again.** `restore_session_if_new` restores the radio
   settings and `last_played`, then takes the head of the queue as the track to
   start (`kick_off_if_idle` does the same on any other `join`), so a restart
-  resumes the interrupted track from the beginning, as it always has.
+  resumes the interrupted track from the beginning, as it always has. The
+  join does not have to come from the dashboard: when someone enters a voice
+  channel of a guild the bot is in no channel of, and that guild's queue
+  still holds tracks, `main.rs`'s `voice_state_update` joins their channel
+  through `join_if_queue_pending`, which starts the head the same way. A bot
+  already connected somewhere in the guild never moves to follow a listener,
+  and with an empty queue it stays out of voice rather than join and idle out.
 - **Clearing means clearing.** `clear_queue` keeps the head only when it is
   a current track; with nothing playing, the whole queue goes, and the next
   track to play is the next one enqueued.

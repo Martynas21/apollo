@@ -1,7 +1,8 @@
 //! Who is listening in the bot's voice channel, read from the serenity
-//! cache's voice states. Other bots never count as listeners.
+//! cache's voice states, and whether a voice-state update is someone
+//! arriving in a channel. Other bots never count as listeners.
 
-use serenity::all::{Cache, ChannelId, GuildId, UserId, VoiceState};
+use serenity::all::{Cache, ChannelId, Guild, GuildId, UserId, VoiceState};
 
 /// Counts the users in `channel` other than the bot itself and anyone
 /// `is_bot` reports as a bot.
@@ -25,14 +26,34 @@ pub fn is_alone(cache: &Cache, guild_id: GuildId, channel: ChannelId) -> bool {
     let Some(guild) = cache.guild(guild_id) else {
         return false;
     };
-    let is_bot = |state: &VoiceState| {
-        state
-            .member
-            .as_ref()
-            .or_else(|| guild.members.get(&state.user_id))
-            .is_some_and(|member| member.user.bot)
-    };
+    let is_bot = |state: &VoiceState| member_is_bot(&guild, state);
     listeners_in(guild.voice_states.values(), channel, bot_id, is_bot) == 0
+}
+
+/// Whether the user behind `state` is a bot, from the state's own member or
+/// the guild's member list. An unknown user counts as a human, the same way
+/// `is_alone` counts one as a listener.
+pub fn is_bot(cache: &Cache, guild_id: GuildId, state: &VoiceState) -> bool {
+    match cache.guild(guild_id) {
+        Some(guild) => member_is_bot(&guild, state),
+        None => state.member.as_ref().is_some_and(|member| member.user.bot),
+    }
+}
+
+fn member_is_bot(guild: &Guild, state: &VoiceState) -> bool {
+    state
+        .member
+        .as_ref()
+        .or_else(|| guild.members.get(&state.user_id))
+        .is_some_and(|member| member.user.bot)
+}
+
+/// The channel `new` has just entered: a join from no channel or a move from
+/// another one. A change inside the same channel (mute, deafen, stream) and a
+/// leave are not arrivals.
+pub fn joined_channel(old: Option<&VoiceState>, new: &VoiceState) -> Option<ChannelId> {
+    let channel = new.channel_id?;
+    (old.and_then(|state| state.channel_id) != Some(channel)).then_some(channel)
 }
 
 #[cfg(test)]
@@ -43,8 +64,12 @@ mod tests {
     const CHANNEL: u64 = 2;
 
     fn voice_state(user_id: u64, channel_id: u64, bot: bool) -> VoiceState {
+        voice_state_in(user_id, Some(channel_id), bot)
+    }
+
+    fn voice_state_in(user_id: u64, channel_id: Option<u64>, bot: bool) -> VoiceState {
         serde_json::from_value(serde_json::json!({
-            "channel_id": channel_id.to_string(),
+            "channel_id": channel_id.map(|id| id.to_string()),
             "guild_id": "1",
             "user_id": user_id.to_string(),
             "session_id": "session",
@@ -105,5 +130,35 @@ mod tests {
     fn users_in_other_channels_are_not_listeners() {
         let states = [voice_state(BOT, CHANNEL, true), voice_state(20, 99, false)];
         assert_eq!(count(&states), 0);
+    }
+
+    #[test]
+    fn arriving_from_no_channel_is_a_join() {
+        let new = voice_state(20, CHANNEL, false);
+        assert_eq!(joined_channel(None, &new), Some(ChannelId::new(CHANNEL)));
+    }
+
+    #[test]
+    fn moving_between_channels_is_a_join_into_the_new_one() {
+        let old = voice_state(20, 99, false);
+        let new = voice_state(20, CHANNEL, false);
+        assert_eq!(
+            joined_channel(Some(&old), &new),
+            Some(ChannelId::new(CHANNEL))
+        );
+    }
+
+    #[test]
+    fn a_change_inside_the_same_channel_is_not_a_join() {
+        let old = voice_state(20, CHANNEL, false);
+        let new = voice_state(20, CHANNEL, false);
+        assert_eq!(joined_channel(Some(&old), &new), None);
+    }
+
+    #[test]
+    fn leaving_voice_is_not_a_join() {
+        let old = voice_state(20, CHANNEL, false);
+        let new = voice_state_in(20, None, false);
+        assert_eq!(joined_channel(Some(&old), &new), None);
     }
 }

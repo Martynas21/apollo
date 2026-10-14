@@ -47,6 +47,28 @@ impl PlayerRegistry {
         Ok(())
     }
 
+    /// Joins `channel_id` to play the queue a guild left behind, but only
+    /// while the bot is in no channel of the guild: a connected bot never
+    /// moves to follow a listener, and a join already under way counts as
+    /// connected. Returns whether it joined.
+    pub async fn join_if_queue_pending(
+        &self,
+        guild_id: GuildId,
+        channel_id: ChannelId,
+    ) -> Result<bool, PlayerError> {
+        if self.is_connected(guild_id) {
+            return Ok(false);
+        }
+        let queued = db::queue_len(&self.db, &guild_id.to_string())
+            .await
+            .map_err(|err| PlayerError::Storage(err.to_string()))?;
+        if queued == 0 {
+            return Ok(false);
+        }
+        self.join(guild_id, channel_id).await?;
+        Ok(true)
+    }
+
     /// The old driver took its track with it: whatever was playing or
     /// loading is started again on the new one, and any start still running
     /// against the old driver is made stale by the epoch bump.
@@ -554,5 +576,78 @@ mod tests {
         );
         let epoch_after = registry.guilds.lock().await.get(&guild_id).unwrap().epoch;
         assert_eq!(epoch_after, epoch_before.wrapping_add(1));
+    }
+
+    #[tokio::test]
+    async fn join_if_queue_pending_joins_and_starts_the_queue_head() {
+        let (registry, backend, guild_id) = new_registry().await;
+        persist_queue(&registry, guild_id, &["a", "b"]).await;
+
+        let joined = registry
+            .join_if_queue_pending(guild_id, ChannelId::new(2))
+            .await
+            .unwrap();
+        registry.settle_playback_start(guild_id).await;
+
+        assert!(joined);
+        assert_eq!(
+            backend.current_channel(guild_id).await,
+            Some(ChannelId::new(2))
+        );
+        let call = backend.call_for(guild_id).unwrap();
+        assert_eq!(call.played_video_ids(), vec!["a"]);
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert_eq!(upcoming_ids(&snapshot), vec!["b"]);
+        assert_eq!(snapshot.now_playing.unwrap().track.video_id, "a");
+    }
+
+    #[tokio::test]
+    async fn join_if_queue_pending_stays_out_of_voice_with_an_empty_queue() {
+        let (registry, backend, guild_id) = new_registry().await;
+
+        let joined = registry
+            .join_if_queue_pending(guild_id, ChannelId::new(2))
+            .await
+            .unwrap();
+
+        assert!(!joined);
+        assert!(backend.call_for(guild_id).is_none());
+        assert_eq!(backend.join_call_count(guild_id), 0);
+    }
+
+    #[tokio::test]
+    async fn join_if_queue_pending_never_moves_a_connected_bot() {
+        let (registry, backend, guild_id) = joined_registry().await;
+        persist_queue(&registry, guild_id, &["a"]).await;
+
+        let joined = registry
+            .join_if_queue_pending(guild_id, ChannelId::new(3))
+            .await
+            .unwrap();
+
+        assert!(!joined);
+        assert_eq!(backend.join_call_count(guild_id), 1);
+        assert_eq!(
+            backend.current_channel(guild_id).await,
+            Some(ChannelId::new(2))
+        );
+        let snapshot = registry.queue_snapshot(guild_id).await;
+        assert!(snapshot.now_playing.is_none());
+        assert_eq!(upcoming_ids(&snapshot), vec!["a"]);
+    }
+
+    #[tokio::test]
+    async fn join_if_queue_pending_reports_a_failed_join() {
+        let (registry, backend, guild_id) = new_registry().await;
+        persist_queue(&registry, guild_id, &["a"]).await;
+        backend.fail_next_join("no permission to join");
+
+        let err = registry
+            .join_if_queue_pending(guild_id, ChannelId::new(2))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, PlayerError::Join(message) if message == "no permission to join"));
+        assert!(backend.call_for(guild_id).is_none());
     }
 }
